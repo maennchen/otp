@@ -1,0 +1,387 @@
+## %CopyrightBegin%
+##
+## SPDX-License-Identifier: Apache-2.0
+##
+## Copyright Ericsson AB 2025. All Rights Reserved.
+##
+## Licensed under the Apache License, Version 2.0 (the "License");
+## you may not use this file except in compliance with the License.
+## You may obtain a copy of the License at
+##
+##     http://www.apache.org/licenses/LICENSE-2.0
+##
+## Unless required by applicable law or agreed to in writing, software
+## distributed under the License is distributed on an "AS IS" BASIS,
+## WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+## See the License for the specific language governing permissions and
+## limitations under the License.
+##
+## %CopyrightEnd%
+
+name: "Build & Release"
+
+on:
+  push:
+    tags:
+      - 'OTP-*'
+    # TODO: Remove
+    branches:
+      - 'jm/windows-release-ci'
+
+permissions:
+  contents: read
+
+env:
+  # TODO: Dynamic
+  # OTP_VERSION: "${{ github.ref_name }}"
+  OTP_VERSION: "OTP-28.0.2"
+
+jobs:
+  build_windows:
+    name: "Build OTP (${{ matrix.target }})"
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Cross Compiling from X64 to ARM64 since the ARM runner does not
+          # support WSL yet: https://github.com/actions/partner-runner-images/issues/109
+          - os: windows-2022
+            target: aarch64-pc-windows-msvc
+            cross: true
+          - os: windows-2022
+            target: i686-pc-windows-msvc
+            cross: false
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            cross: false
+    defaults:
+      run:
+        shell: "wsl-bash {0}"
+    env:
+      TARGET: "${{ matrix.target }}"
+      WSLENV: "TARGET,OTP_VERSION"
+    steps:
+      - name: "Configure .git Line Endings"
+        shell: bash
+        run: |
+          git config --system core.autocrlf false
+          git config --system core.eol lf
+
+      - name: "Checkout source code"
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # ratchet:actions/checkout@v5.0.0
+
+      - name: "Install WSL"
+        uses: Vampire/setup-wsl@6a8db447be7ed35f2f499c02c6e60ff77ef11278 # ratchet:Vampire/setup-wsl@v6.0.0
+        with:
+          distribution: Ubuntu-24.04
+          additional-packages: >-
+            build-essential autoconf make unzip
+            zip gcc-mingw-w64 g++-mingw-w64
+
+      - name: "Install Dependencies"
+        shell: powershell
+        run: choco install -y openssl.light nsis
+
+      - name: "Build Release"
+        run: |
+          ./.github/scripts/build-release.sh \
+            ${{ matrix.cross && ' -c' || '' }} \
+            "$OTP_VERSION" \
+            "$TARGET"
+
+      # TODO: Code-Sign Windows
+
+      - name: "Package Release"
+        run: 'zip -r "release/${TARGET}.zip" "release/${TARGET}"'
+
+      - name: Attest Build Provenance
+        id: attest-build-provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # ratchet:actions/attest-build-provenance@v2.4.0
+        with:
+          subject-path: "release/${{ matrix.target }}.zip"
+
+      - name: "Copy Build Provenance"
+        run: 'cp "$ATTESTATION" "release/${TARGET}.tar.gz.sigstore"'
+        env:
+          ATTESTATION: "${{ steps.attest-build-provenance.bundle-path }}"
+
+      # TODO: Attest SBoM connection to this asset
+
+      - name: "Upload Artifacts"
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # ratchet:actions/upload-artifact@v4.6.2
+        with:
+          name: "build-${{ matrix.target }}"
+          path: "release/${{ matrix.target }}.zip*"
+
+  build_linux_glibc:
+    name: "Build OTP (${{ matrix.target }})"
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            cross: false
+          - os: ubuntu-24.04
+            target: i686-unknown-linux-gnu
+            cross: false
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            cross: false
+    env:
+      TARGET: "${{ matrix.target }}"
+    steps:
+      - name: "Checkout source code"
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # ratchet:actions/checkout@v5.0.0
+
+      - name: "Install Dependencies (apt-get, POSIX sh)"
+        run: |
+          set -eu
+
+          sudo apt-get update
+
+          # Read list, strip comments and blank lines, install in one go
+          cat <<'PKGS' \
+            | sed 's/#.*$//' \
+            | grep -v '^[[:space:]]*$' \
+            | xargs sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends
+
+          # tool-chain
+          build-essential
+          autoconf
+          m4
+
+          # shell line-editing
+          libncurses-dev
+
+          # crypto/ssl/ssh
+          libssl-dev
+          openssl
+
+          # wx / observer GUI (optional)
+          libwxgtk3.2-dev
+          libgl1-mesa-dev
+          libglu1-mesa-dev
+          libpng-dev
+
+          # ssh app (optional)
+          libssh-dev
+
+          # odbc app (optional)
+          unixodbc-dev
+
+          # jinterface (optional)
+          openjdk-8-jdk
+          PKGS
+
+      - name: "Build Release"
+        run: |
+          ./.github/scripts/build-release.sh \
+            ${{ matrix.cross && ' -c' || '' }} \
+            "$OTP_VERSION" \
+            "$TARGET"
+
+      - name: "Package Release"
+        run: 'tar -czf "release/${TARGET}.tar.gz" -C "release/${TARGET}" .'
+
+      - name: Attest Build Provenance
+        id: attest-build-provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # ratchet:actions/attest-build-provenance@v2.4.0
+        with:
+          subject-path: "release/${{ matrix.target }}.tar.gz"
+
+      - name: "Copy Build Provenance"
+        run: 'cp "$ATTESTATION" "release/${TARGET}.tar.gz.sigstore"'
+        env:
+          ATTESTATION: "${{ steps.attest-build-provenance.bundle-path }}"
+
+      # TODO: Attest SBoM connection to this asset
+
+      - name: "Upload Artifacts"
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # ratchet:actions/upload-artifact@v4.6.2
+        with:
+          name: "build-${{ matrix.target }}"
+          path: "release/${{ matrix.target }}.tar.gz*"
+
+  build_linux_musl:
+    name: "Build OTP (${{ matrix.target }})"
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            cross: false
+          - os: ubuntu-24.04
+            target: i686-unknown-linux-musl
+            cross: false
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            cross: false
+    container:
+      image: "alpine:3.22"
+    env:
+      TARGET: "${{ matrix.target }}"
+    steps:
+      - name: "Checkout source code"
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # ratchet:actions/checkout@v5.0.0
+
+      - name: "Install Dependencies"
+        run: |
+          set -eu
+
+          apk update
+
+          cat <<'PKGS' \
+            | sed 's/#.*$//' \
+            | grep -v '^[[:space:]]*$' \
+            | xargs -r apk add --no-cache
+
+          # tool-chain
+          build-base
+          autoconf
+          m4
+          bash
+
+          # shell line-editing
+          ncurses-dev
+
+          # crypto/ssl/ssh
+          openssl-dev
+          openssl
+
+          # wx / observer GUI (optional)
+          wxwidgets-dev
+          wxwidgets-gtk3
+          mesa-dev
+          glu-dev
+          libpng-dev
+
+          # ssh app (optional)
+          libssh-dev
+
+          # odbc app (optional)
+          unixodbc-dev
+
+          # jinterface (optional)
+          openjdk8-jdk
+          PKGS
+
+      - name: "Build Release"
+        run: |
+          ./.github/scripts/build-release.sh \
+            ${{ matrix.cross && ' -c' || '' }} \
+            "$OTP_VERSION" \
+            "$TARGET"
+
+      - name: "Package Release"
+        run: 'tar -czf "release/${TARGET}.tar.gz" -C "release/${TARGET}" .'
+
+      - name: Attest Build Provenance
+        id: attest-build-provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # ratchet:actions/attest-build-provenance@v2.4.0
+        with:
+          subject-path: "release/${{ matrix.target }}.tar.gz"
+
+      - name: "Copy Build Provenance"
+        run: 'cp "$ATTESTATION" "release/${TARGET}.tar.gz.sigstore"'
+        env:
+          ATTESTATION: "${{ steps.attest-build-provenance.bundle-path }}"
+
+      # TODO: Attest SBoM connection to this asset
+
+      - name: "Upload Artifacts"
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # ratchet:actions/upload-artifact@v4.6.2
+        with:
+          name: "build-${{ matrix.target }}"
+          path: "release/${{ matrix.target }}.tar.gz*"
+
+  build_macos:
+    name: "Build OTP (${{ matrix.target }})"
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+            cross: false
+          - os: macos-15
+            target: x86_64-apple-darwin
+            cross: true
+    env:
+      TARGET: "${{ matrix.target }}"
+    steps:
+      - name: "Checkout source code"
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # ratchet:actions/checkout@v5.0.0
+
+      - name: "Install Dependencies (Homebrew, POSIX sh)"
+        run: |
+          set -eu
+
+          # Read list, strip comments and blank lines, install via brew
+          cat <<'PKGS' \
+            | sed 's/#.*$//' \
+            | grep -v '^[[:space:]]*$' \
+            | xargs -r brew install
+
+          # tool-chain
+          autoconf
+
+          # crypto/ssl/ssh
+          openssl@1.1
+
+          # jinterface (optional)
+          openjdk
+
+          # wx / observer GUI (optional)
+          wxwidgets
+          PKGS
+
+      - name: "Build Release"
+        run: |
+          ./.github/scripts/build-release.sh \
+            ${{ matrix.cross && ' -c' || '' }} \
+            "$OTP_VERSION" \
+            "$TARGET"
+
+      - name: "Package Release"
+        run: 'tar -czf "release/${TARGET}.tar.gz" -C "release/${TARGET}" .'
+
+      - name: Attest Build Provenance
+        id: attest-build-provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # ratchet:actions/attest-build-provenance@v2.4.0
+        with:
+          subject-path: "release/${{ matrix.target }}.tar.gz"
+
+      - name: "Copy Build Provenance"
+        run: 'cp "$ATTESTATION" "release/${TARGET}.tar.gz.sigstore"'
+        env:
+          ATTESTATION: "${{ steps.attest-build-provenance.bundle-path }}"
+
+      # TODO: Attest SBoM connection to this asset
+
+      - name: "Upload Artifacts"
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # ratchet:actions/upload-artifact@v4.6.2
+        with:
+          name: "build-${{ matrix.target }}"
+          path: "release/${{ matrix.target }}.tar.gz*"
