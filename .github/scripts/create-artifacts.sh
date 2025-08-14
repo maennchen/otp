@@ -32,3 +32,6 @@ if [ -f otp_doc_man.tar.gz ]; then
     mv otp_doc_man.tar.gz ${DIR}/otp_doc_man_${VSN}.tar.gz
 fi
 mv otp_doc_html.tar.gz ${DIR}/otp_doc_html_${VSN}.tar.gz
+
+# TODO: Remove, echo all files in the current directory
+find .
