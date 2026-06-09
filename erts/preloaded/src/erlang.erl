@@ -430,7 +430,7 @@ A list of binaries. This datatype is useful to use together with
 -export([binary_to_atom/1, binary_to_atom/2]).
 -export([binary_to_existing_atom/1, binary_to_existing_atom/2]).
 -export([binary_to_float/1]).
--export([binary_to_integer/1,binary_to_integer/2]).
+-export([binary_to_integer/1,binary_to_integer/2,binary_to_integer/3]).
 -export([binary_to_list/1]).
 -export([binary_to_list/3, binary_to_term/1, binary_to_term/2]).
 -export([bit_size/1, bitstring_to_list/1]).
@@ -460,7 +460,7 @@ A list of binaries. This datatype is useful to use together with
 -export([is_alive/0, is_builtin/3, is_map_key/2, is_process_alive/1, length/1]).
 -export([link/1, link/2, list_to_atom/1, list_to_binary/1]).
 -export([list_to_bitstring/1, list_to_existing_atom/1, list_to_float/1]).
--export([list_to_integer/1, list_to_integer/2]).
+-export([list_to_integer/1, list_to_integer/2, list_to_integer/3]).
 -export([list_to_pid/1, list_to_port/1, list_to_ref/1, list_to_tuple/1, loaded/0]).
 -export([localtime/0, make_ref/0]).
 -export([map_size/1, map_get/2, match_spec_test/3, md5/1, md5_final/1]).
@@ -1104,6 +1104,58 @@ binary_to_integer(Binary, Base) ->
         badarg ->
             badarg_with_info([Binary,Base])
     end.
+
+-doc """
+Returns an integer whose text representation in base `Base` is `Binary`,
+accepting at most `MaxLength` significant digits.
+
+The optional leading `+`/`-` sign and any leading zeroes do not count towards
+`MaxLength`, so `<<"-00042">>` has length 2. The limit is checked while parsing.
+An over-length `Binary` fails immediately without building the (potentially
+huge) integer, which makes it safe to call on untrusted input.
+
+## Examples
+
+```erlang
+1> binary_to_integer(<<"12345">>, 10, 5).
+12345
+2> binary_to_integer(<<"123456">>, 10, 5).
+** exception error: bad argument
+3> binary_to_integer(<<"-00042">>, 10, 2).
+-42
+```
+
+Failure: `badarg` if `Binary` contains an invalid representation of an integer,
+or if it has more than `MaxLength` significant digits.
+""".
+-doc #{ category => terms }.
+-doc(#{since => <<"OTP 30">>}).
+-spec binary_to_integer(Binary, Base, MaxLength) -> integer() when
+      Binary :: binary(),
+      Base :: 2..36,
+      MaxLength :: pos_integer().
+binary_to_integer(Binary, Base, MaxLength)
+  when erlang:is_integer(MaxLength), MaxLength >= 1 ->
+    case erts_internal:binary_to_integer(Binary, Base, MaxLength) of
+        N when erlang:is_integer(N) ->
+            N;
+        big ->
+            %% Within the length limit but too big for a small integer. The
+            %% input is already known to be <= MaxLength digits, so the bignum
+            %% path is bounded and needs no length logic of its own.
+            case big_binary_to_int(Binary, Base) of
+                N when erlang:is_integer(N) ->
+                    N;
+                Reason ->
+                    error_with_info(Reason, [Binary, Base, MaxLength])
+            end;
+        too_long ->
+            badarg_with_cause([Binary, Base, MaxLength], too_long);
+        badarg ->
+            badarg_with_info([Binary, Base, MaxLength])
+    end;
+binary_to_integer(Binary, Base, MaxLength) ->
+    badarg_with_info([Binary, Base, MaxLength]).
 
 big_binary_to_int(Bin0, Base)
   when erlang:is_binary(Bin0),
@@ -4182,6 +4234,62 @@ list_to_integer(String, Base) ->
         _ ->
             badarg_with_info([String,Base])
     end.
+
+-doc """
+Returns an integer whose text representation in base `Base` is `String`,
+accepting at most `MaxLength` significant digits.
+
+The optional leading `+`/`-` sign and any leading zeroes do not count towards
+`MaxLength`, so `"-00042"` has length 2. The limit is checked while parsing.
+An over-length `String` fails immediately without building the (potentially
+huge) integer, which makes it safe to call on untrusted input.
+
+## Examples
+
+```erlang
+1> list_to_integer("12345", 10, 5).
+12345
+2> list_to_integer("123456", 10, 5).
+** exception error: bad argument
+3> list_to_integer("-00042", 10, 2).
+-42
+```
+
+Failure: `badarg` if `String` contains an invalid representation of an integer,
+or if it has more than `MaxLength` significant digits.
+""".
+-doc #{ category => terms }.
+-doc(#{since => <<"OTP 30">>}).
+-spec list_to_integer(String, Base, MaxLength) -> integer() when
+      String :: string(),
+      Base :: 2..36,
+      MaxLength :: pos_integer().
+list_to_integer(String, Base, MaxLength)
+  when erlang:is_integer(MaxLength), MaxLength >= 1 ->
+    case erts_internal:list_to_integer(String, Base, MaxLength) of
+        {Int,[]} ->
+            Int;
+        big ->
+            %% Within the length limit but too big for a small integer.
+            try erlang:list_to_binary(String) of
+                Binary ->
+                    case big_binary_to_int(Binary, Base) of
+                        N when erlang:is_integer(N) ->
+                            N;
+                        Reason ->
+                            error_with_info(Reason, [String, Base, MaxLength])
+                    end
+            catch
+                error:Reason ->
+                    error_with_info(Reason, [String, Base, MaxLength])
+            end;
+        too_long ->
+            badarg_with_cause([String, Base, MaxLength], too_long);
+        _ ->
+            badarg_with_info([String, Base, MaxLength])
+    end;
+list_to_integer(String, Base, MaxLength) ->
+    badarg_with_info([String, Base, MaxLength]).
 
 -doc """
 Returns a process identifier whose text representation is a `String`.

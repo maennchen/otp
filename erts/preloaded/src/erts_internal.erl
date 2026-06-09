@@ -123,7 +123,8 @@
 
 -export([no_aux_work_threads/0]).
 
--export([binary_to_integer/2, list_to_integer/2]).
+-export([binary_to_integer/2, binary_to_integer/3,
+         list_to_integer/2, list_to_integer/3]).
 
 -export([dynamic_node_name/0, dynamic_node_name/1]).
 
@@ -1114,6 +1115,16 @@ no_aux_work_threads() ->
 binary_to_integer(_Bin, _Base) ->
     erlang:nif_error(undefined).
 
+%% Helper BIF for binary_to_integer/3.
+
+-spec binary_to_integer(Bin, Base, MaxLength) ->
+          integer() | big | 'too_long' | 'badarg' when
+      Bin :: binary(),
+      Base :: 2..36,
+      MaxLength :: pos_integer().
+binary_to_integer(_Bin, _Base, _MaxLength) ->
+    erlang:nif_error(undefined).
+
 %% Helper BIF for list_to_integer/{1,2}.
 
 -spec list_to_integer(List, Base) ->
@@ -1121,6 +1132,17 @@ binary_to_integer(_Bin, _Base) ->
       List :: [any()],
       Base :: 2..36.
 list_to_integer(_List, _Base) ->
+    erlang:nif_error(undefined).
+
+%% Helper BIF for list_to_integer/3.
+
+-spec list_to_integer(List, Base, MaxLength) ->
+          {integer(),list()} | 'big' | 'too_long' |
+          'badarg' | 'no_integer' | 'not_a_list' when
+      List :: [any()],
+      Base :: 2..36,
+      MaxLength :: pos_integer().
+list_to_integer(_List, _Base, _MaxLength) ->
     erlang:nif_error(undefined).
 
 %%

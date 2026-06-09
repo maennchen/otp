@@ -772,6 +772,11 @@ error_info(_Config) ->
          {binary_to_integer, [abc, 100]},
          {binary_to_integer, [<<"abc">>, 100]},
 
+         {binary_to_integer, [<<"abc">>, 100, 5]},
+         {binary_to_integer, [<<"abc">>, 10, 0]},
+         {binary_to_integer, [<<"abc">>, 10, bad]},
+         {binary_to_integer, [<<"123">>, 10, 2]},
+
          {binary_to_list, [<<0:4>>]},
          {binary_to_list, [abc]},
 
@@ -981,6 +986,11 @@ error_info(_Config) ->
          {list_to_integer, [[a|b],abc]},
          {list_to_integer, [abc,10]},
          {list_to_integer, ["42",abc]},
+
+         {list_to_integer, ["abc", 100, 5]},
+         {list_to_integer, ["abc", 10, 0]},
+         {list_to_integer, ["abc", 10, bad]},
+         {list_to_integer, ["123", 10, 2]},
 
          {list_to_pid, ["pid"]},
          {list_to_pid, [42]},

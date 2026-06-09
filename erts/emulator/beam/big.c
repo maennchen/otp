@@ -3030,7 +3030,15 @@ static const Sint largest_power_of_base_lookup[36-1] = {
 #endif
 };
 
-static Eterm chars_to_integer(const byte *bytes, Uint size, const Uint base)
+/*
+ * Convert a string of characters to an integer in the given base.
+ *
+ * max_len is the maximum number of significant digits (sign and leading
+ * zeroes excluded) accepted; 0 means no limit. An over-length input returns
+ * am_too_long before any accumulation, so a huge input is rejected cheaply.
+ */
+static Eterm chars_to_integer(const byte *bytes, Uint size, const Uint base,
+                              const Uint max_len)
 {
     Sint i = 0;
     int neg = 0;
@@ -3060,6 +3068,11 @@ static Eterm chars_to_integer(const byte *bytes, Uint size, const Uint base)
             /* All zero! */
             return make_small(0);
         }
+    }
+
+    if (max_len != 0 && size > max_len) {
+        /* More significant digits than allowed. */
+        return am_too_long;
     }
 
     if (size > get_digits_per_small(base)) {
@@ -3099,34 +3112,64 @@ static Eterm chars_to_integer(const byte *bytes, Uint size, const Uint base)
     return make_small(i);
 }
 
-BIF_RETTYPE erts_internal_binary_to_integer_2(BIF_ALIST_2)
+static BIF_RETTYPE binary_to_integer_helper(Process *p, Eterm bin_arg,
+                                            Eterm base_arg, Uint max_len)
 {
     const byte *temp_alloc = NULL, *bytes;
     Uint size;
     Uint base;
     Eterm res;
 
-    if (!is_small(BIF_ARG_2)) {
+    if (!is_small(base_arg)) {
         BIF_RET(am_badarg);
     }
 
-    base = (Uint)signed_val(BIF_ARG_2);
+    base = (Uint)signed_val(base_arg);
 
     if (base < 2 || base > 36) {
         BIF_RET(am_badarg);
     }
 
-    bytes = erts_get_aligned_binary_bytes(BIF_ARG_1, &size, &temp_alloc);
+    bytes = erts_get_aligned_binary_bytes(bin_arg, &size, &temp_alloc);
     if (bytes == NULL) {
         BIF_RET(am_badarg);
     }
 
-    res = chars_to_integer(bytes, size, base);
+    res = chars_to_integer(bytes, size, base, max_len);
     erts_free_aligned_binary_bytes(temp_alloc);
     BIF_RET(res);
 }
 
-BIF_RETTYPE erts_internal_list_to_integer_2(BIF_ALIST_2)
+BIF_RETTYPE erts_internal_binary_to_integer_2(BIF_ALIST_2)
+{
+    return binary_to_integer_helper(BIF_P, BIF_ARG_1, BIF_ARG_2, 0);
+}
+
+BIF_RETTYPE erts_internal_binary_to_integer_3(BIF_ALIST_3)
+{
+    Uint max_len;
+
+    if (!is_small(BIF_ARG_3)) {
+        BIF_RET(am_badarg);
+    }
+    max_len = (Uint)signed_val(BIF_ARG_3);
+    if (signed_val(BIF_ARG_3) < 1) {
+        BIF_RET(am_badarg);
+    }
+
+    return binary_to_integer_helper(BIF_P, BIF_ARG_1, BIF_ARG_2, max_len);
+}
+
+/*
+ * max_len is the maximum number of significant digits accepted (0 means no
+ * limit). When the value is too large for a small integer, the remaining
+ * significant digits are counted up to max_len + 1 (a walk bounded by max_len,
+ * never the whole list) so an over-length input returns am_too_long instead of
+ * am_big - before list_to_integer/3 converts the list to a binary and parses
+ * the bignum.
+ */
+static BIF_RETTYPE list_to_integer_helper(Process *p, Eterm list_arg,
+                                          Eterm base_arg, Uint max_len)
 {
     Eterm res;
     Sint i = 0;
@@ -3134,7 +3177,7 @@ BIF_RETTYPE erts_internal_list_to_integer_2(BIF_ALIST_2)
     int neg = 0;
     Sint n = 0;
     byte c;
-    Eterm list = BIF_ARG_1;
+    Eterm list = list_arg;
     Uint base;
     Uint digits_per_small;
     Eterm *hp;
@@ -3145,10 +3188,10 @@ BIF_RETTYPE erts_internal_list_to_integer_2(BIF_ALIST_2)
         BIF_RET(am_not_a_list);
     }
 
-    if (is_not_small(BIF_ARG_2)) {
+    if (is_not_small(base_arg)) {
         BIF_RET(am_badarg);
     }
-    base = unsigned_val(BIF_ARG_2);
+    base = unsigned_val(base_arg);
     if (base < 2 || base > 36) {
         BIF_RET(am_badarg);
     }
@@ -3173,7 +3216,7 @@ BIF_RETTYPE erts_internal_list_to_integer_2(BIF_ALIST_2)
                     BIF_RET(am_no_integer);
                 } else {
                     res = make_small(0);
-                    hp = HAlloc(BIF_P, 3);
+                    hp = HAlloc(p, 3);
                     BIF_RET(TUPLE2(hp, res, list));
                 }
             }
@@ -3188,7 +3231,7 @@ BIF_RETTYPE erts_internal_list_to_integer_2(BIF_ALIST_2)
             BIF_RET(am_no_integer);
         } else {
             res = make_small(0);
-            hp = HAlloc(BIF_P, 3);
+            hp = HAlloc(p, 3);
             BIF_RET(TUPLE2(hp, res, list));
         }
     }
@@ -3215,12 +3258,66 @@ BIF_RETTYPE erts_internal_list_to_integer_2(BIF_ALIST_2)
         BIF_RET(am_no_integer);
     }
 
+    /*
+     * `n` is the number of significant digits consumed so far (leading zeroes
+     * already skipped), capped at digits_per_small + 1. If it already exceeds
+     * the limit the input is too long regardless of value size.
+     */
+    if (max_len != 0 && n > (Sint)max_len) {
+        BIF_RET(am_too_long);
+    }
+
     if (n > digits_per_small) {
+        /*
+         * Too large for a small integer. If a limit is set, count the
+         * remaining significant digits up to max_len + 1 to decide between
+         * am_too_long and am_big without parsing the (possibly huge) bignum.
+         */
+        if (max_len != 0) {
+            Sint len = n;       /* significant digits counted so far */
+
+            while (is_list(list)) {
+                Eterm car = CAR(list_val(list));
+
+                if (is_not_small(car)) {
+                    break;
+                }
+                c = unsigned_val(car);
+                if (c2int_is_invalid_char(c, base)) {
+                    break;
+                }
+                len++;
+                if (len > (Sint)max_len) {
+                    BIF_RET(am_too_long);
+                }
+                list = CDR(list_val(list));
+            }
+        }
         BIF_RET(am_big);
     } else {
         i = neg ? -(Sint)ui : (Sint)ui;
         res = make_small(i);
-        hp = HAlloc(BIF_P, 3);
+        hp = HAlloc(p, 3);
         BIF_RET(TUPLE2(hp, res, list));
     }
+}
+
+BIF_RETTYPE erts_internal_list_to_integer_2(BIF_ALIST_2)
+{
+    return list_to_integer_helper(BIF_P, BIF_ARG_1, BIF_ARG_2, 0);
+}
+
+BIF_RETTYPE erts_internal_list_to_integer_3(BIF_ALIST_3)
+{
+    Uint max_len;
+
+    if (!is_small(BIF_ARG_3)) {
+        BIF_RET(am_badarg);
+    }
+    if (signed_val(BIF_ARG_3) < 1) {
+        BIF_RET(am_badarg);
+    }
+    max_len = (Uint)signed_val(BIF_ARG_3);
+
+    return list_to_integer_helper(BIF_P, BIF_ARG_1, BIF_ARG_2, max_len);
 }

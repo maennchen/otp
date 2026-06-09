@@ -695,6 +695,34 @@ t_string_to_integer(Config) when is_list(Config) ->
     {error,system_limit} = string:to_integer(Digits),
     _ = erlang:garbage_collect(),
 
+    %% binary_to_integer/3 and list_to_integer/3 with a max-length limit.
+    %% The two share the bounded C path, so each behaviour is exercised once
+    %% and both entry points are spot-checked.
+
+    %% Within the limit succeeds, small and bignum-sized.
+    12345 = binary_to_integer(<<"12345">>, 10, 5),
+    12345 = list_to_integer("12345", 10, 5),
+    Big50 = list_to_integer(lists:duplicate(50, $9), 10, 50),
+    true = Big50 > (1 bsl 64),
+    Big50 = binary_to_integer(list_to_binary(lists:duplicate(50, $9)), 10, 50),
+
+    %% Sign and leading zeroes do not count towards the length.
+    -42 = binary_to_integer(<<"-00042">>, 10, 2),
+    -42 = list_to_integer("-00042", 10, 2),
+
+    %% Over the limit fails - including for values that fit in a small integer.
+    {'EXIT',{badarg,_}} = catch binary_to_integer(<<"1234">>, 10, 2),
+    {'EXIT',{badarg,_}} = catch list_to_integer("1234", 10, 2),
+    {'EXIT',{badarg,_}} =
+        catch binary_to_integer(list_to_binary(lists:duplicate(51, $9)), 10, 50),
+    {'EXIT',{badarg,_}} =
+        catch list_to_integer(lists:duplicate(51, $9), 10, 50),
+
+    %% Invalid MaxLength.
+    {'EXIT',{badarg,_}} = catch binary_to_integer(<<"1">>, 10, 0),
+    {'EXIT',{badarg,_}} = catch binary_to_integer(<<"1">>, 10, -1),
+    {'EXIT',{badarg,_}} = catch list_to_integer("1", 10, abc),
+
     ok.
 
 rand_bignum() ->

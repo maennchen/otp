@@ -265,6 +265,11 @@ format_erlang_error(binary_to_integer, [Bin,Base], _) ->
         BadBase ->
             [must_be_binary(Bin, []),BadBase]
     end;
+format_erlang_error(binary_to_integer, [_Bin,_Base,_MaxLength], too_long) ->
+    [too_many_digits];
+format_erlang_error(binary_to_integer, [Bin,Base,MaxLength], _) ->
+    [must_be_binary(Bin, {not_encodable,<<"an integer">>}),
+     must_be_base(Base),must_be_pos_int(MaxLength)];
 format_erlang_error(binary_to_list, [_], _) ->
     [not_binary];
 format_erlang_error(binary_to_list, [Bin,Start,Stop], _) ->
@@ -532,6 +537,11 @@ format_erlang_error(list_to_integer, [List,Base], _) ->
         BadBase ->
             [must_be_list(List, []),BadBase]
     end;
+format_erlang_error(list_to_integer, [_List,_Base,_MaxLength], too_long) ->
+    [too_many_digits];
+format_erlang_error(list_to_integer, [List,Base,MaxLength], _) ->
+    [must_be_list(List, {not_encodable,<<"an integer">>}),
+     must_be_base(Base),must_be_pos_int(MaxLength)];
 format_erlang_error(list_to_pid, [List], _) ->
     list_to_something(List, [{not_encodable,<<"a pid">>}]);
 format_erlang_error(list_to_port, [List], _) ->
@@ -1533,6 +1543,8 @@ expand_error(dead_port) ->
     <<"the port identifier does not refer to an existing port">>;
 expand_error({not_encodable,Type}) ->
     [<<"not a textual representation of ">>,Type];
+expand_error(too_many_digits) ->
+    <<"has more significant digits than the given limit allows">>;
 expand_error(non_existing_atom) ->
     <<"not an already existing atom">>;
 expand_error(not_atom) ->
