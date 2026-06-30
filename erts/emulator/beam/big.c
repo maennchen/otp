@@ -4706,18 +4706,34 @@ static Eterm c2int_parse(Process *p, Eterm *bif_args)
                 YCF_CONSUME_REDS(1);
             }
         } else {
+            /*
+             * Binary: process digits least-significant first (right to left),
+             * shifting bpd bits at a time into a running accumulator and
+             * flushing a whole word once D_EXP bits are buffered. This avoids a
+             * per-digit divide/modulo and writes each result word exactly once.
+             */
             const byte *b = bytes;
-            for (dp = 0; dp < (Uint) n_digits; dp++) {
-                ErtsDigit d = (ErtsDigit) c2int_digit_from_base(b[dp]);
-                Uint bitpos = ((Uint) n_digits - 1 - dp) * (Uint) bpd;
-                Uint wi = bitpos / D_EXP;
-                Uint off = bitpos % D_EXP;
-                pow2_w[wi] |= d << off;
-                if (off + (Uint) bpd > D_EXP) {
-                    pow2_w[wi + 1] |= d >> (D_EXP - off);
+            ErtsDigit acc = 0;
+            Uint accbits = 0;
+            Uint wi = 0;
+            Uint cnt = 0;
+            for (dp = (Uint) n_digits; dp > 0; dp--) {
+                ErtsDigit d = (ErtsDigit) c2int_digit_from_base(b[dp - 1]);
+                acc |= d << accbits;
+                if (accbits + (Uint) bpd >= D_EXP) {
+                    pow2_w[wi++] = acc;
+                    /* Carry the bits of d that didn't fit into the next word. */
+                    acc = (accbits == 0) ? 0 : (d >> (D_EXP - accbits));
+                    accbits = accbits + (Uint) bpd - D_EXP;
+                } else {
+                    accbits += (Uint) bpd;
                 }
-                YCF_CONSUME_REDS(1);
+                if (++cnt >= 1024) { cnt = 0; YCF_CONSUME_REDS(1024); }
             }
+            if (accbits > 0) {
+                pow2_w[wi++] = acc;
+            }
+            ASSERT(wi <= (Uint) nwords);
         }
 
         wlen = nwords;
