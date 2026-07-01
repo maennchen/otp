@@ -4235,6 +4235,28 @@ static ERTS_INLINE Uint64 c2int_swar_invalid8(const byte *b, int has_alpha,
 #endif
 
 /*
+ * Portable 64-bit byte swap for the SWAR pack helpers (which are 64-bit only).
+ * __builtin_bswap64 is not available on MSVC; mirror erl_map.c's dispatch.
+ */
+#if (ERTS_AT_LEAST_GCC_VSN__(5, 1, 0) || __has_builtin(__builtin_bswap64))
+#  define c2int_bswap64(N) __builtin_bswap64((Uint64)(N))
+#elif defined(_MSC_VER) && _MSC_VER >= 1900
+#  include <stdlib.h>
+#  define c2int_bswap64(N) _byteswap_uint64((Uint64)(N))
+#else
+static ERTS_INLINE Uint64 c2int_bswap64(Uint64 v) {
+    return ((v & 0x00000000000000ffULL) << 56)
+         | ((v & 0x000000000000ff00ULL) << 40)
+         | ((v & 0x0000000000ff0000ULL) << 24)
+         | ((v & 0x00000000ff000000ULL) << 8)
+         | ((v & 0x000000ff00000000ULL) >> 8)
+         | ((v & 0x0000ff0000000000ULL) >> 24)
+         | ((v & 0x00ff000000000000ULL) >> 40)
+         | ((v & 0xff00000000000000ULL) >> 56);
+}
+#endif
+
+/*
  * Decode 8 validated hex ASCII bytes into their 4-bit nibble values, one nibble
  * per byte lane. '0'-'9' -> 0..9, 'A'-'F'/'a'-'f' -> 10..15 (case-insensitive
  * via the 0x20 lowercase fold; +9 added to lanes whose bit 6 is set = alpha).
@@ -4264,8 +4286,8 @@ static ERTS_INLINE ErtsDigit c2int_swar_pack16_hex(const byte *b) {
     sys_memcpy(&v1, b, 8);        /* high 8 chars */
     sys_memcpy(&v0, b + 8, 8);    /* low 8 chars */
     /* bswap so lane 0 holds the least-significant char of each group. */
-    n0 = __builtin_bswap64(c2int_swar_hex_nibbles(v0));
-    n1 = __builtin_bswap64(c2int_swar_hex_nibbles(v1));
+    n0 = c2int_bswap64(c2int_swar_hex_nibbles(v0));
+    n1 = c2int_bswap64(c2int_swar_hex_nibbles(v1));
     return (ErtsDigit) (c2int_swar_gather_nibbles(n0)
                         | (c2int_swar_gather_nibbles(n1) << 32));
 }
@@ -4281,7 +4303,7 @@ static ERTS_INLINE ErtsDigit c2int_swar_pack64_bin(const byte *b) {
         Uint64 v, g;
         sys_memcpy(&v, b + 56 - 8 * chunk, 8);   /* chunk 0 = least-significant group */
         v &= (Uint64) 0x0101010101010101ULL;     /* low bit of each ASCII digit */
-        v = __builtin_bswap64(v);                /* lane 0 = least-significant bit */
+        v = c2int_bswap64(v);                    /* lane 0 = least-significant bit */
         g = (v * (Uint64) 0x0102040810204080ULL) >> 56;   /* gather 8 low bits */
         w |= g << (8 * chunk);
     }
