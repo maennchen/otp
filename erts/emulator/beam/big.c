@@ -4222,6 +4222,72 @@ static ERTS_INLINE Uint64 c2int_swar_invalid8(const byte *b, int has_alpha,
     return outof;
 }
 
+/*
+ * The SWAR pack helpers below assume little-endian byte order in the 8-byte
+ * loads (lane 0 after a load is the byte at the lowest address). This build-time
+ * constant gates the pack fast path; on big-endian it is 0 and the branch that
+ * uses it folds away, falling back to the scalar accumulator.
+ */
+#ifdef WORDS_BIGENDIAN
+#  define c2int_swar_pack_ok 0
+#else
+#  define c2int_swar_pack_ok 1
+#endif
+
+/*
+ * Decode 8 validated hex ASCII bytes into their 4-bit nibble values, one nibble
+ * per byte lane. '0'-'9' -> 0..9, 'A'-'F'/'a'-'f' -> 10..15 (case-insensitive
+ * via the 0x20 lowercase fold; +9 added to lanes whose bit 6 is set = alpha).
+ */
+static ERTS_INLINE Uint64 c2int_swar_hex_nibbles(Uint64 v) {
+    Uint64 lower = v | (Uint64) 0x2020202020202020ULL;
+    Uint64 dg = lower - (Uint64) 0x3030303030303030ULL;
+    Uint64 addend = ((lower & (Uint64) 0x4040404040404040ULL) >> 6)
+                    * (Uint64) 0x09ULL;
+    return (dg + addend) & (Uint64) 0x0f0f0f0f0f0f0f0fULL;
+}
+
+/* Gather one nibble from each of 8 byte lanes (lane i -> bits [4i,4i+4)). */
+static ERTS_INLINE Uint64 c2int_swar_gather_nibbles(Uint64 n) {
+    return (n & 0xfULL) | ((n >> 4) & 0xf0ULL) | ((n >> 8) & 0xf00ULL)
+         | ((n >> 12) & 0xf000ULL) | ((n >> 16) & 0xf0000ULL)
+         | ((n >> 20) & 0xf00000ULL) | ((n >> 24) & 0xf000000ULL)
+         | ((n >> 28) & 0xf0000000ULL);
+}
+
+/*
+ * Pack 16 hex chars (most-significant first at b[0], b[15] least significant)
+ * into one 64-bit word.
+ */
+static ERTS_INLINE ErtsDigit c2int_swar_pack16_hex(const byte *b) {
+    Uint64 v0, v1, n0, n1;
+    sys_memcpy(&v1, b, 8);        /* high 8 chars */
+    sys_memcpy(&v0, b + 8, 8);    /* low 8 chars */
+    /* bswap so lane 0 holds the least-significant char of each group. */
+    n0 = __builtin_bswap64(c2int_swar_hex_nibbles(v0));
+    n1 = __builtin_bswap64(c2int_swar_hex_nibbles(v1));
+    return (ErtsDigit) (c2int_swar_gather_nibbles(n0)
+                        | (c2int_swar_gather_nibbles(n1) << 32));
+}
+
+/*
+ * Pack 64 binary chars ('0'/'1', most-significant first at b[0], b[63] least
+ * significant) into one word.
+ */
+static ERTS_INLINE ErtsDigit c2int_swar_pack64_bin(const byte *b) {
+    Uint64 w = 0;
+    int chunk;
+    for (chunk = 0; chunk < 8; chunk++) {
+        Uint64 v, g;
+        sys_memcpy(&v, b + 56 - 8 * chunk, 8);   /* chunk 0 = least-significant group */
+        v &= (Uint64) 0x0101010101010101ULL;     /* low bit of each ASCII digit */
+        v = __builtin_bswap64(v);                /* lane 0 = least-significant bit */
+        g = (v * (Uint64) 0x0102040810204080ULL) >> 56;   /* gather 8 low bits */
+        w |= g << (8 * chunk);
+    }
+    return (ErtsDigit) w;
+}
+
 static ERTS_INLINE byte c2int_digit_from_base(byte ch) {
     return ch <= '9' ? ch - '0'
             : (10 + (ch <= 'Z' ? ch - 'A' : ch - 'a'));
@@ -4796,12 +4862,48 @@ static Eterm c2int_parse(Process *p, Eterm *bif_args)
                 l = CDR(list_val(l));
                 YCF_CONSUME_REDS(1);
             }
+        } else if (c2int_swar_pack_ok && (bpd == 4 || bpd == 1)) {
+            /*
+             * SWAR fast path for the word-aligned power-of-two bases (base 16:
+             * 16 chars/word; base 2: 64 chars/word) on little-endian. Pack whole
+             * words directly from the least-significant end; the front `head`
+             * chars (a partial top word) are finished by the scalar accumulator.
+             * Because chars_per_word * bpd == D_EXP exactly, the SWAR and scalar
+             * halves meet on a word boundary. c2int_swar_pack_ok is a build-time
+             * constant, so the whole branch folds away on big-endian.
+             */
+            const byte *b = bytes;
+            Uint cpw = (Uint) (D_EXP / (Uint) bpd);   /* 16 or 64 */
+            Uint head = (Uint) n_digits;
+            Uint wi = 0;
+            Uint cnt = 0;
+            ErtsDigit acc;
+            Uint accbits;
+
+            while (head >= cpw) {
+                const byte *grp = b + head - cpw;
+                pow2_w[wi++] = (bpd == 4) ? c2int_swar_pack16_hex(grp)
+                                          : c2int_swar_pack64_bin(grp);
+                head -= cpw;
+                if (++cnt >= 64) { cnt = 0; YCF_CONSUME_REDS(64); }
+            }
+            /* Scalar finish for the partial top word (head < cpw chars). */
+            acc = 0; accbits = 0;
+            for (dp = head; dp > 0; dp--) {
+                ErtsDigit d = (ErtsDigit) c2int_digit_from_base(b[dp - 1]);
+                acc |= d << accbits;
+                accbits += (Uint) bpd;
+            }
+            if (accbits > 0) {
+                pow2_w[wi++] = acc;
+            }
+            ASSERT(wi <= (Uint) nwords);
         } else {
             /*
-             * Binary: process digits least-significant first (right to left),
-             * shifting bpd bits at a time into a running accumulator and
-             * flushing a whole word once D_EXP bits are buffered. This avoids a
-             * per-digit divide/modulo and writes each result word exactly once.
+             * Scalar accumulator for the non-word-aligned power-of-two bases
+             * (8 and 32), and the fallback on big-endian: process digits
+             * least-significant first, shifting bpd bits into a running
+             * accumulator and flushing a whole word once D_EXP bits are buffered.
              */
             const byte *b = bytes;
             ErtsDigit acc = 0;
@@ -4813,7 +4915,6 @@ static Eterm c2int_parse(Process *p, Eterm *bif_args)
                 acc |= d << accbits;
                 if (accbits + (Uint) bpd >= D_EXP) {
                     pow2_w[wi++] = acc;
-                    /* Carry the bits of d that didn't fit into the next word. */
                     acc = (accbits == 0) ? 0 : (d >> (D_EXP - accbits));
                     accbits = accbits + (Uint) bpd - D_EXP;
                 } else {
