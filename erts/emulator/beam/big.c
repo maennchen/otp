@@ -4563,7 +4563,7 @@ static Eterm c2int_parse(Process *p, Eterm *bif_args)
     int is_list_src;
     const byte *bytes = NULL;  /* binary source cursor */
     Uint size = 0;             /* binary source remaining bytes */
-    const byte *temp_alloc = NULL; /* TMP backing from get_aligned_binary_bytes */
+    byte *temp_alloc = NULL;       /* TMP backing from get_aligned_binary_bytes */
     byte *bin_copy = NULL;     /* yield-safe copy of the binary digit bytes */
     Eterm list = NIL;          /* list source cursor */
     int want_tuple = 0;        /* list source -> wrap result as {Int,Rest} */
@@ -4680,7 +4680,14 @@ static Eterm c2int_parse(Process *p, Eterm *bif_args)
          * (sign-stripped, zero-trimmed) digit bytes into a C2INT_SCRATCH buffer
          * that does survive yields, and free the TMP copy immediately.
          */
-        aligned = erts_get_aligned_binary_bytes(input, &size, &temp_alloc);
+        /*
+         * Cast away the const on &temp_alloc: YCF lifts trap-state locals into
+         * a struct and drops the `const` qualifier, so &temp_alloc is `byte **`
+         * in the generated code while erts_get_aligned_binary_bytes wants
+         * `const byte **`. The pointee is never written through here.
+         */
+        aligned = erts_get_aligned_binary_bytes(input, &size,
+                                                (const byte **) &temp_alloc);
         if (aligned == NULL) {
             return am_badarg;
         }
