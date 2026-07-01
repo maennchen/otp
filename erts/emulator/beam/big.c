@@ -4627,7 +4627,7 @@ static Eterm c2int_parse(Process *p, Eterm *bif_args)
     Uint base;
     int sign = 0;              /* 1 = negative */
     int is_list_src;
-    const byte *bytes = NULL;  /* binary source cursor */
+    byte *bytes = NULL;        /* binary source cursor (non-const: see below) */
     Uint size = 0;             /* binary source remaining bytes */
     byte *temp_alloc = NULL;       /* TMP backing from get_aligned_binary_bytes */
     byte *bin_copy = NULL;     /* yield-safe copy of the binary digit bytes */
@@ -4735,8 +4735,15 @@ static Eterm c2int_parse(Process *p, Eterm *bif_args)
         list = l;               /* l now points at the first non-zero digit */
         rest_out = scan;        /* tail after the digit run */
     } else {
-        const byte *aligned;
-        const byte *b;
+        /*
+         * These are declared non-const (rather than `const byte *`) because YCF
+         * lifts trap-state locals into a struct and drops their `const`
+         * qualifier; keeping the source in sync avoids -Werror mismatches (GCC)
+         * on the assignment and on &temp_alloc below. The bytes are never
+         * written through these pointers.
+         */
+        byte *aligned;
+        byte *b;
         Uint sz;
 
         /*
@@ -4744,16 +4751,11 @@ static Eterm c2int_parse(Process *p, Eterm *bif_args)
          * (for unaligned input). That TMP allocation must not be held across a
          * YCF yield (the unused-temp-alloc check would trip), so we copy the
          * (sign-stripped, zero-trimmed) digit bytes into a C2INT_SCRATCH buffer
-         * that does survive yields, and free the TMP copy immediately.
+         * that does survive yields, and free the TMP copy immediately. The casts
+         * below drop the `const` that YCF strips from these locals.
          */
-        /*
-         * Cast away the const on &temp_alloc: YCF lifts trap-state locals into
-         * a struct and drops the `const` qualifier, so &temp_alloc is `byte **`
-         * in the generated code while erts_get_aligned_binary_bytes wants
-         * `const byte **`. The pointee is never written through here.
-         */
-        aligned = erts_get_aligned_binary_bytes(input, &size,
-                                                (const byte **) &temp_alloc);
+        aligned = (byte *) erts_get_aligned_binary_bytes(
+                      input, &size, (const byte **) &temp_alloc);
         if (aligned == NULL) {
             return am_badarg;
         }
