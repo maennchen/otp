@@ -150,9 +150,13 @@ is, it implies nothing about how the application or OTP has been built.
 
 ### Order of Versions
 
-Version numbers in general are only partially ordered. However, normal version
-numbers (with three parts) as of OTP 17.0 have a total or linear order. This
-applies both to normal OTP versions and normal application versions.
+Version numbers in general are only **partially** ordered: for some pairs of
+versions, neither is larger than the other. Comparing two versions therefore has
+four possible outcomes: smaller, equal, larger, or **no order**.
+
+Normal version numbers (with three parts or fewer) as of OTP 17.0 have a total
+or linear order among themselves. This applies both to normal OTP versions and
+normal application versions.
 
 When comparing two version numbers with a defined order, one compares
 each part as standard integers, starting from the most significant
@@ -161,26 +165,86 @@ determined by the first parts of the same significance that differ. A
 larger OTP version encompasses all changes present in a smaller OTP
 version. The same principle applies to application versions.
 
-Versions can have more than three parts, resulting in partial
-ordering. Such versions are only used when branching off from another
-branch. When an extra part (apart from the normal three parts) is added to
-a version number, a new branch of versions is made. The new branch has
-a linear order against the base version. However, versions on
-different branches have no order, and therefore one can only conclude
-that they all include what is included in their closest common
-ancestor. When branching multiple times from the same base version,
-`0` parts are added between the base version and the least significant
-`1` part until a unique version is found. Versions that have an order
-can be compared as described in the previous paragraph.
+#### Branched Versions
 
-An example of branched versions: The version `6.0.2.1` is a branched version
-from the base version `6.0.2`. Versions of the form `6.0.2.<X>` can be compared
-with normal versions smaller than or equal to `6.0.2`, and other versions on the
-form `6.0.2.<X>`. The version `6.0.2.1` will include all changes in `6.0.2`.
-However, `6.0.3` will most likely _not_ include all changes in `6.0.2.1` (note
-that these versions have no order). A second branched version from the base
-version `6.0.2` will be version `6.0.2.0.1`, and a third branched version will
-be `6.0.2.0.0.1`.
+Versions can have more than three parts. Such versions are only used when
+branching off from another version, and it is these that make the order partial.
+When an extra part (apart from the normal three parts) is added to a version
+number, a new branch of versions is made.
+
+The **base** of a branched version is the version it was branched from: all of
+its parts except the last. The version `6.0.2.1` is branched from the base
+`6.0.2`. A version with three parts or fewer is not branched and is its own
+base.
+
+A branch exists to carry changes onto a release line that the main line has
+already moved past. `6.0.2.1` includes everything in `6.0.2` plus the change it
+was branched to deliver. `6.0.3` also includes everything in `6.0.2`, plus
+different work. Neither includes all of the other, so neither is larger. They
+have no order, and one can only conclude that both include what is in their
+closest common ancestor.
+
+A change made on a branch may or may not also be applied to the line the branch
+left, and the version number does not record which. `6.0.3` may contain the fix
+delivered in `6.0.2.1`, or it may not; nothing in either number says. This is
+why the two have no order rather than an unknown-but-existing one, and why a
+consumer must not infer that a change present in a branched version is present
+in any later version off the base.
+
+#### Comparing Two Versions
+
+Branching is recursive: a branched version can itself be branched from, becoming
+the base of the new branch. `18.3.4.1.1` is branched from `18.3.4.1`, which is
+in turn branched from `18.3.4`.
+
+To compare versions `A` and `B`, apply the first rule that matches:
+
+1. **Neither has more than three parts.** They are ordered. Compare part by
+   part as described above.
+2. **One is an ancestor of the other**, that is, its parts are a leading
+   sequence of the other's. The ancestor is the smaller: `18.3.4` < `18.3.4.1`
+   < `18.3.4.1.1`.
+3. **Both branch from the same base.** They are ordered by their differing
+   last part: `6.0.2.1` < `6.0.2.2`.
+4. **Exactly one has more than three parts**, and the other is smaller than or
+   equal to a version the branched one descends from. The branched version is
+   the larger: `6.0.1` < `6.0.2.1`, since `6.0.1` < `6.0.2`.
+5. **Anything else.** They have **no order**.
+
+Examples, taking `6.0.2.1` (branched from `6.0.2`) as the branched version:
+
+| `A`         | `B`         | Result                            |
+| ----------- | ----------- | --------------------------------- |
+| `6.0.2`     | `6.0.2.1`   | `A` < `B` (rule 2, ancestor)      |
+| `6.0.1`     | `6.0.2.1`   | `A` < `B` (rule 4, below base)    |
+| `6.0.2.1`   | `6.0.2.2`   | `A` < `B` (rule 3, same base)     |
+| `6.0.3`     | `6.0.2.1`   | **no order** (above the base)     |
+| `6.1`       | `6.0.2.1`   | **no order** (above the base)     |
+| `6.0.2.1`   | `6.0.3.1`   | **no order** (different bases)    |
+| `6.0.2.0.1` | `6.0.2.1`   | **no order** (different bases)    |
+
+Note the fourth and fifth rows: a normal version that *looks* larger than a
+branched one is not larger, but unordered against it.
+
+When branching multiple times from the same base version, `0` parts are added
+between the base version and the least significant `1` part until a unique
+version is found. A second branched version from the base version `6.0.2` will
+be version `6.0.2.0.1`, and a third branched version will be `6.0.2.0.0.1`.
+These branch from `6.0.2.0` and `6.0.2.0.0` respectively, not from `6.0.2`, so
+they have no order against `6.0.2.1` or against each other, as the last row
+above shows.
+
+#### Sorting Is Not Comparing
+
+A tool that lists versions must place every version somewhere, including pairs
+this scheme leaves unordered. Such a placement is a presentation choice made by
+that tool, not a statement about the versions.
+
+Do not read a position in a sorted list as a claim about content. That
+`6.0.2.1` is listed before `6.0.3` does not mean `6.0.3` includes its changes.
+Only the comparison above establishes that one version encompasses another, and
+only that comparison is a safe basis for deciding whether a fix is present in a
+given version.
 
 [](){: #releases_and_patches }
 
