@@ -479,8 +479,11 @@ set_cwd(Dirname) ->
 
 -doc(#{equiv => delete(Filename, [])}).
 -spec delete(Filename) -> ok | {error, Reason} when
-      Filename :: name_all(),
+      Filename :: name_all() | {io_device(), name_all()},
       Reason :: posix() | badarg.
+
+delete({#file_descriptor{}, _Name} = Target) ->
+    ?PRIM_FILE:delete(at_target(Target));
 
 delete(Name) ->
     check_and_call(delete, [file_name(Name)]).
@@ -562,11 +565,18 @@ Typical error reasons:
 - **`enotdir`** - `Source` is a directory, but `Destination` is not.
 
 - **`exdev`** - `Source` and `Destination` are on different file systems.
+
+`Source` and `Destination` can also be `{Dir, Name}` tuples, where `Dir` is a
+directory that was opened with the modes `raw`, `read` and `directory`. The two
+directories do not have to be the same one. See `open/2`.
 """.
 -spec rename(Source, Destination) -> ok | {error, Reason} when
-      Source :: name_all(),
-      Destination :: name_all(),
+      Source :: name_all() | {io_device(), name_all()},
+      Destination :: name_all() | {io_device(), name_all()},
       Reason :: posix() | badarg.
+
+rename({#file_descriptor{}, _From} = Source, {#file_descriptor{}, _To} = Dest) ->
+    ?PRIM_FILE:rename(at_target(Source), at_target(Dest));
 
 rename(From, To) ->
     check_and_call(rename, [file_name(From), file_name(To)]).
@@ -590,8 +600,11 @@ Typical error reasons:
   `enoent` is returned instead.
 """.
 -spec make_dir(Dir) -> ok | {error, Reason} when
-      Dir :: name_all(),
+      Dir :: name_all() | {io_device(), name_all()},
       Reason :: posix() | badarg.
+
+make_dir({#file_descriptor{}, _Name} = Target) ->
+    ?PRIM_FILE:make_dir(at_target(Target));
 
 make_dir(Name) ->
     check_and_call(make_dir, [file_name(Name)]).
@@ -616,8 +629,11 @@ Typical error reasons:
   `eacces` is returned instead.
 """.
 -spec del_dir(Dir) -> ok | {error, Reason} when
-      Dir :: name_all(),
+      Dir :: name_all() | {io_device(), name_all()},
       Reason :: posix() | badarg.
+
+del_dir({#file_descriptor{}, _Name} = Target) ->
+    ?PRIM_FILE:del_dir(at_target(Target));
 
 del_dir(Name) ->
     check_and_call(del_dir, [file_name(Name)]).
@@ -931,12 +947,15 @@ read_link_all(Name) ->
 
 -doc(#{equiv => write_file_info(Filename, FileInfo, [])}).
 -spec write_file_info(Filename, FileInfo) -> ok | {error, Reason} when
-      Filename :: name_all() | io_device(),
+      Filename :: name_all() | io_device() | {io_device(), name_all()},
       FileInfo :: file_info(),
       Reason :: posix() | badarg.
 
 write_file_info(#file_descriptor{module = Module} = Handle, Info = #file_info{}) ->
     Module:write_file_info(Handle, Info);
+
+write_file_info({#file_descriptor{}, _Name} = Target, Info = #file_info{}) ->
+    ?PRIM_FILE:write_file_info(at_target(Target), Info);
 
 write_file_info(Name, Info = #file_info{}) ->
     check_and_call(write_file_info, [file_name(Name), Info]).
@@ -1031,7 +1050,7 @@ process replaces the path.
 """.
 -doc(#{since => <<"OTP R15B">>}).
 -spec write_file_info(Filename, FileInfo, Opts) -> ok | {error, Reason} when
-      Filename :: name_all() | io_device(),
+      Filename :: name_all() | io_device() | {io_device(), name_all()},
       Opts :: [file_info_option()],
       FileInfo :: file_info(),
       Reason :: posix() | badarg.
@@ -1039,6 +1058,10 @@ process replaces the path.
 write_file_info(#file_descriptor{module = Module} = Handle, Info = #file_info{}, Opts)
   when is_list(Opts) ->
     Module:write_file_info(Handle, Info, Opts);
+
+write_file_info({#file_descriptor{}, _Name} = Target, Info = #file_info{}, Opts)
+  when is_list(Opts) ->
+    ?PRIM_FILE:write_file_info(at_target(Target), Info, Opts);
 
 write_file_info(Name, Info = #file_info{}, Opts) when is_list(Opts) ->
     Args = [file_name(Name), Info, Opts],

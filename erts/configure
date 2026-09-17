@@ -21801,6 +21801,42 @@ then :
   printf "%s\n" "#define HAVE_READLINKAT 1" >>confdefs.h
 
 fi
+ac_fn_c_check_func "$LINENO" "mkdirat" "ac_cv_func_mkdirat"
+if test "x$ac_cv_func_mkdirat" = xyes
+then :
+  printf "%s\n" "#define HAVE_MKDIRAT 1" >>confdefs.h
+
+fi
+ac_fn_c_check_func "$LINENO" "unlinkat" "ac_cv_func_unlinkat"
+if test "x$ac_cv_func_unlinkat" = xyes
+then :
+  printf "%s\n" "#define HAVE_UNLINKAT 1" >>confdefs.h
+
+fi
+ac_fn_c_check_func "$LINENO" "renameat" "ac_cv_func_renameat"
+if test "x$ac_cv_func_renameat" = xyes
+then :
+  printf "%s\n" "#define HAVE_RENAMEAT 1" >>confdefs.h
+
+fi
+ac_fn_c_check_func "$LINENO" "fchmodat" "ac_cv_func_fchmodat"
+if test "x$ac_cv_func_fchmodat" = xyes
+then :
+  printf "%s\n" "#define HAVE_FCHMODAT 1" >>confdefs.h
+
+fi
+ac_fn_c_check_func "$LINENO" "fchownat" "ac_cv_func_fchownat"
+if test "x$ac_cv_func_fchownat" = xyes
+then :
+  printf "%s\n" "#define HAVE_FCHOWNAT 1" >>confdefs.h
+
+fi
+ac_fn_c_check_func "$LINENO" "utimensat" "ac_cv_func_utimensat"
+if test "x$ac_cv_func_utimensat" = xyes
+then :
+  printf "%s\n" "#define HAVE_UTIMENSAT 1" >>confdefs.h
+
+fi
 ac_fn_c_check_func "$LINENO" "strlcpy" "ac_cv_func_strlcpy"
 if test "x$ac_cv_func_strlcpy" = xyes
 then :

@@ -946,6 +946,82 @@ posix_errno_t efile_set_owner(const efile_path_t *path, Sint32 owner, Sint32 gro
     return 0;
 }
 
+posix_errno_t efile_set_permissions_at(efile_data_t *dir, const efile_path_t *path,
+        Uint32 permissions) {
+#ifndef HAVE_FCHMODAT
+    (void)dir;
+    (void)path;
+    (void)permissions;
+
+    return ENOTSUP;
+#else
+    efile_unix_t *u = (efile_unix_t*)dir;
+    mode_t new_modes = permissions & EFILE_MUTABLE_MODES;
+
+    /* Some file systems refuse the set-user-ID and set-group-ID bits. The path
+     * variant drops them and retries, so this function does the same. */
+    if(fchmodat(u->fd, (const char*)path->data, new_modes, 0) < 0) {
+        new_modes &= ~(S_ISUID | S_ISGID);
+
+        if(fchmodat(u->fd, (const char*)path->data, new_modes, 0) < 0) {
+            return errno;
+        }
+    }
+
+    return 0;
+#endif
+}
+
+posix_errno_t efile_set_owner_at(efile_data_t *dir, const efile_path_t *path,
+        Sint32 owner, Sint32 group) {
+#ifndef HAVE_FCHOWNAT
+    (void)dir;
+    (void)path;
+    (void)owner;
+    (void)group;
+
+    return ENOTSUP;
+#else
+    efile_unix_t *u = (efile_unix_t*)dir;
+
+    if(fchownat(u->fd, (const char*)path->data, owner, group, 0) < 0) {
+        return errno;
+    }
+
+    return 0;
+#endif
+}
+
+posix_errno_t efile_set_time_at(efile_data_t *dir, const efile_path_t *path,
+        Sint64 a_time, Sint64 m_time, Sint64 c_time) {
+#ifndef HAVE_UTIMENSAT
+    (void)dir;
+    (void)path;
+    (void)a_time;
+    (void)m_time;
+    (void)c_time;
+
+    return ENOTSUP;
+#else
+    efile_unix_t *u = (efile_unix_t*)dir;
+    struct timespec times[2];
+
+    /* Unix cannot set the creation time, so the path variant ignores it too. */
+    (void)c_time;
+
+    times[0].tv_sec = (time_t)a_time;
+    times[0].tv_nsec = 0;
+    times[1].tv_sec = (time_t)m_time;
+    times[1].tv_nsec = 0;
+
+    if(utimensat(u->fd, (const char*)path->data, times, 0) < 0) {
+        return errno;
+    }
+
+    return 0;
+#endif
+}
+
 posix_errno_t efile_set_handle_owner(efile_data_t *d, Sint32 owner, Sint32 group) {
     efile_unix_t *u = (efile_unix_t*)d;
 
@@ -1262,6 +1338,32 @@ posix_errno_t efile_rename(const efile_path_t *old_path, const efile_path_t *new
     return 0;
 }
 
+posix_errno_t efile_rename_at(efile_data_t *old_dir, const efile_path_t *old_path,
+        efile_data_t *new_dir, const efile_path_t *new_path) {
+#ifndef HAVE_RENAMEAT
+    (void)old_dir;
+    (void)old_path;
+    (void)new_dir;
+    (void)new_path;
+
+    return ENOTSUP;
+#else
+    efile_unix_t *old_u = (efile_unix_t*)old_dir;
+    efile_unix_t *new_u = (efile_unix_t*)new_dir;
+
+    if(renameat(old_u->fd, (const char*)old_path->data,
+                new_u->fd, (const char*)new_path->data) < 0) {
+        if(errno == ENOTEMPTY) {
+            return EEXIST;
+        }
+
+        return errno;
+    }
+
+    return 0;
+#endif
+}
+
 posix_errno_t efile_make_hard_link(const efile_path_t *existing_path, const efile_path_t *new_path) {
     if(link((const char*)existing_path->data, (const char*)new_path->data) < 0) {
         return errno;
@@ -1288,6 +1390,57 @@ posix_errno_t efile_make_dir(const efile_path_t *path) {
     }
 
     return 0;
+}
+
+posix_errno_t efile_make_dir_at(efile_data_t *dir, const efile_path_t *path) {
+#ifndef HAVE_MKDIRAT
+    (void)dir;
+    (void)path;
+
+    return ENOTSUP;
+#else
+    efile_unix_t *u = (efile_unix_t*)dir;
+
+    if(mkdirat(u->fd, (const char*)path->data, DIR_MODE) < 0) {
+        return errno;
+    }
+
+    return 0;
+#endif
+}
+
+posix_errno_t efile_del_at(efile_data_t *dir, const efile_path_t *path, int is_dir) {
+#ifndef HAVE_UNLINKAT
+    (void)dir;
+    (void)path;
+    (void)is_dir;
+
+    return ENOTSUP;
+#else
+    efile_unix_t *u = (efile_unix_t*)dir;
+    int flags;
+
+    flags = is_dir ? AT_REMOVEDIR : 0;
+
+    if(unlinkat(u->fd, (const char*)path->data, flags) < 0) {
+        posix_errno_t saved_errno = errno;
+
+        if(is_dir) {
+            /* The path variant reports a directory that is not empty as
+             * EEXIST, so this one does the same. */
+            if(saved_errno == ENOTEMPTY) {
+                saved_errno = EEXIST;
+            }
+        } else if(saved_errno == EISDIR) {
+            /* Linux sets the wrong error code. */
+            saved_errno = EPERM;
+        }
+
+        return saved_errno;
+    }
+
+    return 0;
+#endif
 }
 
 posix_errno_t efile_del_file(const efile_path_t *path) {

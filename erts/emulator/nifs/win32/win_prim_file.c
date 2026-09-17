@@ -37,6 +37,25 @@
  * and the types they need. The emulator links against ntdll for them. */
 #include <winternl.h>
 
+/* winternl.h does not declare the call that changes a name on an open file,
+ * so it is declared here. */
+NTSYSAPI NTSTATUS NTAPI NtSetInformationFile(HANDLE FileHandle,
+    IO_STATUS_BLOCK *IoStatusBlock, PVOID FileInformation, ULONG Length,
+    FILE_INFORMATION_CLASS FileInformationClass);
+
+/* SetFileInformationByHandle ignores the directory in FILE_RENAME_INFO, so
+ * renaming a name relative to a directory uses the native call and the
+ * structure that call expects. winternl.h declares FILE_INFORMATION_CLASS
+ * with one member, so the value is given here as well. */
+#define EFILE_FILE_RENAME_INFORMATION ((FILE_INFORMATION_CLASS)10)
+
+typedef struct {
+    BOOLEAN ReplaceIfExists;
+    HANDLE RootDirectory;
+    ULONG FileNameLength;
+    WCHAR FileName[1];
+} EFILE_FILE_RENAME_INFORMATION_T;
+
 #define EFILE_OBJ_CASE_INSENSITIVE 0x00000040
 
 #define EFILE_FILE_OPEN 0x00000001
@@ -694,7 +713,7 @@ posix_errno_t efile_open_at(efile_data_t *dir, const efile_path_t *path,
  * caller closes it. Unlike efile_open_at this does not build a resource, so it
  * can be used by the operations that only need a handle for a moment. */
 static posix_errno_t open_handle_at(efile_data_t *dir, const efile_path_t *path,
-        ACCESS_MASK access_flags, ULONG options, HANDLE *result) {
+        ACCESS_MASK access_flags, ULONG options, ULONG disposition, HANDLE *result) {
     efile_win_t *parent = (efile_win_t*)dir;
     OBJECT_ATTRIBUTES object_attributes;
     IO_STATUS_BLOCK io_status_block;
@@ -724,22 +743,18 @@ static posix_errno_t open_handle_at(efile_data_t *dir, const efile_path_t *path,
      * asked for here rather than at every call. */
     status = NtCreateFile(result, access_flags | SYNCHRONIZE, &object_attributes,
         &io_status_block, NULL, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_FLAGS,
-        EFILE_FILE_OPEN, options | EFILE_FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+        disposition, options | EFILE_FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
 
     if(status < 0) {
-        posix_errno_t posix_errno = nt_status_to_posix_errno(status);
-
         /* Asking for a directory and naming a file, or the other way about,
          * reports a status that does not map to the error a path gives. */
-        if(posix_errno == EIO) {
-            if(options & EFILE_FILE_DIRECTORY_FILE) {
-                return ENOTDIR;
-            } else if(options & EFILE_FILE_NON_DIRECTORY_FILE) {
-                return EISDIR;
-            }
+        if(status == EFILE_STATUS_NOT_A_DIRECTORY) {
+            return ENOTDIR;
+        } else if(status == EFILE_STATUS_FILE_IS_A_DIRECTORY) {
+            return EISDIR;
         }
 
-        return posix_errno;
+        return nt_status_to_posix_errno(status);
     }
 
     return 0;
@@ -761,7 +776,8 @@ posix_errno_t efile_read_info_at(efile_data_t *dir, const efile_path_t *path,
         options |= EFILE_FILE_OPEN_REPARSE_POINT;
     }
 
-    posix_errno = open_handle_at(dir, path, GENERIC_READ, options, &handle);
+    posix_errno = open_handle_at(dir, path, GENERIC_READ, options,
+        EFILE_FILE_OPEN, &handle);
 
     if(posix_errno != 0) {
         return posix_errno;
@@ -793,9 +809,11 @@ posix_errno_t efile_read_link_at(ErlNifEnv *env, efile_data_t *dir,
     ErlNifBinary result_bin;
     HANDLE handle;
 
-    posix_errno = open_handle_at(dir, path, GENERIC_READ,
+    /* The link itself is opened first, so that a name that is not a link can
+     * be refused. */
+    posix_errno = open_handle_at(dir, path, FILE_READ_ATTRIBUTES,
         EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_OPEN_REPARSE_POINT,
-        &handle);
+        EFILE_FILE_OPEN, &handle);
 
     if(posix_errno != 0) {
         return posix_errno;
@@ -834,6 +852,188 @@ posix_errno_t efile_read_link_at(ErlNifEnv *env, efile_data_t *dir,
     return posix_errno;
 }
 
+posix_errno_t efile_make_dir_at(efile_data_t *dir, const efile_path_t *path) {
+    posix_errno_t posix_errno;
+    HANDLE handle;
+
+    /* NtCreateFile makes the directory when it is told to create rather than
+     * open, so there is no separate call for this. */
+    posix_errno = open_handle_at(dir, path, GENERIC_READ,
+        EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_DIRECTORY_FILE,
+        EFILE_FILE_CREATE, &handle);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    CloseHandle(handle);
+
+    return 0;
+}
+
+posix_errno_t efile_del_at(efile_data_t *dir, const efile_path_t *path, int is_dir) {
+    FILE_DISPOSITION_INFO disposition;
+    posix_errno_t posix_errno;
+    ULONG options;
+    HANDLE handle;
+
+    /* A name is removed by opening it and marking it for deletion, because
+     * DeleteFileW and RemoveDirectoryW both need a path. The reparse point
+     * option removes a link rather than what the link points at. */
+    options = EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_OPEN_REPARSE_POINT;
+
+    if(is_dir) {
+        options |= EFILE_FILE_DIRECTORY_FILE;
+    } else {
+        options |= EFILE_FILE_NON_DIRECTORY_FILE;
+    }
+
+    posix_errno = open_handle_at(dir, path, DELETE, options,
+        EFILE_FILE_OPEN, &handle);
+
+    if(posix_errno != 0) {
+        /* The path variant reports removing a directory as a file as EPERM
+         * rather than EISDIR. */
+        if(!is_dir && posix_errno == EISDIR) {
+            return EPERM;
+        }
+
+        return posix_errno;
+    }
+
+    disposition.DeleteFile = TRUE;
+
+    if(!SetFileInformationByHandle(handle, FileDispositionInfo,
+                                   &disposition, sizeof(disposition))) {
+        posix_errno = windows_to_posix_errno(GetLastError());
+
+        /* A directory that is not empty reports as EEXIST, as it does for a
+         * path. */
+        if(is_dir && posix_errno == EACCES) {
+            posix_errno = EEXIST;
+        }
+
+        CloseHandle(handle);
+
+        return posix_errno;
+    }
+
+    CloseHandle(handle);
+
+    return 0;
+}
+
+posix_errno_t efile_rename_at(efile_data_t *old_dir, const efile_path_t *old_path,
+        efile_data_t *new_dir, const efile_path_t *new_path) {
+    efile_win_t *new_parent = (efile_win_t*)new_dir;
+    EFILE_FILE_RENAME_INFORMATION_T *rename_info;
+    IO_STATUS_BLOCK io_status_block;
+    posix_errno_t posix_errno;
+    size_t name_size, info_size;
+    NTSTATUS status;
+    HANDLE handle;
+
+    posix_errno = open_handle_at(old_dir, old_path, DELETE | SYNCHRONIZE,
+        EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_OPEN_REPARSE_POINT,
+        EFILE_FILE_OPEN, &handle);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    /* The new name goes in the same structure, so the structure has to be
+     * large enough to hold it. */
+    name_size = wcslen((WCHAR*)new_path->data) * sizeof(WCHAR);
+    info_size = sizeof(EFILE_FILE_RENAME_INFORMATION_T) + name_size;
+
+    rename_info = (EFILE_FILE_RENAME_INFORMATION_T*)enif_alloc(info_size);
+
+    if(rename_info == NULL) {
+        CloseHandle(handle);
+        return ENOMEM;
+    }
+
+    sys_memset(rename_info, 0, sizeof(EFILE_FILE_RENAME_INFORMATION_T));
+    rename_info->ReplaceIfExists = TRUE;
+    rename_info->RootDirectory = new_parent->handle;
+    rename_info->FileNameLength = (ULONG)name_size;
+    sys_memcpy(rename_info->FileName, new_path->data, name_size);
+
+    sys_memset(&io_status_block, 0, sizeof(io_status_block));
+
+    status = NtSetInformationFile(handle, &io_status_block, rename_info,
+        (ULONG)info_size, EFILE_FILE_RENAME_INFORMATION);
+
+    if(status < 0) {
+        posix_errno = nt_status_to_posix_errno(status);
+    } else {
+        posix_errno = 0;
+    }
+
+    enif_free(rename_info);
+    CloseHandle(handle);
+
+    return posix_errno;
+}
+
+posix_errno_t efile_set_permissions_at(efile_data_t *dir, const efile_path_t *path,
+        Uint32 permissions) {
+    posix_errno_t posix_errno;
+    efile_win_t file;
+    HANDLE handle;
+
+    posix_errno = open_handle_at(dir, path,
+        FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+        EFILE_FILE_OPEN_FOR_BACKUP_INTENT, EFILE_FILE_OPEN, &handle);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    sys_memset(&file, 0, sizeof(file));
+    file.handle = handle;
+
+    posix_errno = efile_set_handle_permissions(&file.common, permissions);
+
+    CloseHandle(handle);
+
+    return posix_errno;
+}
+
+posix_errno_t efile_set_owner_at(efile_data_t *dir, const efile_path_t *path,
+        Sint32 owner, Sint32 group) {
+    (void)dir;
+    (void)path;
+    (void)owner;
+    (void)group;
+
+    return 0;
+}
+
+posix_errno_t efile_set_time_at(efile_data_t *dir, const efile_path_t *path,
+        Sint64 a_time, Sint64 m_time, Sint64 c_time) {
+    posix_errno_t posix_errno;
+    efile_win_t file;
+    HANDLE handle;
+
+    posix_errno = open_handle_at(dir, path,
+        FILE_WRITE_ATTRIBUTES | SYNCHRONIZE,
+        EFILE_FILE_OPEN_FOR_BACKUP_INTENT, EFILE_FILE_OPEN, &handle);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    sys_memset(&file, 0, sizeof(file));
+    file.handle = handle;
+
+    posix_errno = efile_set_handle_time(&file.common, a_time, m_time, c_time);
+
+    CloseHandle(handle);
+
+    return posix_errno;
+}
+
 posix_errno_t efile_list_dir_at(ErlNifEnv *env, efile_data_t *dir,
         const efile_path_t *path, ERL_NIF_TERM *result) {
     posix_errno_t posix_errno;
@@ -842,7 +1042,7 @@ posix_errno_t efile_list_dir_at(ErlNifEnv *env, efile_data_t *dir,
 
     posix_errno = open_handle_at(dir, path, GENERIC_READ,
         EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_DIRECTORY_FILE,
-        &handle);
+        EFILE_FILE_OPEN, &handle);
 
     if(posix_errno != 0) {
         return posix_errno;

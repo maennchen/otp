@@ -52,7 +52,7 @@
 -export([cur_dir_0/1, cur_dir_1/1, make_del_dir/1, make_del_dir_r/1,
          list_dir/1,list_dir_error/1,list_dir_handle/1,
          file_write_handle_info/1,
-         open_at/1, open_at_symlink/1, read_at/1,
+         open_at/1, open_at_symlink/1, read_at/1, write_at/1,
 	 untranslatable_names/1, untranslatable_names_error/1,
 	 pos1/1, pos2/1, pos3/1]).
 -export([close/1, consult1/1, path_consult/1, delete/1]).
@@ -158,7 +158,7 @@ groups() ->
      {open, [],
       [open1, old_modes, new_modes, path_open, close, access,
        read_write, pread_write, append, open_errors,
-       exclusive, open_at, open_at_symlink, read_at]},
+       exclusive, open_at, open_at_symlink, read_at, write_at]},
      {pos, [], [pos1, pos2, pos3]},
      {file_info, [],
       [file_info_basic_file, file_info_basic_directory,
@@ -1088,6 +1088,99 @@ read_at_symlink(Dir, TestDir) ->
             ok = ?FILE_MODULE:delete(Link),
             ok
     end.
+
+%% The operations that change the file system take a {Dir, Name} tuple as well,
+%% and report the same results as the matching path does.
+write_at(Config) when is_list(Config) ->
+    RootDir = proplists:get_value(priv_dir, Config),
+    TestDir = filename:join(RootDir, ?MODULE_STRING++"_write_at"),
+    ok = ?FILE_MODULE:make_dir(TestDir),
+
+    {ok, Dir} = ?FILE_MODULE:open(TestDir, [raw, read, directory]),
+
+    %% Making and removing a directory.
+    ok = ?FILE_MODULE:make_dir({Dir, "sub"}),
+    {ok, #file_info{type = directory}} =
+        ?FILE_MODULE:read_file_info(filename:join(TestDir, "sub")),
+    {error, eexist} = ?FILE_MODULE:make_dir({Dir, "sub"}),
+    ok = ?FILE_MODULE:del_dir({Dir, "sub"}),
+    {error, enoent} = ?FILE_MODULE:read_file_info(filename:join(TestDir, "sub")),
+
+    %% Renaming inside one directory.
+    ok = ?FILE_MODULE:write_file(filename:join(TestDir, "before"), "moved"),
+    ok = ?FILE_MODULE:rename({Dir, "before"}, {Dir, "after"}),
+    {ok, <<"moved">>} = ?FILE_MODULE:read_file(filename:join(TestDir, "after")),
+
+    %% Changing the permissions and the times of a name.
+    %% Windows models only the read only bit, so the permissions are checked
+    %% by writing to the file rather than by reading the mode back.
+    {ok, Info} = ?FILE_MODULE:read_file_info({Dir, "after"}),
+    ok = ?FILE_MODULE:write_file_info({Dir, "after"},
+                                      Info#file_info{mode = 8#400}),
+    {error, eacces} = ?FILE_MODULE:write_file(filename:join(TestDir, "after"),
+                                              "denied"),
+    ok = ?FILE_MODULE:write_file_info({Dir, "after"},
+                                      Info#file_info{mode = 8#600}),
+    ok = ?FILE_MODULE:write_file(filename:join(TestDir, "after"), "moved"),
+    {ok, Info1} = ?FILE_MODULE:read_file_info({Dir, "after"}),
+
+    Time = {{2001, 2, 3}, {4, 5, 6}},
+    ok = ?FILE_MODULE:write_file_info({Dir, "after"},
+                                      Info1#file_info{mtime = Time,
+                                                      atime = Time}),
+    {ok, Info2} = ?FILE_MODULE:read_file_info({Dir, "after"}),
+    Time = Info2#file_info.mtime,
+
+    ok = ?FILE_MODULE:write_file_info({Dir, "after"},
+                                      Info2#file_info{mode = 8#644}),
+
+    %% Removing a name.
+    ok = ?FILE_MODULE:delete({Dir, "after"}),
+    {error, enoent} = ?FILE_MODULE:read_file_info(filename:join(TestDir, "after")),
+
+    %% Errors match what the matching path reports.
+    {error, enoent} = ?FILE_MODULE:delete({Dir, "missing"}),
+    {error, enoent} = ?FILE_MODULE:del_dir({Dir, "missing"}),
+
+    ok = ?FILE_MODULE:write_file(filename:join(TestDir, "plain"), "x"),
+    {error, enotdir} = ?FILE_MODULE:del_dir({Dir, "plain"}),
+    ok = ?FILE_MODULE:make_dir({Dir, "adir"}),
+    {error, eperm} = ?FILE_MODULE:delete({Dir, "adir"}),
+    ok = ?FILE_MODULE:del_dir({Dir, "adir"}),
+    ok = ?FILE_MODULE:delete({Dir, "plain"}),
+
+    write_at_across_dirs(Dir, TestDir),
+
+    ok = ?FILE_MODULE:close(Dir),
+    ok = ?FILE_MODULE:del_dir(TestDir),
+
+    [] = flush(),
+    ok.
+
+%% The two names of a rename may belong to different open directories.
+write_at_across_dirs(Dir, TestDir) ->
+    ok = ?FILE_MODULE:make_dir({Dir, "from"}),
+    ok = ?FILE_MODULE:make_dir({Dir, "to"}),
+
+    {ok, From} = ?FILE_MODULE:open(filename:join(TestDir, "from"),
+                                   [raw, read, directory]),
+    {ok, To} = ?FILE_MODULE:open(filename:join(TestDir, "to"),
+                                 [raw, read, directory]),
+
+    ok = ?FILE_MODULE:write_file(filename:join([TestDir, "from", "f"]), "across"),
+    ok = ?FILE_MODULE:rename({From, "f"}, {To, "f"}),
+
+    {ok, <<"across">>} =
+        ?FILE_MODULE:read_file(filename:join([TestDir, "to", "f"])),
+    {error, enoent} = ?FILE_MODULE:read_file_info({From, "f"}),
+
+    ok = ?FILE_MODULE:delete({To, "f"}),
+    ok = ?FILE_MODULE:close(From),
+    ok = ?FILE_MODULE:close(To),
+
+    ok = ?FILE_MODULE:del_dir({Dir, "from"}),
+    ok = ?FILE_MODULE:del_dir({Dir, "to"}),
+    ok.
 
 %%%
 %%% Test write_file_info() on an open file.

@@ -73,6 +73,8 @@
        set_handle_permissions_nif/2, set_handle_owner_nif/3,
        set_handle_time_nif/4, open_at_nif/3, set_controlling_process_nif/2,
        read_info_at_nif/3, read_link_at_nif/2, list_dir_at_nif/2,
+       make_dir_at_nif/2, del_at_nif/3, rename_at_nif/4,
+       set_permissions_at_nif/3, set_owner_at_nif/4, set_time_at_nif/5,
        make_hard_link_nif/2, make_soft_link_nif/2, rename_nif/2,
        read_info_nif/2, set_permissions_nif/2, set_owner_nif/3, set_time_nif/4,
        read_link_nif/1, list_dir_nif/1, make_dir_nif/1, del_file_nif/1,
@@ -553,6 +555,18 @@ read_link_at_nif(_DirRef, _Name) ->
     erlang:nif_error(undef).
 list_dir_at_nif(_DirRef, _Name) ->
     erlang:nif_error(undef).
+make_dir_at_nif(_DirRef, _Name) ->
+    erlang:nif_error(undef).
+del_at_nif(_DirRef, _Name, _IsDir) ->
+    erlang:nif_error(undef).
+rename_at_nif(_SourceDirRef, _Source, _DestDirRef, _Destination) ->
+    erlang:nif_error(undef).
+set_permissions_at_nif(_DirRef, _Name, _Permissions) ->
+    erlang:nif_error(undef).
+set_owner_at_nif(_DirRef, _Name, _Uid, _Gid) ->
+    erlang:nif_error(undef).
+set_time_at_nif(_DirRef, _Name, _ATime, _MTime, _CTime) ->
+    erlang:nif_error(undef).
 
 %% Takes over a file that another process opened. A file is closed when the
 %% process that owns it dies, so a file that changes hands has to change the
@@ -803,6 +817,14 @@ write_file_info(Filename, Info, Opts) ->
 
 %% Changing an open file does not resolve a path. The caller always changes
 %% the file it opened, even if another process replaces the path.
+write_file_info_1({#file_descriptor{module = ?MODULE} = Dir, Name}, Info, TimeType) ->
+    try
+        #{ handle := DirRef } = get_fd_data(Dir),
+        write_file_info_2({at, DirRef, encode_path(Name)}, Info, TimeType)
+    catch
+        throw:Reason -> {error, Reason};
+        error:_ -> {error, badarg}
+    end;
 write_file_info_1(#file_descriptor{module = ?MODULE} = Fd, Info, TimeType) ->
     try
         #{ handle := FRef } = get_fd_data(Fd),
@@ -847,7 +869,9 @@ set_owner(Target, undefined, Gid) ->
 set_owner({path, EncodedName}, Uid, Gid) ->
     set_owner_nif(EncodedName, Uid, Gid);
 set_owner({handle, FRef}, Uid, Gid) ->
-    set_handle_owner_nif(FRef, Uid, Gid).
+    set_handle_owner_nif(FRef, Uid, Gid);
+set_owner({at, DirRef, Name}, Uid, Gid) ->
+    set_owner_at_nif(DirRef, Name, Uid, Gid).
 set_owner_nif(_Path, _Uid, _Gid) ->
     erlang:nif_error(undef).
 set_handle_owner_nif(_FileRef, _Uid, _Gid) ->
@@ -858,7 +882,9 @@ set_permissions(_Target, undefined) ->
 set_permissions({path, EncodedName}, Permissions) ->
     set_permissions_nif(EncodedName, Permissions);
 set_permissions({handle, FRef}, Permissions) ->
-    set_handle_permissions_nif(FRef, Permissions).
+    set_handle_permissions_nif(FRef, Permissions);
+set_permissions({at, DirRef, Name}, Permissions) ->
+    set_permissions_at_nif(DirRef, Name, Permissions).
 set_permissions_nif(_Path, _Permissions) ->
     erlang:nif_error(undef).
 set_handle_permissions_nif(_FileRef, _Permissions) ->
@@ -867,7 +893,9 @@ set_handle_permissions_nif(_FileRef, _Permissions) ->
 set_time({path, EncodedName}, ATime, MTime, CTime) ->
     set_time_nif(EncodedName, ATime, MTime, CTime);
 set_time({handle, FRef}, ATime, MTime, CTime) ->
-    set_handle_time_nif(FRef, ATime, MTime, CTime).
+    set_handle_time_nif(FRef, ATime, MTime, CTime);
+set_time({at, DirRef, Name}, ATime, MTime, CTime) ->
+    set_time_at_nif(DirRef, Name, ATime, MTime, CTime).
 set_time_nif(_Path, _ATime, _MTime, _CTime) ->
     erlang:nif_error(undef).
 set_handle_time_nif(_FileRef, _ATime, _MTime, _CTime) ->
@@ -931,6 +959,8 @@ set_cwd(Path) ->
         error:badarg -> {error, badarg}
     end.
 
+delete({#file_descriptor{module = ?MODULE} = Dir, Name}) ->
+    del_at(Dir, Name, 0);
 delete(Path) ->
     try
         del_file_nif(encode_path(Path))
@@ -938,21 +968,50 @@ delete(Path) ->
         error:badarg -> {error, badarg}
     end.
 
+%% Both names are resolved against an open directory. The two directories may
+%% be the same one.
+rename({#file_descriptor{module = ?MODULE} = SourceDir, Source},
+       {#file_descriptor{module = ?MODULE} = DestDir, Destination}) ->
+    try
+        #{ handle := SourceRef } = get_fd_data(SourceDir),
+        #{ handle := DestRef } = get_fd_data(DestDir),
+        rename_at_nif(SourceRef, encode_path(Source),
+                      DestRef, encode_path(Destination))
+    catch
+        error:badarg -> {error, badarg}
+    end;
 rename(Source, Destination) ->
     try
         rename_nif(encode_path(Source), encode_path(Destination))
     catch
         error:badarg -> {error, badarg}
     end.
+make_dir({#file_descriptor{module = ?MODULE} = Dir, Name}) ->
+    try
+        #{ handle := DirRef } = get_fd_data(Dir),
+        make_dir_at_nif(DirRef, encode_path(Name))
+    catch
+        error:badarg -> {error, badarg}
+    end;
 make_dir(Path) ->
     try
         make_dir_nif(encode_path(Path))
     catch
         error:badarg -> {error, badarg}
     end.
+del_dir({#file_descriptor{module = ?MODULE} = Dir, Name}) ->
+    del_at(Dir, Name, 1);
 del_dir(Path) ->
     try
         del_dir_nif(encode_path(Path))
+    catch
+        error:badarg -> {error, badarg}
+    end.
+
+del_at(Dir, Name, IsDir) ->
+    try
+        #{ handle := DirRef } = get_fd_data(Dir),
+        del_at_nif(DirRef, encode_path(Name), IsDir)
     catch
         error:badarg -> {error, badarg}
     end.

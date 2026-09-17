@@ -234,6 +234,13 @@ posix_errno_t efile_set_time(const efile_path_t *path, Sint64 a_time, Sint64 m_t
  * opened, even if another process replaces the path. */
 posix_errno_t efile_set_handle_time(efile_data_t *d, Sint64 a_time, Sint64 m_time, Sint64 c_time);
 
+/** @brief As \c efile_set_time, but the name is resolved against an open
+ * directory rather than a path.
+ *
+ * @param dir A file that was opened with EFILE_MODE_DIRECTORY. */
+posix_errno_t efile_set_time_at(efile_data_t *dir, const efile_path_t *path,
+        Sint64 a_time, Sint64 m_time, Sint64 c_time);
+
 /** @brief On Unix, this sets the file permissions according to the docs for
  * file:write_file_info/2. On Windows it uses the "owner write permission" flag
  * to toggle whether the file is read-only or not. */
@@ -245,6 +252,13 @@ posix_errno_t efile_set_permissions(const efile_path_t *path, Uint32 permissions
  * opened, even if another process replaces the path. */
 posix_errno_t efile_set_handle_permissions(efile_data_t *d, Uint32 permissions);
 
+/** @brief As \c efile_set_permissions, but the name is resolved against an
+ * open directory rather than a path.
+ *
+ * @param dir A file that was opened with EFILE_MODE_DIRECTORY. */
+posix_errno_t efile_set_permissions_at(efile_data_t *dir, const efile_path_t *path,
+        Uint32 permissions);
+
 /** @brief On Unix, this will set the owner/group to the given values. It will
  * do nothing on other platforms. */
 posix_errno_t efile_set_owner(const efile_path_t *path, Sint32 owner, Sint32 group);
@@ -254,6 +268,13 @@ posix_errno_t efile_set_owner(const efile_path_t *path, Sint32 owner, Sint32 gro
  * This function does not resolve a path. The caller always changes the file it
  * opened, even if another process replaces the path. */
 posix_errno_t efile_set_handle_owner(efile_data_t *d, Sint32 owner, Sint32 group);
+
+/** @brief As \c efile_set_owner, but the name is resolved against an open
+ * directory rather than a path.
+ *
+ * @param dir A file that was opened with EFILE_MODE_DIRECTORY. */
+posix_errno_t efile_set_owner_at(efile_data_t *dir, const efile_path_t *path,
+        Sint32 owner, Sint32 group);
 
 /** @brief Resolves the final path of the given link. */
 posix_errno_t efile_read_link(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_TERM *result);
@@ -317,12 +338,33 @@ posix_errno_t efile_list_dir_at(ErlNifEnv *env, efile_data_t *dir,
  * delete if errno is EXDEV. */
 posix_errno_t efile_rename(const efile_path_t *old_path, const efile_path_t *new_path);
 
+/** @brief As \c efile_rename, but both names are resolved against an open
+ * directory rather than a path. The two directories may be the same.
+ *
+ * @param old_dir A file that was opened with EFILE_MODE_DIRECTORY.
+ * @param new_dir A file that was opened with EFILE_MODE_DIRECTORY. */
+posix_errno_t efile_rename_at(efile_data_t *old_dir, const efile_path_t *old_path,
+        efile_data_t *new_dir, const efile_path_t *new_path);
+
 posix_errno_t efile_make_hard_link(const efile_path_t *existing_path, const efile_path_t *new_path);
 posix_errno_t efile_make_soft_link(const efile_path_t *existing_path, const efile_path_t *new_path);
 posix_errno_t efile_make_dir(const efile_path_t *path);
 
+/** @brief As \c efile_make_dir, but the name is resolved against an open
+ * directory rather than a path.
+ *
+ * @param dir A file that was opened with EFILE_MODE_DIRECTORY. */
+posix_errno_t efile_make_dir_at(efile_data_t *dir, const efile_path_t *path);
+
 posix_errno_t efile_del_file(const efile_path_t *path);
 posix_errno_t efile_del_dir(const efile_path_t *path);
+
+/** @brief As \c efile_del_file and \c efile_del_dir, but the name is resolved
+ * against an open directory rather than a path.
+ *
+ * @param dir A file that was opened with EFILE_MODE_DIRECTORY.
+ * @param is_dir Whether to remove a directory rather than a file. */
+posix_errno_t efile_del_at(efile_data_t *dir, const efile_path_t *path, int is_dir);
 
 posix_errno_t efile_get_cwd(ErlNifEnv *env, ERL_NIF_TERM *result);
 posix_errno_t efile_set_cwd(const efile_path_t *path);
