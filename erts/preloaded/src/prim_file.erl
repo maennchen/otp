@@ -75,6 +75,7 @@
        read_info_at_nif/3, read_link_at_nif/2, list_dir_at_nif/2,
        make_dir_at_nif/2, del_at_nif/3, rename_at_nif/4,
        set_permissions_at_nif/3, set_owner_at_nif/4, set_time_at_nif/5,
+       make_hard_link_at_nif/4, make_soft_link_at_nif/3,
        make_hard_link_nif/2, make_soft_link_nif/2, rename_nif/2,
        read_info_nif/2, set_permissions_nif/2, set_owner_nif/3, set_time_nif/4,
        read_link_nif/1, list_dir_nif/1, make_dir_nif/1, del_file_nif/1,
@@ -567,6 +568,10 @@ set_owner_at_nif(_DirRef, _Name, _Uid, _Gid) ->
     erlang:nif_error(undef).
 set_time_at_nif(_DirRef, _Name, _ATime, _MTime, _CTime) ->
     erlang:nif_error(undef).
+make_hard_link_at_nif(_ExistingDirRef, _Existing, _NewDirRef, _New) ->
+    erlang:nif_error(undef).
+make_soft_link_at_nif(_Existing, _NewDirRef, _New) ->
+    erlang:nif_error(undef).
 
 %% Takes over a file that another process opened. A file is closed when the
 %% process that owns it dies, so a file that changes hands has to change the
@@ -1015,12 +1020,31 @@ del_at(Dir, Name, IsDir) ->
     catch
         error:badarg -> {error, badarg}
     end.
+make_link({#file_descriptor{module = ?MODULE} = ExistingDir, Existing},
+          {#file_descriptor{module = ?MODULE} = NewDir, New}) ->
+    try
+        #{ handle := ExistingRef } = get_fd_data(ExistingDir),
+        #{ handle := NewRef } = get_fd_data(NewDir),
+        make_hard_link_at_nif(ExistingRef, encode_path(Existing),
+                              NewRef, encode_path(New))
+    catch
+        error:badarg -> {error, badarg}
+    end;
 make_link(Existing, New) ->
     try
         make_hard_link_nif(encode_path(Existing), encode_path(New))
     catch
         error:badarg -> {error, badarg}
     end.
+%% Only the new name belongs to a directory. The target is stored in the link
+%% as it is given, so it is not resolved here.
+make_symlink(Existing, {#file_descriptor{module = ?MODULE} = NewDir, New}) ->
+    try
+        #{ handle := NewRef } = get_fd_data(NewDir),
+        make_soft_link_at_nif(encode_path(Existing), NewRef, encode_path(New))
+    catch
+        error:badarg -> {error, badarg}
+    end;
 make_symlink(Existing, New) ->
     try
         make_soft_link_nif(encode_path(Existing), encode_path(New))

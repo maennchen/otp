@@ -348,6 +348,25 @@ posix_errno_t efile_rename_at(efile_data_t *old_dir, const efile_path_t *old_pat
 
 posix_errno_t efile_make_hard_link(const efile_path_t *existing_path, const efile_path_t *new_path);
 posix_errno_t efile_make_soft_link(const efile_path_t *existing_path, const efile_path_t *new_path);
+
+/** @brief As \c efile_make_hard_link, but both names are resolved against an
+ * open directory rather than a path. The two directories may be the same.
+ *
+ * @param existing_dir A file that was opened with EFILE_MODE_DIRECTORY.
+ * @param new_dir A file that was opened with EFILE_MODE_DIRECTORY. */
+posix_errno_t efile_make_hard_link_at(efile_data_t *existing_dir,
+        const efile_path_t *existing_path, efile_data_t *new_dir,
+        const efile_path_t *new_path);
+
+/** @brief As \c efile_make_soft_link, but the new name is resolved against an
+ * open directory rather than a path.
+ *
+ * The target is stored in the link as it is given. The system does not read it
+ * until the link is used, so it is not resolved against the directory.
+ *
+ * @param new_dir A file that was opened with EFILE_MODE_DIRECTORY. */
+posix_errno_t efile_make_soft_link_at(const efile_path_t *existing_path,
+        efile_data_t *new_dir, const efile_path_t *new_path);
 posix_errno_t efile_make_dir(const efile_path_t *path);
 
 /** @brief As \c efile_make_dir, but the name is resolved against an open

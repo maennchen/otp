@@ -1214,9 +1214,12 @@ Typical error reasons:
 - **`enotsup`** - Hard links are not supported on this platform.
 """.
 -spec make_link(Existing, New) -> ok | {error, Reason} when
-      Existing :: name_all(),
-      New :: name_all(),
+      Existing :: name_all() | {io_device(), name_all()},
+      New :: name_all() | {io_device(), name_all()},
       Reason :: posix() | badarg.
+
+make_link({#file_descriptor{}, _Old} = Existing, {#file_descriptor{}, _New} = New) ->
+    ?PRIM_FILE:make_link(at_target(Existing), at_target(New));
 
 make_link(Old, New) ->
     check_and_call(make_link, [file_name(Old), file_name(New)]).
@@ -1242,8 +1245,11 @@ Typical error reasons:
 """.
 -spec make_symlink(Existing, New) -> ok | {error, Reason} when
       Existing :: name_all(),
-      New :: name_all(),
+      New :: name_all() | {io_device(), name_all()},
       Reason :: posix() | badarg.
+
+make_symlink(Old, {#file_descriptor{}, _New} = New) ->
+    ?PRIM_FILE:make_symlink(file_name(Old), at_target(New));
 
 make_symlink(Old, New) ->
     check_and_call(make_symlink, [file_name(Old), file_name(New)]).
@@ -2172,6 +2178,11 @@ If both `Source` and `Destination` refer to filenames, the files are opened with
 `[read, binary]` and `[write, binary]` prepended to their mode lists,
 respectively, to optimize the copy.
 
+A filename can also be a `{Dir, Name}` tuple, where `Dir` is a directory that
+was opened with the modes `raw`, `read` and `directory`. Give it with its mode
+list, as `{{Dir, Name}, Modes}`, so that it is not read as a filename and a
+mode list of its own. See `open/2`.
+
 If `Source` refers to a filename, it is opened with `read` mode prepended to the
 mode list before the copy, and closed when done.
 
@@ -2220,6 +2231,20 @@ copy_int(#file_descriptor{module = Module} = Source,
 copy_int(#file_descriptor{} = Source, 
 	 #file_descriptor{} = Dest, Length) ->
     copy_opened_int(Source, Dest, Length, 0);
+%% Copy between names in open directories. The directories belong to this
+%% process, so the file server cannot open them and the copy is done here.
+copy_int({{#file_descriptor{}, _} = Source, SourceOpts},
+         {{#file_descriptor{}, _} = Dest, DestOpts}, Length)
+  when is_list(SourceOpts), is_list(DestOpts) ->
+    copy_at(Source, SourceOpts, Dest, DestOpts, Length);
+copy_int({{#file_descriptor{}, _} = Source, SourceOpts}, {DestName, DestOpts},
+         Length)
+  when is_list(SourceOpts), is_list(DestOpts) ->
+    copy_at(Source, SourceOpts, DestName, DestOpts, Length);
+copy_int({SourceName, SourceOpts}, {{#file_descriptor{}, _} = Dest, DestOpts},
+         Length)
+  when is_list(SourceOpts), is_list(DestOpts) ->
+    copy_at(SourceName, SourceOpts, Dest, DestOpts, Length);
 %% Copy between filenames, let the server do the copy
 copy_int({SourceName, SourceOpts}, {DestName, DestOpts}, Length) 
   when is_list(SourceOpts), is_list(DestOpts) ->
@@ -2295,6 +2320,36 @@ copy_int(Source, Dest, Length) ->
     copy_int({Source, []}, {Dest, []}, Length).
 
 
+
+%% Opens both names and copies between the open files. At least one of them is
+%% a name in an open directory, which only this process can resolve.
+copy_at(Source, SourceOpts, Dest, DestOpts, Length) ->
+    case open(Source, [read, binary | SourceOpts]) of
+        {ok, In} ->
+            Result =
+                case open(Dest, [write, binary | DestOpts]) of
+                    {ok, Out} ->
+                        copy_at_close(In, Out, Length);
+                    {error, _} = Error ->
+                        Error
+                end,
+            _ = close(In),
+            Result;
+        {error, _} = Error ->
+            Error
+    end.
+
+copy_at_close(In, Out, Length) ->
+    case copy_opened_int(In, Out, Length, 0) of
+        {ok, _} = OK ->
+            case close(Out) of
+                ok -> OK;
+                Error -> Error
+            end;
+        Error ->
+            _ = close(Out),
+            Error
+    end.
 
 -doc false.
 copy_opened(Source, Dest, Length)
@@ -3162,6 +3217,10 @@ fname_join(Dir, Name) ->
 %% 	Generates a flat file name from a deep list of atoms and 
 %% 	characters (integers).
 
+file_name({#file_descriptor{}, _Name} = Target) ->
+    %% A name in an open directory is opened by open/2, which resolves it
+    %% against the directory. It needs no name translation of its own.
+    Target;
 file_name(N) when is_binary(N) ->
     N;
 file_name(N) ->

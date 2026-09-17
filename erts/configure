@@ -21837,6 +21837,18 @@ then :
   printf "%s\n" "#define HAVE_UTIMENSAT 1" >>confdefs.h
 
 fi
+ac_fn_c_check_func "$LINENO" "linkat" "ac_cv_func_linkat"
+if test "x$ac_cv_func_linkat" = xyes
+then :
+  printf "%s\n" "#define HAVE_LINKAT 1" >>confdefs.h
+
+fi
+ac_fn_c_check_func "$LINENO" "symlinkat" "ac_cv_func_symlinkat"
+if test "x$ac_cv_func_symlinkat" = xyes
+then :
+  printf "%s\n" "#define HAVE_SYMLINKAT 1" >>confdefs.h
+
+fi
 ac_fn_c_check_func "$LINENO" "strlcpy" "ac_cv_func_strlcpy"
 if test "x$ac_cv_func_strlcpy" = xyes
 then :

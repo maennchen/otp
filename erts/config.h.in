@@ -932,6 +932,12 @@
 /* Define to 1 if you have the 'fstatat' function. */
 #undef HAVE_FSTATAT
 
+/* Define to 1 if you have the 'linkat' function. */
+#undef HAVE_LINKAT
+
+/* Define to 1 if you have the 'symlinkat' function. */
+#undef HAVE_SYMLINKAT
+
 /* Define to 1 if you have the 'mkdirat' function. */
 #undef HAVE_MKDIRAT
 

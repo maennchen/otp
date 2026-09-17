@@ -1380,6 +1380,52 @@ posix_errno_t efile_make_soft_link(const efile_path_t *existing_path, const efil
     return 0;
 }
 
+posix_errno_t efile_make_hard_link_at(efile_data_t *existing_dir,
+        const efile_path_t *existing_path, efile_data_t *new_dir,
+        const efile_path_t *new_path) {
+#ifndef HAVE_LINKAT
+    (void)existing_dir;
+    (void)existing_path;
+    (void)new_dir;
+    (void)new_path;
+
+    return ENOTSUP;
+#else
+    efile_unix_t *existing_u = (efile_unix_t*)existing_dir;
+    efile_unix_t *new_u = (efile_unix_t*)new_dir;
+
+    /* A hard link names a file that has to exist, so both names are resolved
+     * against the directory they belong to. */
+    if(linkat(existing_u->fd, (const char*)existing_path->data,
+              new_u->fd, (const char*)new_path->data, 0) < 0) {
+        return errno;
+    }
+
+    return 0;
+#endif
+}
+
+posix_errno_t efile_make_soft_link_at(const efile_path_t *existing_path,
+        efile_data_t *new_dir, const efile_path_t *new_path) {
+#ifndef HAVE_SYMLINKAT
+    (void)existing_path;
+    (void)new_dir;
+    (void)new_path;
+
+    return ENOTSUP;
+#else
+    efile_unix_t *new_u = (efile_unix_t*)new_dir;
+
+    /* Only the new name is resolved. The target is stored as it is given. */
+    if(symlinkat((const char*)existing_path->data, new_u->fd,
+                 (const char*)new_path->data) < 0) {
+        return errno;
+    }
+
+    return 0;
+#endif
+}
+
 posix_errno_t efile_make_dir(const efile_path_t *path) {
 #ifdef NO_MKDIR_MODE
     if(mkdir((const char*)path->data) < 0) {

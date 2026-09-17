@@ -113,6 +113,8 @@ static ERL_NIF_TERM get_handle_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
 static ERL_NIF_TERM altname_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM set_controlling_process_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM rename_at_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+static ERL_NIF_TERM make_hard_link_at_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+static ERL_NIF_TERM make_soft_link_at_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 
 /* Helper functions */
 
@@ -215,6 +217,8 @@ static ErlNifFunc nif_funcs[] = {
     {"make_dir_at_nif", 2, make_dir_at_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"del_at_nif", 3, del_at_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"rename_at_nif", 4, rename_at_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"make_hard_link_at_nif", 4, make_hard_link_at_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"make_soft_link_at_nif", 3, make_soft_link_at_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"set_permissions_at_nif", 3, set_permissions_at_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"set_owner_at_nif", 4, set_owner_at_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"set_time_at_nif", 5, set_time_at_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
@@ -887,12 +891,80 @@ static ERL_NIF_TERM rename_at_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
         return posix_error_to_tuple(env, EINVAL);
     }
 
-    if((posix_errno = efile_marshal_path(env, argv[1], &old_path))) {
+    if((posix_errno = efile_marshal_name(env, argv[1], &old_path))) {
         return posix_error_to_tuple(env, posix_errno);
-    } else if((posix_errno = efile_marshal_path(env, argv[3], &new_path))) {
+    } else if((posix_errno = efile_marshal_name(env, argv[3], &new_path))) {
         return posix_error_to_tuple(env, posix_errno);
     } else if((posix_errno = efile_rename_at(old_dir, &old_path,
                                              new_dir, &new_path))) {
+        return posix_error_to_tuple(env, posix_errno);
+    }
+
+    return am_ok;
+}
+
+/* Like renaming, a hard link takes two directories, so it cannot use the
+ * wrapper that marks one file as busy. */
+static ERL_NIF_TERM make_hard_link_at_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    efile_data_t *existing_dir, *new_dir;
+    efile_path_t existing_path, new_path;
+    posix_errno_t posix_errno;
+
+    ASSERT(argc == 4);
+
+    if(!get_file_data(env, argv[0], &existing_dir)
+       || !get_file_data(env, argv[2], &new_dir)) {
+        return enif_make_badarg(env);
+    }
+
+    if(!(existing_dir->modes & EFILE_MODE_DIRECTORY)
+       || !(new_dir->modes & EFILE_MODE_DIRECTORY)) {
+        return posix_error_to_tuple(env, ENOTDIR);
+    }
+
+    if(erts_atomic32_read_acqb(&existing_dir->state) != EFILE_STATE_IDLE
+       || erts_atomic32_read_acqb(&new_dir->state) != EFILE_STATE_IDLE) {
+        return posix_error_to_tuple(env, EINVAL);
+    }
+
+    if((posix_errno = efile_marshal_name(env, argv[1], &existing_path))) {
+        return posix_error_to_tuple(env, posix_errno);
+    } else if((posix_errno = efile_marshal_name(env, argv[3], &new_path))) {
+        return posix_error_to_tuple(env, posix_errno);
+    } else if((posix_errno = efile_make_hard_link_at(existing_dir, &existing_path,
+                                                     new_dir, &new_path))) {
+        return posix_error_to_tuple(env, posix_errno);
+    }
+
+    return am_ok;
+}
+
+/* Only the new name belongs to a directory. The target is stored as given. */
+static ERL_NIF_TERM make_soft_link_at_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    efile_path_t existing_path, new_path;
+    posix_errno_t posix_errno;
+    efile_data_t *new_dir;
+
+    ASSERT(argc == 3);
+
+    if(!get_file_data(env, argv[1], &new_dir)) {
+        return enif_make_badarg(env);
+    }
+
+    if(!(new_dir->modes & EFILE_MODE_DIRECTORY)) {
+        return posix_error_to_tuple(env, ENOTDIR);
+    }
+
+    if(erts_atomic32_read_acqb(&new_dir->state) != EFILE_STATE_IDLE) {
+        return posix_error_to_tuple(env, EINVAL);
+    }
+
+    if((posix_errno = efile_marshal_path(env, argv[0], &existing_path))) {
+        return posix_error_to_tuple(env, posix_errno);
+    } else if((posix_errno = efile_marshal_path(env, argv[2], &new_path))) {
+        return posix_error_to_tuple(env, posix_errno);
+    } else if((posix_errno = efile_make_soft_link_at(&existing_path, new_dir,
+                                                     &new_path))) {
         return posix_error_to_tuple(env, posix_errno);
     }
 

@@ -37,17 +37,19 @@
  * and the types they need. The emulator links against ntdll for them. */
 #include <winternl.h>
 
-/* winternl.h does not declare the call that changes a name on an open file,
- * so it is declared here. */
+/* winternl.h does not declare the call that changes a name on an open file
+ * or gives it a second one, so it is declared here. */
 NTSYSAPI NTSTATUS NTAPI NtSetInformationFile(HANDLE FileHandle,
     IO_STATUS_BLOCK *IoStatusBlock, PVOID FileInformation, ULONG Length,
     FILE_INFORMATION_CLASS FileInformationClass);
 
-/* SetFileInformationByHandle ignores the directory in FILE_RENAME_INFO, so
- * renaming a name relative to a directory uses the native call and the
- * structure that call expects. winternl.h declares FILE_INFORMATION_CLASS
- * with one member, so the value is given here as well. */
+/* SetFileInformationByHandle ignores the directory in FILE_RENAME_INFO, and
+ * the Windows SDK has no structure for a hard link at all, so both of these
+ * use the native call and the structures that call expects. winternl.h
+ * declares FILE_INFORMATION_CLASS with one member, so the values are given
+ * here as well. */
 #define EFILE_FILE_RENAME_INFORMATION ((FILE_INFORMATION_CLASS)10)
+#define EFILE_FILE_LINK_INFORMATION ((FILE_INFORMATION_CLASS)11)
 
 typedef struct {
     BOOLEAN ReplaceIfExists;
@@ -55,6 +57,14 @@ typedef struct {
     ULONG FileNameLength;
     WCHAR FileName[1];
 } EFILE_FILE_RENAME_INFORMATION_T;
+
+typedef struct {
+    BOOLEAN ReplaceIfExists;
+    HANDLE RootDirectory;
+    ULONG FileNameLength;
+    WCHAR FileName[1];
+} EFILE_FILE_LINK_INFORMATION_T;
+
 
 #define EFILE_OBJ_CASE_INSENSITIVE 0x00000040
 
@@ -850,6 +860,88 @@ posix_errno_t efile_read_link_at(ErlNifEnv *env, efile_data_t *dir,
     }
 
     return posix_errno;
+}
+
+posix_errno_t efile_make_hard_link_at(efile_data_t *existing_dir,
+        const efile_path_t *existing_path, efile_data_t *new_dir,
+        const efile_path_t *new_path) {
+    efile_win_t *new_parent = (efile_win_t*)new_dir;
+    EFILE_FILE_LINK_INFORMATION_T *link_info;
+    IO_STATUS_BLOCK io_status_block;
+    posix_errno_t posix_errno;
+    size_t name_size, info_size;
+    NTSTATUS status;
+    HANDLE handle;
+
+    /* The file that gets a second name is opened first, and the new name is
+     * then given to it relative to the directory it belongs to. */
+    posix_errno = open_handle_at(existing_dir, existing_path, FILE_READ_ATTRIBUTES,
+        EFILE_FILE_OPEN_FOR_BACKUP_INTENT, EFILE_FILE_OPEN, &handle);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    name_size = wcslen((WCHAR*)new_path->data) * sizeof(WCHAR);
+    info_size = sizeof(EFILE_FILE_LINK_INFORMATION_T) + name_size;
+
+    link_info = (EFILE_FILE_LINK_INFORMATION_T*)enif_alloc(info_size);
+
+    if(link_info == NULL) {
+        CloseHandle(handle);
+        return ENOMEM;
+    }
+
+    sys_memset(link_info, 0, sizeof(EFILE_FILE_LINK_INFORMATION_T));
+    link_info->ReplaceIfExists = FALSE;
+    link_info->RootDirectory = new_parent->handle;
+    link_info->FileNameLength = (ULONG)name_size;
+    sys_memcpy(link_info->FileName, new_path->data, name_size);
+
+    sys_memset(&io_status_block, 0, sizeof(io_status_block));
+
+    status = NtSetInformationFile(handle, &io_status_block, link_info,
+        (ULONG)info_size, EFILE_FILE_LINK_INFORMATION);
+
+    if(status < 0) {
+        posix_errno = nt_status_to_posix_errno(status);
+    } else {
+        posix_errno = 0;
+    }
+
+    enif_free(link_info);
+    CloseHandle(handle);
+
+    return posix_errno;
+}
+
+posix_errno_t efile_make_soft_link_at(const efile_path_t *existing_path,
+        efile_data_t *new_dir, const efile_path_t *new_path) {
+    (void)existing_path;
+    (void)new_dir;
+    (void)new_path;
+
+    /* CreateSymbolicLinkW needs a path for the new link, and Windows has no
+     * call that makes a link relative to a directory handle. Resolving the
+     * directory back to a path would resolve that path again, which is what
+     * this API avoids. */
+    return ENOTSUP;
+}
+
+posix_errno_t efile_open_in_root(efile_data_t *root, const efile_path_t *path,
+        enum efile_modes_t modes, ErlNifResourceType *nif_type, efile_data_t **d) {
+    (void)root;
+    (void)path;
+    (void)modes;
+    (void)nif_type;
+
+    /* Windows resolves a name against a directory handle, but it follows a
+     * reparse point while it does so, and it accepts a name that leaves the
+     * directory. Keeping a name inside the root needs a walk of its own, which
+     * this platform does not have yet. */
+    (*d) = NULL;
+
+    return ENOTSUP;
 }
 
 posix_errno_t efile_make_dir_at(efile_data_t *dir, const efile_path_t *path) {
