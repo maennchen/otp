@@ -111,6 +111,7 @@ static ERL_NIF_TERM file_desc_to_ref_nif(ErlNifEnv *env, int argc, const ERL_NIF
 static ERL_NIF_TERM delayed_close_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM get_handle_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM altname_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
+static ERL_NIF_TERM set_controlling_process_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]);
 
 /* Helper functions */
 
@@ -177,6 +178,7 @@ WRAP_FILE_HANDLE_EXPORT(list_handle_dir_nif)
 WRAP_FILE_HANDLE_EXPORT(set_handle_permissions_nif)
 WRAP_FILE_HANDLE_EXPORT(set_handle_owner_nif)
 WRAP_FILE_HANDLE_EXPORT(set_handle_time_nif)
+WRAP_FILE_HANDLE_EXPORT(open_at_nif)
 
 static ErlNifFunc nif_funcs[] = {
     /* File handle ops */
@@ -196,6 +198,7 @@ static ErlNifFunc nif_funcs[] = {
     {"set_handle_permissions_nif", 2, set_handle_permissions_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"set_handle_owner_nif", 3, set_handle_owner_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"set_handle_time_nif", 4, set_handle_time_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"open_at_nif", 3, open_at_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
 
     /* Filesystem ops */
     {"make_hard_link_nif", 2, make_hard_link_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
@@ -224,6 +227,7 @@ static ErlNifFunc nif_funcs[] = {
     {"delayed_close_nif", 1, delayed_close_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"altname_nif", 1, altname_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"file_desc_to_ref_nif", 1, file_desc_to_ref_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"set_controlling_process_nif", 2, set_controlling_process_nif},
 };
 
 ERL_NIF_INIT(prim_file, nif_funcs, load, NULL, upgrade, unload)
@@ -577,6 +581,40 @@ static ERL_NIF_TERM create_ref_or_error_tuple(ErlNifEnv *env, efile_data_t *d) {
     return enif_make_tuple2(env, am_ok, result);
 }
 
+/* Moves a file to another process. The file is monitored on the new process
+ * before the old monitor is removed, so the file is never left unmonitored. If
+ * the new process is already dead, the file keeps its current owner and the
+ * caller is told. */
+static ERL_NIF_TERM set_controlling_process_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    ErlNifPid new_owner;
+    ErlNifMonitor monitor;
+    efile_data_t *d;
+
+    ASSERT(argc == 2);
+
+    if(!get_file_data(env, argv[0], &d)) {
+        return enif_make_badarg(env);
+    }
+
+    if(!enif_get_local_pid(env, argv[1], &new_owner)) {
+        return enif_make_badarg(env);
+    }
+
+    if(erts_atomic32_read_acqb(&d->state) != EFILE_STATE_IDLE) {
+        return posix_error_to_tuple(env, EINVAL);
+    }
+
+    if(enif_monitor_process(env, d, &new_owner, &monitor)) {
+        /* The new owner is already dead. */
+        return posix_error_to_tuple(env, ESRCH);
+    }
+
+    enif_demonitor_process(env, d, &d->monitor);
+    d->monitor = monitor;
+
+    return am_ok;
+}
+
 static ERL_NIF_TERM open_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     posix_errno_t posix_errno;
     efile_data_t *d;
@@ -594,6 +632,34 @@ static ERL_NIF_TERM open_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
     if((posix_errno = efile_marshal_path(env, argv[0], &path))) {
         return posix_error_to_tuple(env, posix_errno);
     } else if((posix_errno = efile_open(&path, modes, efile_resource_type, &d))) {
+        return posix_error_to_tuple(env, posix_errno);
+    }
+
+    return create_ref_or_error_tuple(env, d);
+}
+
+static ERL_NIF_TERM open_at_nif_impl(efile_data_t *dir, ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    posix_errno_t posix_errno;
+    efile_data_t *d;
+
+    enum efile_modes_t modes;
+    efile_path_t path;
+
+    ASSERT(argc == 2);
+    if(!enif_is_list(env, argv[1])) {
+        return enif_make_badarg(env);
+    }
+
+    if(!(dir->modes & EFILE_MODE_DIRECTORY)) {
+        return posix_error_to_tuple(env, ENOTDIR);
+    }
+
+    modes = efile_translate_modelist(env, argv[1]);
+
+    if((posix_errno = efile_marshal_name(env, argv[0], &path))) {
+        return posix_error_to_tuple(env, posix_errno);
+    } else if((posix_errno = efile_open_at(dir, &path, modes,
+                                           efile_resource_type, &d))) {
         return posix_error_to_tuple(env, posix_errno);
     }
 

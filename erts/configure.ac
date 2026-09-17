@@ -2232,7 +2232,9 @@ AS_CASE([$host_os],
         ],
 	[win32],
 	[
-		LIBS="$LIBS -lmswsock"
+                dnl ntdll supplies the calls that open and link a name relative to
+                dnl a directory handle. Win32 has no equivalent of its own.
+                LIBS="$LIBS -lmswsock -lntdll"
 	])
 
 dnl Check for recvmmsg and sendmmsg (Linux and BSD, not Darwin/Windows)
@@ -2364,7 +2366,7 @@ AC_CHECK_FUNCS([ieee_handler fpsetmask finite isnan isinf res_gethostbyname dlop
 		dlvsym pread pwrite memmove strerror strerror_r strerrorname_np strncasecmp \
 		gethrtime localtime_r gmtime_r mprotect madvise posix_madvise \
 		mmap mremap memcpy memrchr mallopt sbrk _sbrk __sbrk brk _brk __brk \
-                flockfile fstat fdopendir futimens futimes strlcpy strlcat setsid posix2time time2posix \
+                flockfile fstat fdopendir futimens futimes openat strlcpy strlcat setsid posix2time time2posix \
 		setlocale nl_langinfo poll mlockall ppoll vsyslog])
 
 ## We have a special check for inet_pton as AC_CHECK_FUCNS does not work

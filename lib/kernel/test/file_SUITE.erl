@@ -52,6 +52,7 @@
 -export([cur_dir_0/1, cur_dir_1/1, make_del_dir/1, make_del_dir_r/1,
          list_dir/1,list_dir_error/1,list_dir_handle/1,
          file_write_handle_info/1,
+         open_at/1, open_at_symlink/1,
 	 untranslatable_names/1, untranslatable_names_error/1,
 	 pos1/1, pos2/1, pos3/1]).
 -export([close/1, consult1/1, path_consult/1, delete/1]).
@@ -157,7 +158,7 @@ groups() ->
      {open, [],
       [open1, old_modes, new_modes, path_open, close, access,
        read_write, pread_write, append, open_errors,
-       exclusive]},
+       exclusive, open_at, open_at_symlink]},
      {pos, [], [pos1, pos2, pos3]},
      {file_info, [],
       [file_info_basic_file, file_info_basic_directory,
@@ -891,11 +892,127 @@ list_dir_handle_symlink(TestDir, Sorted) ->
 
             ok = ?FILE_MODULE:close(Fd),
 
-            ok = ?FILE_MODULE:delete(Link),
+            ok = delete_dir_symlink(Link),
             ok = ?FILE_MODULE:delete(filename:join(Other, "other")),
             ok = ?FILE_MODULE:del_dir(Other),
             ok
     end.
+
+%% Removes a symbolic link that points at a directory. Unix removes it as a
+%% link, Windows as a directory.
+delete_dir_symlink(Link) ->
+    case os:type() of
+        {win32, _} -> ?FILE_MODULE:del_dir(Link);
+        _ -> ?FILE_MODULE:delete(Link)
+    end.
+
+%%%
+%%% Test opening a file in an open directory.
+%%%
+
+open_at(Config) when is_list(Config) ->
+    RootDir = proplists:get_value(priv_dir, Config),
+    TestDir = filename:join(RootDir, ?MODULE_STRING++"_open_at"),
+    ok = ?FILE_MODULE:make_dir(TestDir),
+    Name = filename:join(TestDir, "file"),
+    ok = ?FILE_MODULE:write_file(Name, "contents"),
+
+    {ok, Dir} = ?FILE_MODULE:open(TestDir, [raw, read, directory]),
+
+    %% A raw file reads the same contents as a path does.
+    {ok, Raw} = ?FILE_MODULE:open({Dir, "file"}, [raw, read]),
+    {ok, <<"contents">>} = ?FILE_MODULE:read(Raw, 100),
+    ok = ?FILE_MODULE:close(Raw),
+
+    %% Without the raw mode the caller gets an io server, which reads the same
+    %% contents as a list.
+    {ok, Pid} = ?FILE_MODULE:open({Dir, "file"}, [read]),
+    true = is_pid(Pid),
+    {ok, "contents"} = ?FILE_MODULE:read(Pid, 100),
+    ok = ?FILE_MODULE:close(Pid),
+
+    %% The io server owns the file, so the file stays open after the directory
+    %% is closed.
+    {ok, Pid2} = ?FILE_MODULE:open({Dir, "file"}, [read]),
+    ok = ?FILE_MODULE:close(Dir),
+    {ok, "contents"} = ?FILE_MODULE:read(Pid2, 100),
+    ok = ?FILE_MODULE:close(Pid2),
+
+    {ok, Dir2} = ?FILE_MODULE:open(TestDir, [raw, read, directory]),
+
+    {error, enoent} = ?FILE_MODULE:open({Dir2, "missing"}, [raw, read]),
+
+    %% The ram mode has no file to work on, so it is not allowed. A path
+    %% raises the same error when it is given both ram and raw.
+    ok = try ?FILE_MODULE:open({Dir2, "file"}, [ram, read]) of
+             Unexpected -> Unexpected
+         catch
+             error:badarg -> ok
+         end,
+
+    ok = ?FILE_MODULE:close(Dir2),
+
+    ok = ?FILE_MODULE:delete(Name),
+    ok = ?FILE_MODULE:del_dir(TestDir),
+
+    [] = flush(),
+    ok.
+
+%% An open directory is not resolved again, so replacing the path it was opened
+%% through does not change which file is opened.
+open_at_symlink(Config) when is_list(Config) ->
+    RootDir = proplists:get_value(priv_dir, Config),
+    TestDir = filename:join(RootDir, ?MODULE_STRING++"_open_at_symlink"),
+    ok = ?FILE_MODULE:make_dir(TestDir),
+
+    Target = filename:join(TestDir, "target"),
+    Other = filename:join(TestDir, "other"),
+    Link = filename:join(TestDir, "link"),
+
+    ok = ?FILE_MODULE:make_dir(Target),
+    ok = ?FILE_MODULE:make_dir(Other),
+    ok = ?FILE_MODULE:write_file(filename:join(Target, "file"), "target"),
+    ok = ?FILE_MODULE:write_file(filename:join(Other, "file"), "other"),
+
+    case ?FILE_MODULE:make_symlink(Target, Link) of
+        {error, enotsup} ->
+            ok;
+        {error, eperm} ->
+            {win32,_} = os:type(),
+            ok;
+        ok ->
+            {ok, Dir} = ?FILE_MODULE:open(Link, [raw, read, directory]),
+
+            %% Point the symlink at the other directory now that it is
+            %% open. A link to a directory is removed as a directory on
+            %% Windows and as a link on Unix.
+            ok = delete_dir_symlink(Link),
+            ok = ?FILE_MODULE:make_symlink(Other, Link),
+
+            {ok, Fd} = ?FILE_MODULE:open({Dir, "file"}, [raw, read, binary]),
+            {ok, <<"target">>} = ?FILE_MODULE:read(Fd, 100),
+            ok = ?FILE_MODULE:close(Fd),
+
+            %% The path resolves to the other directory now.
+            {ok, ViaPath} =
+                ?FILE_MODULE:open(filename:join(Link, "file"),
+                                  [raw, read, binary]),
+            {ok, <<"other">>} = ?FILE_MODULE:read(ViaPath, 100),
+            ok = ?FILE_MODULE:close(ViaPath),
+
+            ok = ?FILE_MODULE:close(Dir),
+            ok = delete_dir_symlink(Link),
+            ok
+    end,
+
+    ok = ?FILE_MODULE:delete(filename:join(Target, "file")),
+    ok = ?FILE_MODULE:delete(filename:join(Other, "file")),
+    ok = ?FILE_MODULE:del_dir(Target),
+    ok = ?FILE_MODULE:del_dir(Other),
+    ok = ?FILE_MODULE:del_dir(TestDir),
+
+    [] = flush(),
+    ok.
 
 %%%
 %%% Test write_file_info() on an open file.

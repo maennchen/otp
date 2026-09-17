@@ -1502,13 +1502,39 @@ Typical error reasons:
 
 - **`enospc`** - There is no space left on the device (if `write` access was
   specified).
+
+## Opening a file in an open directory
+
+`File` can also be a `{Dir, Name}` tuple. `Dir` is a directory that was opened
+with the modes `raw`, `read` and `directory`. `Name` is the name of a file in
+that directory.
+
+The operating system resolves `Name` against the open directory. It does not
+resolve the path of the directory again, so another process cannot replace a
+directory in that path and make this function open a different file. The file
+stays open after the directory is closed.
+
+`Name` itself is not checked. A name that contains `..` or that starts with a
+separator still reaches a file outside the directory.
+
+```erlang
+{ok, Dir} = file:open("/tmp/example", [raw, read, directory]),
+{ok, Fd} = file:open({Dir, "data.txt"}, [read]),
+ok = file:close(Dir).
+```
+
+The mode `ram` is not allowed with a `{Dir, Name}` tuple.
 """.
 -spec open(File, Modes) -> {ok, IoDevice} | {error, Reason} when
-      File :: Filename | iodata(),
+      File :: Filename | iodata() | {Dir, Filename},
       Filename :: name_all(),
+      Dir :: io_device(),
       Modes :: [mode() | ram | directory],
       IoDevice :: io_device(),
       Reason :: posix() | badarg | system_limit.
+
+open({#file_descriptor{} = Dir, Name}, ModeList) when is_list(ModeList) ->
+    open_at(unwrap_fd(Dir), file_name(Name), ModeList);
 
 open(Item, ModeList) when is_list(ModeList) ->
     case {lists:member(raw, ModeList), lists:member(ram, ModeList)} of
@@ -1541,6 +1567,68 @@ open(Item, ModeList) when is_list(ModeList) ->
 %% Old obsolete mode specification in atom or 2-tuple format
 open(Item, Mode) ->
     open(Item, mode_list(Mode)).
+
+%% Opens a name against an open directory. The name is resolved by the
+%% operating system against the directory the caller holds, so another process
+%% cannot replace a directory in the path and make the caller open a different
+%% file.
+%% A directory that file:open/2 returned is wrapped in the layers that were
+%% asked for, and only the file underneath them can open a name.
+unwrap_fd(#file_descriptor{module = ?PRIM_FILE} = Fd) ->
+    Fd;
+unwrap_fd(#file_descriptor{data = #file_descriptor{} = Inner}) ->
+    unwrap_fd(Inner);
+unwrap_fd(Fd) ->
+    Fd.
+
+open_at(_Dir, {error, _} = Error, _ModeList) ->
+    Error;
+open_at(Dir, Name, ModeList) ->
+    case {lists:member(raw, ModeList), lists:member(ram, ModeList)} of
+        {_, true} ->
+            erlang:error(badarg, [{Dir, Name}, ModeList]);
+        {true, false} ->
+            ?PRIM_FILE:open({Dir, Name}, ModeList);
+        {false, false} ->
+            %% The directory belongs to this process, so the file must be
+            %% opened here. The io server then adopts the open file instead of
+            %% opening a name of its own.
+            open_at_io_server(Dir, Name, ModeList)
+    end.
+
+open_at_io_server(Dir, Name, ModeList) ->
+    case check_args([Name | ModeList]) of
+        ok ->
+            %% The directory belongs to this process, so the file is opened
+            %% here and the io server adopts it. The io server runs its open
+            %% function in its own process, which cannot use the directory.
+            case ?PRIM_FILE:open({Dir, Name}, ModeList) of
+                {ok, Fd} ->
+                    start_io_server_for(Fd, ModeList);
+                Error ->
+                    Error
+            end;
+        Error ->
+            Error
+    end.
+
+start_io_server_for(Fd, ModeList) ->
+    %% The file was opened by this process, because only this process can use
+    %% the directory. The io server takes it over in its own process, so the
+    %% file is closed when the io server dies rather than when we do.
+    OpenFun = fun(_ReadMode, _Opts) -> ?PRIM_FILE:adopt(Fd) end,
+
+    Result = file_io_server:start_handle(self(), OpenFun, ModeList),
+
+    case Result of
+        {ok, _Pid} ->
+            Result;
+        Error ->
+            %% The io server never took the file, so it is still ours to
+            %% close.
+            _ = ?PRIM_FILE:close(Fd),
+            Error
+    end.
 
 %%%-----------------------------------------------------------------
 %%% The following interface functions operate on open files.

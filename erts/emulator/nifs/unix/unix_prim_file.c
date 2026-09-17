@@ -100,6 +100,12 @@ posix_errno_t efile_marshal_path(ErlNifEnv *env, ERL_NIF_TERM path, efile_path_t
     return 0;
 }
 
+posix_errno_t efile_marshal_name(ErlNifEnv *env, ERL_NIF_TERM name, efile_path_t *result) {
+    /* A path is not expanded on this platform, so a name needs no different
+     * treatment than a path. */
+    return efile_marshal_path(env, name, result);
+}
+
 ERL_NIF_TERM efile_get_handle(ErlNifEnv *env, efile_data_t *d) {
     efile_unix_t *u = (efile_unix_t*)d;
     int fd = u->fd;
@@ -170,26 +176,10 @@ static int get_flags(enum efile_modes_t modes) {
     return flags;
 }
 
-posix_errno_t efile_open(const efile_path_t *path, enum efile_modes_t modes,
-        ErlNifResourceType *nif_type, efile_data_t **d) {
-
-    int mode, flags, fd;
-
-    flags = get_flags(modes);
-
-    if(modes & EFILE_MODE_DIRECTORY) {
-        mode = DIR_MODE;
-#ifdef O_DIRECTORY
-        flags |= O_DIRECTORY;
-#endif
-    } else {
-        mode = FILE_MODE;
-    }
-
-    do {
-        fd = open((const char*)path->data, flags, mode);
-    } while(fd == -1 && errno == EINTR);
-
+/* Wraps a descriptor that open(2) or openat(2) returned in a resource. The
+ * path is used for the type checks, and for those only. */
+static posix_errno_t build_open_resource(const efile_path_t *path, int fd,
+        enum efile_modes_t modes, ErlNifResourceType *nif_type, efile_data_t **d) {
     if(fd != -1) {
         efile_unix_t *u;
 
@@ -223,6 +213,62 @@ posix_errno_t efile_open(const efile_path_t *path, enum efile_modes_t modes,
 
     (*d) = NULL;
     return errno;
+}
+
+/* Returns the open(2) flags and the creation mode for the given modes. */
+static void get_open_flags(enum efile_modes_t modes, int *flags, int *mode) {
+    *flags = get_flags(modes);
+
+    if(modes & EFILE_MODE_DIRECTORY) {
+        *mode = DIR_MODE;
+#ifdef O_DIRECTORY
+        *flags |= O_DIRECTORY;
+#endif
+    } else {
+        *mode = FILE_MODE;
+    }
+}
+
+posix_errno_t efile_open(const efile_path_t *path, enum efile_modes_t modes,
+        ErlNifResourceType *nif_type, efile_data_t **d) {
+
+    int mode, flags, fd;
+
+    get_open_flags(modes, &flags, &mode);
+
+    do {
+        fd = open((const char*)path->data, flags, mode);
+    } while(fd == -1 && errno == EINTR);
+
+    return build_open_resource(path, fd, modes, nif_type, d);
+}
+
+posix_errno_t efile_open_at(efile_data_t *dir, const efile_path_t *path,
+        enum efile_modes_t modes, ErlNifResourceType *nif_type, efile_data_t **d) {
+#ifndef HAVE_OPENAT
+    (void)dir;
+    (void)path;
+    (void)modes;
+    (void)nif_type;
+
+    (*d) = NULL;
+    return ENOTSUP;
+#else
+    efile_unix_t *u = (efile_unix_t*)dir;
+    int mode, flags, fd;
+
+    get_open_flags(modes, &flags, &mode);
+
+    /* openat(2) resolves the name against the open directory, so the caller
+     * cannot be tricked into opening a file outside the directory it holds.
+     * The name itself is not checked here. A name that contains ".." or that
+     * starts with a separator still escapes the directory. */
+    do {
+        fd = openat(u->fd, (const char*)path->data, flags, mode);
+    } while(fd == -1 && errno == EINTR);
+
+    return build_open_resource(path, fd, modes, nif_type, d);
+#endif
 }
 
 posix_errno_t efile_from_fd(int fd,

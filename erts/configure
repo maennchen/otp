@@ -21314,7 +21314,7 @@ fi
          ;; #(
   win32) :
 
-		LIBS="$LIBS -lmswsock"
+                LIBS="$LIBS -lmswsock -lntdll"
 	 ;; #(
   *) :
      ;;
@@ -21775,6 +21775,12 @@ ac_fn_c_check_func "$LINENO" "futimes" "ac_cv_func_futimes"
 if test "x$ac_cv_func_futimes" = xyes
 then :
   printf "%s\n" "#define HAVE_FUTIMES 1" >>confdefs.h
+
+fi
+ac_fn_c_check_func "$LINENO" "openat" "ac_cv_func_openat"
+if test "x$ac_cv_func_openat" = xyes
+then :
+  printf "%s\n" "#define HAVE_OPENAT 1" >>confdefs.h
 
 fi
 ac_fn_c_check_func "$LINENO" "strlcpy" "ac_cv_func_strlcpy"

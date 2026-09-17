@@ -133,6 +133,17 @@ typedef ErlNifBinary efile_path_t;
  * prim_file:internal_native2name for compatibility reasons. */
 posix_errno_t efile_marshal_path(ErlNifEnv *env, ERL_NIF_TERM path, efile_path_t *result);
 
+/** @brief Translates a name that is resolved against an open directory.
+ *
+ * Unlike \c efile_marshal_path this does not expand the name into a full
+ * path. The name is resolved by the operating system against the directory
+ * the caller holds, so a full path would name a file somewhere else, and
+ * Windows refuses one outright.
+ *
+ * @param name The term to translate; it must have been encoded with
+ * prim_file:internal_native2name, as for \c efile_marshal_path. */
+posix_errno_t efile_marshal_name(ErlNifEnv *env, ERL_NIF_TERM name, efile_path_t *result);
+
 /** @brief Returns the underlying handle as an implementation-defined term.
  *
  * This is an internal function intended to support tests and tricky
@@ -175,6 +186,20 @@ int efile_truncate(efile_data_t *d);
 
 posix_errno_t efile_open(const efile_path_t *path, enum efile_modes_t modes,
         ErlNifResourceType *nif_type, efile_data_t **d);
+
+/** @brief Opens a file whose name is resolved against an open directory.
+ *
+ * This function does not resolve a path. The name is resolved against the
+ * directory the caller holds, so another process cannot replace a directory in
+ * the path and make the caller open a different file.
+ *
+ * The name itself is not checked. A name that contains ".." or that starts
+ * with a separator still reaches a file outside the directory. Callers that
+ * need containment must check the name first.
+ *
+ * @param dir A file that was opened with EFILE_MODE_DIRECTORY. */
+posix_errno_t efile_open_at(efile_data_t *dir, const efile_path_t *path,
+        enum efile_modes_t modes, ErlNifResourceType *nif_type, efile_data_t **d);
 
 posix_errno_t efile_from_fd(int fd,
                             ErlNifResourceType *nif_type,
