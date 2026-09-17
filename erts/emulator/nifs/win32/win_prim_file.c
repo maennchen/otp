@@ -1240,6 +1240,34 @@ posix_errno_t efile_list_dir(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_T
     return 0;
 }
 
+static posix_errno_t list_handle_dir(ErlNifEnv *env, HANDLE handle,
+        ERL_NIF_TERM *result) {
+    posix_errno_t posix_errno;
+    efile_path_t path;
+
+    /* Windows cannot enumerate a directory directly from a HANDLE. We ask the
+     * handle for its current path, then search that path. This guarantee is
+     * weaker than the Unix guarantee. The open handle keeps the directory
+     * alive. The resolved path also follows the directory across renames. */
+    posix_errno = internal_read_link(handle, &path);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    posix_errno = efile_list_dir(env, &path, result);
+
+    enif_release_binary(&path);
+
+    return posix_errno;
+}
+
+posix_errno_t efile_list_handle_dir(ErlNifEnv *env, efile_data_t *d, ERL_NIF_TERM *result) {
+    efile_win_t *w = (efile_win_t*)d;
+
+    return list_handle_dir(env, w->handle, result);
+}
+
 posix_errno_t efile_rename(const efile_path_t *old_path, const efile_path_t *new_path) {
     BOOL old_is_directory, new_is_directory;
     DWORD move_flags, last_error;

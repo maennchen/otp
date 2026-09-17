@@ -50,7 +50,7 @@
 	 init_per_testcase/2, end_per_testcase/2,
 	 read_write_file/1, names/1]).
 -export([cur_dir_0/1, cur_dir_1/1, make_del_dir/1, make_del_dir_r/1,
-	 list_dir/1,list_dir_error/1,
+	 list_dir/1,list_dir_error/1,list_dir_handle/1,
 	 untranslatable_names/1, untranslatable_names_error/1,
 	 pos1/1, pos2/1, pos3/1]).
 -export([close/1, consult1/1, path_consult/1, delete/1]).
@@ -146,8 +146,8 @@ all() ->
 
 groups() -> 
     [{dirs, [], [make_del_dir, make_del_dir_r, cur_dir_0, cur_dir_1,
-		 list_dir, list_dir_error, untranslatable_names,
-		 untranslatable_names_error]},
+		 list_dir, list_dir_error, list_dir_handle,
+		 untranslatable_names, untranslatable_names_error]},
      {files, [],
       [{group, open}, {group, pos}, {group, file_info},
        {group, consult}, {group, eval}, {group, script},
@@ -815,6 +815,92 @@ list_dir_1(TestDir, Cnt, Sorted0) ->
     Sorted = lists:sort(DirList0),
     Sorted = lists:sort(DirList1),
     list_dir_1(TestDir, Cnt-1, Sorted).
+
+%%%
+%%% Test list_dir() and list_dir_all() on an open directory.
+%%%
+
+list_dir_handle(Config) ->
+    RootDir = proplists:get_value(priv_dir, Config),
+    TestDir = filename:join(RootDir, ?MODULE_STRING++"_list_dir_handle"),
+    ok = ?FILE_MODULE:make_dir(TestDir),
+
+    Names = ["file1", "file2", "file3"],
+    [ok = ?FILE_MODULE:write_file(filename:join(TestDir, N), N) || N <- Names],
+    Sorted = lists:sort(Names),
+
+    {ok, Fd} = ?FILE_MODULE:open(TestDir, [raw, read, directory]),
+
+    {ok, DirList0} = ?FILE_MODULE:list_dir(Fd),
+    Sorted = lists:sort(DirList0),
+    {ok, DirList1} = ?FILE_MODULE:list_dir_all(Fd),
+    Sorted = lists:sort(DirList1),
+
+    %% The caller can list the same handle more than once.
+    {ok, DirList2} = ?FILE_MODULE:list_dir(Fd),
+    Sorted = lists:sort(DirList2),
+
+    ok = ?FILE_MODULE:close(Fd),
+
+    %% Listing a handle that is not a directory is an error.
+    {ok, RegularFd} =
+        ?FILE_MODULE:open(filename:join(TestDir, "file1"), [raw, read]),
+    {error, enotdir} = ?FILE_MODULE:list_dir(RegularFd),
+    {error, enotdir} = ?FILE_MODULE:list_dir_all(RegularFd),
+    ok = ?FILE_MODULE:close(RegularFd),
+
+    list_dir_handle_symlink(TestDir, Sorted),
+
+    [ok = ?FILE_MODULE:delete(filename:join(TestDir, N)) || N <- Names],
+    ok = ?FILE_MODULE:del_dir(TestDir),
+    ok.
+
+%% Listing an open directory does not resolve its path again. Replacing the
+%% path that the directory was opened through does not change the listing.
+list_dir_handle_symlink(TestDir, Sorted) ->
+    RootDir = filename:dirname(TestDir),
+    Link = filename:join(RootDir, ?MODULE_STRING++"_list_dir_handle_link"),
+    Other = filename:join(RootDir, ?MODULE_STRING++"_list_dir_handle_other"),
+
+    case ?FILE_MODULE:make_symlink(TestDir, Link) of
+        {error, enotsup} ->
+            ok;
+        {error, eperm} ->
+            {win32,_} = os:type(),
+            ok;
+        ok ->
+            ok = ?FILE_MODULE:make_dir(Other),
+            ok = ?FILE_MODULE:write_file(filename:join(Other, "other"), "other"),
+
+            {ok, Fd} = ?FILE_MODULE:open(Link, [raw, read, directory]),
+
+            %% Replace the symlink target now that the directory is open.
+            %% A link to a directory is removed as a directory on Windows
+            %% and as a link on Unix.
+            ok = delete_dir_symlink(Link),
+            ok = ?FILE_MODULE:make_symlink(Other, Link),
+
+            %% The handle still lists the directory it was opened on. The
+            %% path now resolves to the other directory.
+            {ok, ViaHandle} = ?FILE_MODULE:list_dir(Fd),
+            Sorted = lists:sort(ViaHandle),
+            {ok, ["other"]} = ?FILE_MODULE:list_dir(Link),
+
+            ok = ?FILE_MODULE:close(Fd),
+
+            ok = delete_dir_symlink(Link),
+            ok = ?FILE_MODULE:delete(filename:join(Other, "other")),
+            ok = ?FILE_MODULE:del_dir(Other),
+            ok
+    end.
+
+%% Removes a symbolic link that points at a directory. Unix removes it as a
+%% link, Windows as a directory.
+delete_dir_symlink(Link) ->
+    case os:type() of
+        {win32, _} -> ?FILE_MODULE:del_dir(Link);
+        _ -> ?FILE_MODULE:delete(Link)
+    end.
 
 untranslatable_names(Config) ->
     case no_untranslatable_names() of
