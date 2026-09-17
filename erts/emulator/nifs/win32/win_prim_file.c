@@ -1186,7 +1186,7 @@ posix_errno_t efile_read_link(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_
     return posix_errno;
 }
 
-posix_errno_t efile_list_dir(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_TERM *result) {
+static posix_errno_t list_dir_path(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_TERM *result) {
     ERL_NIF_TERM list_head;
     WIN32_FIND_DATAW data;
     HANDLE search_handle;
@@ -1238,6 +1238,32 @@ posix_errno_t efile_list_dir(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_T
     (*result) = list_head;
 
     return 0;
+}
+
+posix_errno_t efile_list_dir(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_TERM *result) {
+    return list_dir_path(env, path, result);
+}
+
+posix_errno_t efile_list_handle_dir(ErlNifEnv *env, efile_data_t *d, ERL_NIF_TERM *result) {
+    efile_win_t *w = (efile_win_t*)d;
+    posix_errno_t posix_errno;
+    efile_path_t path;
+
+    /* Windows cannot enumerate a directory directly from a HANDLE. We ask the
+     * handle for its current path, then search that path. This guarantee is
+     * weaker than the Unix guarantee. The open handle keeps the directory
+     * alive. The resolved path also follows the directory across renames. */
+    posix_errno = internal_read_link(w->handle, &path);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    posix_errno = list_dir_path(env, &path, result);
+
+    enif_release_binary(&path);
+
+    return posix_errno;
 }
 
 posix_errno_t efile_rename(const efile_path_t *old_path, const efile_path_t *new_path) {

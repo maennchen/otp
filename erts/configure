@@ -21759,6 +21759,12 @@ then :
   printf "%s\n" "#define HAVE_FSTAT 1" >>confdefs.h
 
 fi
+ac_fn_c_check_func "$LINENO" "fdopendir" "ac_cv_func_fdopendir"
+if test "x$ac_cv_func_fdopendir" = xyes
+then :
+  printf "%s\n" "#define HAVE_FDOPENDIR 1" >>confdefs.h
+
+fi
 ac_fn_c_check_func "$LINENO" "strlcpy" "ac_cv_func_strlcpy"
 if test "x$ac_cv_func_strlcpy" = xyes
 then :

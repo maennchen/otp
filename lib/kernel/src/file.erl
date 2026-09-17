@@ -1033,13 +1033,21 @@ Typical error reasons:
 
 - **`{no_translation, Filename}`** - `Filename` is a `t:binary/0` with
   characters coded in ISO Latin-1 and the VM was started with parameter `+fnue`.
+
+`Dir` can also be a directory opened with `open/2` using the modes `raw`,
+`read` and `directory`. `list_dir/1` then lists the open directory without
+resolving its path again. The result always describes the directory you opened,
+even if another process replaces the path.
 """.
 -spec list_dir(Dir) -> {ok, Filenames} | {error, Reason} when
-      Dir :: name_all(),
+      Dir :: name_all() | io_device(),
       Filenames :: [filename()],
       Reason :: posix()
               | badarg
               | {no_translation, Filename :: unicode:latin1_binary()}.
+
+list_dir(#file_descriptor{module = Module} = Handle) ->
+    Module:list_dir(Handle);
 
 list_dir(Name) ->
     check_and_call(list_dir, [file_name(Name)]).
@@ -1056,12 +1064,18 @@ Typical error reasons:
   parent directories.
 
 - **`enoent`** - The directory does not exist.
+
+`Dir` can also be a directory opened with `open/2` using the modes `raw`,
+`read` and `directory`, with the same guarantee as described for `list_dir/1`.
 """.
 -doc(#{since => <<"OTP R16B">>}).
 -spec list_dir_all(Dir) -> {ok, Filenames} | {error, Reason} when
-      Dir :: name_all(),
+      Dir :: name_all() | io_device(),
       Filenames :: [filename_all()],
       Reason :: posix() | badarg.
+
+list_dir_all(#file_descriptor{module = Module} = Handle) ->
+    Module:list_dir_all(Handle);
 
 list_dir_all(Name) ->
     check_and_call(list_dir_all, [file_name(Name)]).

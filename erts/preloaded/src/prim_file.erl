@@ -69,7 +69,7 @@
 
 -nifs([open_nif/2, close_nif/1, read_nif/2, write_nif/2, pread_nif/3,
        pwrite_nif/3, seek_nif/3, sync_nif/2, truncate_nif/1, allocate_nif/3,
-       advise_nif/4, read_handle_info_nif/1,
+       advise_nif/4, read_handle_info_nif/1, list_handle_dir_nif/1,
        make_hard_link_nif/2, make_soft_link_nif/2, rename_nif/2,
        read_info_nif/2, set_permissions_nif/2, set_owner_nif/3, set_time_nif/4,
        read_link_nif/1, list_dir_nif/1, make_dir_nif/1, del_file_nif/1,
@@ -608,6 +608,19 @@ translate_raw_name(RawName, SilentFailure) ->
 list_dir(Name) -> list_dir_1(Name, true).
 list_dir_all(Name) -> list_dir_1(Name, false).
 
+%% Listing an open directory does not resolve the path a second time. The
+%% caller always lists the directory it opened, even if another process
+%% replaces the path.
+list_dir_1(#file_descriptor{module = ?MODULE} = Fd, SkipInvalid) ->
+    try
+        #{ handle := FRef } = get_fd_data(Fd),
+        case list_handle_dir_nif(FRef) of
+            {ok, RawNames} -> list_dir_convert(RawNames, SkipInvalid, []);
+            {error, Reason} -> {error, Reason}
+        end
+    catch
+        error:badarg -> {error, badarg}
+    end;
 list_dir_1(Name, SkipInvalid) ->
     try list_dir_nif(encode_path(Name)) of
         {ok, RawNames} -> list_dir_convert(RawNames, SkipInvalid, []);
@@ -848,6 +861,8 @@ altname(Path) ->
     end.
 
 list_dir_nif(_Path) ->
+    erlang:nif_error(undef).
+list_handle_dir_nif(_FileRef) ->
     erlang:nif_error(undef).
 read_link_nif(_Path) ->
     erlang:nif_error(undef).

@@ -904,18 +904,11 @@ static int is_ignored_name(int name_length, const char *name) {
     return 0;
 }
 
-posix_errno_t efile_list_dir(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_TERM *result) {
+/* Reads all entries of dir_stream into a list. This function always closes the
+ * stream, on success and on failure. */
+static posix_errno_t list_dir_stream(ErlNifEnv *env, DIR *dir_stream, ERL_NIF_TERM *result) {
     ERL_NIF_TERM list_head;
-
     struct dirent *dir_entry;
-    DIR *dir_stream;
-
-    dir_stream = opendir((const char*)path->data);
-    if(dir_stream == NULL) {
-        posix_errno_t saved_errno = errno;
-        *result = enif_make_list(env, 0);
-        return saved_errno;
-    }
 
     list_head = enif_make_list(env, 0);
     dir_entry = readdir(dir_stream);
@@ -940,6 +933,58 @@ posix_errno_t efile_list_dir(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_T
     closedir(dir_stream);
 
     return 0;
+}
+
+posix_errno_t efile_list_dir(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_TERM *result) {
+    DIR *dir_stream;
+
+    dir_stream = opendir((const char*)path->data);
+    if(dir_stream == NULL) {
+        posix_errno_t saved_errno = errno;
+        *result = enif_make_list(env, 0);
+        return saved_errno;
+    }
+
+    return list_dir_stream(env, dir_stream, result);
+}
+
+posix_errno_t efile_list_handle_dir(ErlNifEnv *env, efile_data_t *d, ERL_NIF_TERM *result) {
+#ifndef HAVE_FDOPENDIR
+    (void)d;
+
+    *result = enif_make_list(env, 0);
+    return ENOTSUP;
+#else
+    efile_unix_t *u = (efile_unix_t*)d;
+    DIR *dir_stream;
+    int fd;
+
+    /* fdopendir becomes the owner of the descriptor. closedir would then close
+     * the descriptor of our resource, so we supply a copy instead. */
+    do {
+        fd = dup(u->fd);
+    } while(fd == -1 && errno == EINTR);
+
+    if(fd == -1) {
+        posix_errno_t saved_errno = errno;
+        *result = enif_make_list(env, 0);
+        return saved_errno;
+    }
+
+    dir_stream = fdopendir(fd);
+    if(dir_stream == NULL) {
+        posix_errno_t saved_errno = errno;
+        close(fd);
+        *result = enif_make_list(env, 0);
+        return saved_errno;
+    }
+
+    /* The copied descriptor shares its file offset with the original. An
+     * earlier call may have left that offset part-way through the directory. */
+    rewinddir(dir_stream);
+
+    return list_dir_stream(env, dir_stream, result);
+#endif
 }
 
 posix_errno_t efile_rename(const efile_path_t *old_path, const efile_path_t *new_path) {

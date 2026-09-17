@@ -25,7 +25,7 @@
 -export([close/1, sync/1, datasync/1, truncate/1, advise/4, allocate/3,
          position/2, write/2, pwrite/2, pwrite/3,
          read_line/1, read/2, pread/2, pread/3,
-         read_handle_info/2]).
+         read_handle_info/2, list_dir/1, list_dir_all/1]).
 
 %% OTP internal.
 -export([ipread_s32bu_p32bu/3, sendfile/8, internal_get_nif_resource/1]).
@@ -139,3 +139,11 @@ internal_get_nif_resource(Fd) ->
 read_handle_info(Fd, Opts) ->
     PrivateFd = Fd#file_descriptor.data,
     ?CALL_FD(PrivateFd, read_handle_info, [Opts]).
+
+list_dir(Fd) ->
+    PrivateFd = Fd#file_descriptor.data,
+    ?CALL_FD(PrivateFd, list_dir, []).
+
+list_dir_all(Fd) ->
+    PrivateFd = Fd#file_descriptor.data,
+    ?CALL_FD(PrivateFd, list_dir_all, []).

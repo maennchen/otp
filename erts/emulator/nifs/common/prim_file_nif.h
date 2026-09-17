@@ -213,6 +213,16 @@ posix_errno_t efile_read_link(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_
  * given directory. */
 posix_errno_t efile_list_dir(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_TERM *result);
 
+/** @brief Lists the contents of a directory that has already been opened with
+ * EFILE_MODE_DIRECTORY.
+ *
+ * This function does not resolve a path, but efile_list_dir does. An attacker
+ * cannot make the caller list a different directory.
+ *
+ * @param result [out] A list of all the directory/file names contained in the
+ * given directory. */
+posix_errno_t efile_list_handle_dir(ErlNifEnv *env, efile_data_t *d, ERL_NIF_TERM *result);
+
 /** @brief Changes the name of an existing file or directory, from old_path
  * to new_path.
  *

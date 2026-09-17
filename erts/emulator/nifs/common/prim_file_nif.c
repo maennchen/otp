@@ -173,6 +173,7 @@ WRAP_FILE_HANDLE_EXPORT(advise_nif)
 WRAP_FILE_HANDLE_EXPORT(get_handle_nif)
 WRAP_FILE_HANDLE_EXPORT(ipread_s32bu_p32bu_nif)
 WRAP_FILE_HANDLE_EXPORT(read_handle_info_nif)
+WRAP_FILE_HANDLE_EXPORT(list_handle_dir_nif)
 
 static ErlNifFunc nif_funcs[] = {
     /* File handle ops */
@@ -188,6 +189,7 @@ static ErlNifFunc nif_funcs[] = {
     {"allocate_nif", 3, allocate_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"advise_nif", 4, advise_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"read_handle_info_nif", 1, read_handle_info_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"list_handle_dir_nif", 1, list_handle_dir_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
 
     /* Filesystem ops */
     {"make_hard_link_nif", 2, make_hard_link_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
@@ -1140,6 +1142,23 @@ static ERL_NIF_TERM list_dir_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
     if((posix_errno = efile_marshal_path(env, argv[0], &path))) {
         return posix_error_to_tuple(env, posix_errno);
     } else if((posix_errno = efile_list_dir(env, &path, &result))) {
+        return posix_error_to_tuple(env, posix_errno);
+    }
+
+    return enif_make_tuple2(env, am_ok, result);
+}
+
+static ERL_NIF_TERM list_handle_dir_nif_impl(efile_data_t *d, ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    posix_errno_t posix_errno;
+    ERL_NIF_TERM result;
+
+    ASSERT(argc == 0);
+
+    if(!(d->modes & EFILE_MODE_DIRECTORY)) {
+        return posix_error_to_tuple(env, ENOTDIR);
+    }
+
+    if((posix_errno = efile_list_handle_dir(env, d, &result))) {
         return posix_error_to_tuple(env, posix_errno);
     }
 

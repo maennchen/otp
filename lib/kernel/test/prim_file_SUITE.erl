@@ -40,7 +40,8 @@
 	 symlinks/1,
 	 list_dir_limit/1,
 	 list_dir_error/1,
-	 list_dir/1]).
+         list_dir/1,
+         list_dir_handle/1]).
 
 -export([advise/1]).
 -export([large_write/1]).
@@ -60,7 +61,7 @@ suite() -> [].
 all() -> 
     [read_write_file, {group, dirs}, {group, files},
      delete, rename, {group, errors}, {group, links},
-     list_dir_limit, list_dir].
+     list_dir_limit, list_dir, list_dir_handle].
 
 groups() -> 
     [{dirs, [],
@@ -1759,6 +1760,53 @@ list_dir_1(TestDir, Cnt, Sorted0) ->
     Sorted = lists:sort(DirList0),
     Sorted = lists:sort(DirList1),
     list_dir_1(TestDir, Cnt-1, Sorted).
+
+%% Tests that an open directory can be listed without resolving its path
+%% again, so changes to the path do not change the listing.
+list_dir_handle(Config) ->
+    RootDir = proplists:get_value(priv_dir, Config),
+    TestDir = filename:join(RootDir, ?MODULE_STRING++"_list_dir_handle"),
+    ok = ?PRIM_FILE:make_dir(TestDir),
+
+    Names = ["file1", "file2", "file3"],
+    [ok = ?PRIM_FILE:write_file(filename:join(TestDir, N), N) || N <- Names],
+    Sorted = lists:sort(Names),
+
+    {ok, Fd} = ?PRIM_FILE:open(TestDir, [read, directory]),
+
+    %% Both functions list the same contents as the path-based functions.
+    {ok, DirList0} = ?PRIM_FILE:list_dir(Fd),
+    Sorted = lists:sort(DirList0),
+    {ok, DirList1} = ?PRIM_FILE:list_dir_all(Fd),
+    Sorted = lists:sort(DirList1),
+
+    %% The caller can list the handle repeatedly.
+    {ok, DirList2} = ?PRIM_FILE:list_dir(Fd),
+    Sorted = lists:sort(DirList2),
+
+    %% Later listings of the same handle include new entries.
+    ok = ?PRIM_FILE:write_file(filename:join(TestDir, "file4"), "file4"),
+    AllSorted = lists:sort(["file4" | Names]),
+    {ok, DirList3} = ?PRIM_FILE:list_dir(Fd),
+    AllSorted = lists:sort(DirList3),
+
+    ok = ?PRIM_FILE:close(Fd),
+
+    %% Listing a handle that is not a directory is an error.
+    RegularFile = filename:join(TestDir, "file1"),
+    {ok, RegularFd} = ?PRIM_FILE:open(RegularFile, [read]),
+    {error, enotdir} = ?PRIM_FILE:list_dir(RegularFd),
+    {error, enotdir} = ?PRIM_FILE:list_dir_all(RegularFd),
+    ok = ?PRIM_FILE:close(RegularFd),
+
+    %% Listing a closed handle is also an error.
+    {ok, ClosedFd} = ?PRIM_FILE:open(TestDir, [read, directory]),
+    ok = ?PRIM_FILE:close(ClosedFd),
+    {error, einval} = ?PRIM_FILE:list_dir(ClosedFd),
+
+    [ok = ?PRIM_FILE:delete(filename:join(TestDir, N)) || N <- ["file4" | Names]],
+    ok = ?PRIM_FILE:del_dir(TestDir),
+    ok.
 
 %%%
 %%% Support for testing large files.
