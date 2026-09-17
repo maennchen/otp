@@ -174,6 +174,9 @@ WRAP_FILE_HANDLE_EXPORT(get_handle_nif)
 WRAP_FILE_HANDLE_EXPORT(ipread_s32bu_p32bu_nif)
 WRAP_FILE_HANDLE_EXPORT(read_handle_info_nif)
 WRAP_FILE_HANDLE_EXPORT(list_handle_dir_nif)
+WRAP_FILE_HANDLE_EXPORT(set_handle_permissions_nif)
+WRAP_FILE_HANDLE_EXPORT(set_handle_owner_nif)
+WRAP_FILE_HANDLE_EXPORT(set_handle_time_nif)
 
 static ErlNifFunc nif_funcs[] = {
     /* File handle ops */
@@ -190,6 +193,9 @@ static ErlNifFunc nif_funcs[] = {
     {"advise_nif", 4, advise_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"read_handle_info_nif", 1, read_handle_info_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"list_handle_dir_nif", 1, list_handle_dir_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"set_handle_permissions_nif", 2, set_handle_permissions_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"set_handle_owner_nif", 3, set_handle_owner_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"set_handle_time_nif", 4, set_handle_time_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
 
     /* Filesystem ops */
     {"make_hard_link_nif", 2, make_hard_link_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
@@ -1072,6 +1078,22 @@ static ERL_NIF_TERM set_permissions_nif(ErlNifEnv *env, int argc, const ERL_NIF_
     return am_ok;
 }
 
+static ERL_NIF_TERM set_handle_permissions_nif_impl(efile_data_t *d, ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    posix_errno_t posix_errno;
+    unsigned int permissions;
+
+    ASSERT(argc == 1);
+    if(!enif_get_uint(env, argv[0], &permissions)) {
+        return enif_make_badarg(env);
+    }
+
+    if((posix_errno = efile_set_handle_permissions(d, permissions))) {
+        return posix_error_to_tuple(env, posix_errno);
+    }
+
+    return am_ok;
+}
+
 static ERL_NIF_TERM set_owner_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     posix_errno_t posix_errno;
 
@@ -1086,6 +1108,22 @@ static ERL_NIF_TERM set_owner_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
     if((posix_errno = efile_marshal_path(env, argv[0], &path))) {
         return posix_error_to_tuple(env, posix_errno);
     } else if((posix_errno = efile_set_owner(&path, uid, gid))) {
+        return posix_error_to_tuple(env, posix_errno);
+    }
+
+    return am_ok;
+}
+
+static ERL_NIF_TERM set_handle_owner_nif_impl(efile_data_t *d, ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    posix_errno_t posix_errno;
+    int uid, gid;
+
+    ASSERT(argc == 2);
+    if(!enif_get_int(env, argv[0], &uid) || !enif_get_int(env, argv[1], &gid)) {
+        return enif_make_badarg(env);
+    }
+
+    if((posix_errno = efile_set_handle_owner(d, uid, gid))) {
         return posix_error_to_tuple(env, posix_errno);
     }
 
@@ -1108,6 +1146,24 @@ static ERL_NIF_TERM set_time_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
     if((posix_errno = efile_marshal_path(env, argv[0], &path))) {
         return posix_error_to_tuple(env, posix_errno);
     } else if((posix_errno = efile_set_time(&path, accessed, modified, created))) {
+        return posix_error_to_tuple(env, posix_errno);
+    }
+
+    return am_ok;
+}
+
+static ERL_NIF_TERM set_handle_time_nif_impl(efile_data_t *d, ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    posix_errno_t posix_errno;
+    Sint64 accessed, modified, created;
+
+    ASSERT(argc == 3);
+    if(!enif_get_int64(env, argv[0], &accessed)
+       || !enif_get_int64(env, argv[1], &modified)
+       || !enif_get_int64(env, argv[2], &created)) {
+        return enif_make_badarg(env);
+    }
+
+    if((posix_errno = efile_set_handle_time(d, accessed, modified, created))) {
         return posix_error_to_tuple(env, posix_errno);
     }
 

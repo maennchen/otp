@@ -696,6 +696,12 @@
 /* Define to 1 if you have the 'fstat' function. */
 #undef HAVE_FSTAT
 
+/* Define to 1 if you have the 'futimens' function. */
+#undef HAVE_FUTIMENS
+
+/* Define to 1 if you have the 'futimes' function. */
+#undef HAVE_FUTIMES
+
 /* Define if you have fwrite_unlocked */
 #undef HAVE_FWRITE_UNLOCKED
 

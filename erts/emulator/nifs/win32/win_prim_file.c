@@ -1033,6 +1033,39 @@ posix_errno_t efile_read_handle_info(efile_data_t *d, efile_fileinfo_t *result) 
     return posix_errno;
 }
 
+static posix_errno_t set_handle_permissions(HANDLE handle, Uint32 permissions) {
+    FILE_BASIC_INFO info;
+
+    /* The path variant works on the directory entry through
+     * SetFileAttributesW, which needs a path. From a handle we read and write
+     * the same attribute through SetFileInformationByHandle instead. */
+    if(!GetFileInformationByHandleEx(handle, FileBasicInfo, &info, sizeof(info))) {
+        return windows_to_posix_errno(GetLastError());
+    }
+
+    if(permissions & _S_IWRITE) {
+        info.FileAttributes &= ~FILE_ATTRIBUTE_READONLY;
+    } else {
+        info.FileAttributes |= FILE_ATTRIBUTE_READONLY;
+    }
+
+    if(info.FileAttributes == 0) {
+        info.FileAttributes = FILE_ATTRIBUTE_NORMAL;
+    }
+
+    /* A zero timestamp tells Windows to leave that time alone. */
+    info.CreationTime.QuadPart = 0;
+    info.LastAccessTime.QuadPart = 0;
+    info.LastWriteTime.QuadPart = 0;
+    info.ChangeTime.QuadPart = 0;
+
+    if(!SetFileInformationByHandle(handle, FileBasicInfo, &info, sizeof(info))) {
+        return windows_to_posix_errno(GetLastError());
+    }
+
+    return 0;
+}
+
 posix_errno_t efile_set_permissions(const efile_path_t *path, Uint32 permissions) {
     DWORD attributes = GetFileAttributesW((WCHAR*)path->data);
 
@@ -1053,10 +1086,42 @@ posix_errno_t efile_set_permissions(const efile_path_t *path, Uint32 permissions
     return windows_to_posix_errno(GetLastError());
 }
 
+posix_errno_t efile_set_handle_permissions(efile_data_t *d, Uint32 permissions) {
+    efile_win_t *w = (efile_win_t*)d;
+
+    return set_handle_permissions(w->handle, permissions);
+}
+
 posix_errno_t efile_set_owner(const efile_path_t *path, Sint32 owner, Sint32 group) {
     (void)path;
     (void)owner;
     (void)group;
+
+    return 0;
+}
+
+posix_errno_t efile_set_handle_owner(efile_data_t *d, Sint32 owner, Sint32 group) {
+    (void)d;
+    (void)owner;
+    (void)group;
+
+    return 0;
+}
+
+static posix_errno_t set_handle_time(HANDLE handle, Sint64 a_time,
+        Sint64 m_time, Sint64 c_time) {
+    FILETIME accessed, modified, created;
+
+    /* The path variant clears the read-only attribute first, because
+     * CreateFileW cannot open a read-only file for writing. We already hold an
+     * open handle, so that dance is unnecessary here. */
+    EPOCH_TO_FILETIME(modified, m_time);
+    EPOCH_TO_FILETIME(accessed, a_time);
+    EPOCH_TO_FILETIME(created, c_time);
+
+    if(!SetFileTime(handle, &created, &accessed, &modified)) {
+        return windows_to_posix_errno(GetLastError());
+    }
 
     return 0;
 }
@@ -1105,6 +1170,13 @@ posix_errno_t efile_set_time(const efile_path_t *path, Sint64 a_time, Sint64 m_t
     }
 
     return windows_to_posix_errno(last_error);
+}
+
+posix_errno_t efile_set_handle_time(efile_data_t *d, Sint64 a_time, Sint64 m_time,
+        Sint64 c_time) {
+    efile_win_t *w = (efile_win_t*)d;
+
+    return set_handle_time(w->handle, a_time, m_time, c_time);
 }
 
 static posix_errno_t internal_read_link(HANDLE link_handle, efile_path_t *result) {

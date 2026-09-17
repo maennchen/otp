@@ -70,6 +70,8 @@
 -nifs([open_nif/2, close_nif/1, read_nif/2, write_nif/2, pread_nif/3,
        pwrite_nif/3, seek_nif/3, sync_nif/2, truncate_nif/1, allocate_nif/3,
        advise_nif/4, read_handle_info_nif/1, list_handle_dir_nif/1,
+       set_handle_permissions_nif/2, set_handle_owner_nif/3,
+       set_handle_time_nif/4,
        make_hard_link_nif/2, make_soft_link_nif/2, rename_nif/2,
        read_info_nif/2, set_permissions_nif/2, set_owner_nif/3, set_time_nif/4,
        read_link_nif/1, list_dir_nif/1, make_dir_nif/1, del_file_nif/1,
@@ -708,52 +710,76 @@ write_file_info(Filename, Info) ->
 write_file_info(Filename, Info, Opts) ->
     write_file_info_1(Filename, Info, proplist_get_value(time, Opts, local)).
 
+%% Changing an open file does not resolve a path. The caller always changes
+%% the file it opened, even if another process replaces the path.
+write_file_info_1(#file_descriptor{module = ?MODULE} = Fd, Info, TimeType) ->
+    try
+        #{ handle := FRef } = get_fd_data(Fd),
+        write_file_info_2({handle, FRef}, Info, TimeType)
+    catch
+        throw:Reason -> {error, Reason};
+        error:_ -> {error, badarg}
+    end;
 write_file_info_1(Filename, Info, TimeType) ->
+    try
+        write_file_info_2({name, encode_path(Filename)}, Info, TimeType)
+    catch
+        throw:Reason -> {error, Reason};
+        error:_ -> {error, badarg}
+    end.
+
+write_file_info_2(Target, Info, TimeType) ->
     #file_info{ mode = Modes,
                 uid = Uid,
                 gid = Gid,
                 atime = ATime0,
                 mtime = MTime0,
                 ctime = CTime0} = Info,
-    try
-        % ATime and/or MTime might be undefined
-        %  - use localtime() for atime, if atime is undefined
-        %  - use atime as mtime if mtime is undefined
-        %  - use mtime as ctime if ctime is undefined
-        ATime = file_info_convert_atime(ATime0, TimeType),
-        MTime = file_info_convert_mtime(MTime0, ATime, TimeType),
-        CTime = file_info_convert_ctime(CTime0, MTime, TimeType),
-        EncodedName = encode_path(Filename),
+    % ATime and/or MTime might be undefined
+    %  - use localtime() for atime, if atime is undefined
+    %  - use atime as mtime if mtime is undefined
+    %  - use mtime as ctime if ctime is undefined
+    ATime = file_info_convert_atime(ATime0, TimeType),
+    MTime = file_info_convert_mtime(MTime0, ATime, TimeType),
+    CTime = file_info_convert_ctime(CTime0, MTime, TimeType),
 
-        %% This is a bit ugly but we need to handle partial failures the same
-        %% way the old driver did.
-        throw_on_error(set_owner(EncodedName, Uid, Gid)),
-        throw_on_error(set_permissions(EncodedName, Modes)),
-        throw_on_error(set_time(EncodedName, ATime, MTime, CTime))
-    catch
-        throw:Reason -> {error, Reason};
-        error:_ -> {error, badarg}
-    end.
+    %% This is a bit ugly but we need to handle partial failures the same
+    %% way the old driver did.
+    throw_on_error(set_owner(Target, Uid, Gid)),
+    throw_on_error(set_permissions(Target, Modes)),
+    throw_on_error(set_time(Target, ATime, MTime, CTime)).
 
-set_owner(EncodedName, Uid, undefined) ->
-    set_owner(EncodedName, Uid, -1);
-set_owner(EncodedName, undefined, Gid) ->
-    set_owner(EncodedName, -1, Gid);
-set_owner(EncodedName, Uid, Gid) ->
-    set_owner_nif(EncodedName, Uid, Gid).
+set_owner(Target, Uid, undefined) ->
+    set_owner(Target, Uid, -1);
+set_owner(Target, undefined, Gid) ->
+    set_owner(Target, -1, Gid);
+set_owner({name, EncodedName}, Uid, Gid) ->
+    set_owner_nif(EncodedName, Uid, Gid);
+set_owner({handle, FRef}, Uid, Gid) ->
+    set_handle_owner_nif(FRef, Uid, Gid).
 set_owner_nif(_Path, _Uid, _Gid) ->
     erlang:nif_error(undef).
-
-set_permissions(_EncodedName, undefined) ->
-    ok;
-set_permissions(EncodedName, Permissions) ->
-    set_permissions_nif(EncodedName, Permissions).
-set_permissions_nif(_Path, _Permissions) ->
+set_handle_owner_nif(_FileRef, _Uid, _Gid) ->
     erlang:nif_error(undef).
 
-set_time(EncodedName, ATime, MTime, CTime) ->
-    set_time_nif(EncodedName, ATime, MTime, CTime).
+set_permissions(_Target, undefined) ->
+    ok;
+set_permissions({name, EncodedName}, Permissions) ->
+    set_permissions_nif(EncodedName, Permissions);
+set_permissions({handle, FRef}, Permissions) ->
+    set_handle_permissions_nif(FRef, Permissions).
+set_permissions_nif(_Path, _Permissions) ->
+    erlang:nif_error(undef).
+set_handle_permissions_nif(_FileRef, _Permissions) ->
+    erlang:nif_error(undef).
+
+set_time({name, EncodedName}, ATime, MTime, CTime) ->
+    set_time_nif(EncodedName, ATime, MTime, CTime);
+set_time({handle, FRef}, ATime, MTime, CTime) ->
+    set_handle_time_nif(FRef, ATime, MTime, CTime).
 set_time_nif(_Path, _ATime, _MTime, _CTime) ->
+    erlang:nif_error(undef).
+set_handle_time_nif(_FileRef, _ATime, _MTime, _CTime) ->
     erlang:nif_error(undef).
 
 throw_on_error(ok) -> ok;

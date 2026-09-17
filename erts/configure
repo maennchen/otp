@@ -21765,6 +21765,18 @@ then :
   printf "%s\n" "#define HAVE_FDOPENDIR 1" >>confdefs.h
 
 fi
+ac_fn_c_check_func "$LINENO" "futimens" "ac_cv_func_futimens"
+if test "x$ac_cv_func_futimens" = xyes
+then :
+  printf "%s\n" "#define HAVE_FUTIMENS 1" >>confdefs.h
+
+fi
+ac_fn_c_check_func "$LINENO" "futimes" "ac_cv_func_futimes"
+if test "x$ac_cv_func_futimes" = xyes
+then :
+  printf "%s\n" "#define HAVE_FUTIMES 1" >>confdefs.h
+
+fi
 ac_fn_c_check_func "$LINENO" "strlcpy" "ac_cv_func_strlcpy"
 if test "x$ac_cv_func_strlcpy" = xyes
 then :

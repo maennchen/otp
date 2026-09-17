@@ -51,6 +51,7 @@
 	 read_write_file/1, names/1]).
 -export([cur_dir_0/1, cur_dir_1/1, make_del_dir/1, make_del_dir_r/1,
 	 list_dir/1,list_dir_error/1,list_dir_handle/1,
+	 file_write_handle_info/1,
 	 untranslatable_names/1, untranslatable_names_error/1,
 	 pos1/1, pos2/1, pos3/1]).
 -export([close/1, consult1/1, path_consult/1, delete/1]).
@@ -163,6 +164,7 @@ groups() ->
        file_handle_info_basic_file, file_handle_info_basic_directory,
        file_handle_info_times, file_handle_info_wrapped,
        file_write_file_info,
+       file_write_handle_info,
        file_wfi_helpers]},
      {consult, [], [consult1, path_consult]},
      {eval, [], [eval1, path_eval]},
@@ -900,6 +902,98 @@ delete_dir_symlink(Link) ->
     case os:type() of
         {win32, _} -> ?FILE_MODULE:del_dir(Link);
         _ -> ?FILE_MODULE:delete(Link)
+    end.
+
+%%%
+%%% Test write_file_info() on an open file.
+%%%
+
+file_write_handle_info(Config) ->
+    RootDir = proplists:get_value(priv_dir, Config),
+    TestDir = filename:join(RootDir, ?MODULE_STRING++"_write_handle_info"),
+    ok = ?FILE_MODULE:make_dir(TestDir),
+    Name = filename:join(TestDir, "file"),
+    ok = ?FILE_MODULE:write_file(Name, "contents"),
+
+    {ok, Fd} = ?FILE_MODULE:open(Name, [raw, read, write]),
+    {ok, Info} = ?FILE_MODULE:read_file_info(Fd),
+
+    %% Windows models only the read only bit, so the permissions are checked
+    %% by writing to the file rather than by reading the mode back.
+    ok = ?FILE_MODULE:write_file_info(Fd, Info#file_info{mode = 8#400}),
+    {error, eacces} = ?FILE_MODULE:write_file(Name, "denied"),
+    ok = ?FILE_MODULE:write_file_info(Fd, Info#file_info{mode = 8#600}),
+    ok = ?FILE_MODULE:write_file(Name, "contents"),
+    {ok, Info1} = ?FILE_MODULE:read_file_info(Fd),
+
+    Time = {{2001, 2, 3}, {4, 5, 6}},
+    ok = ?FILE_MODULE:write_file_info(Fd, Info1#file_info{mtime = Time,
+                                                         atime = Time}),
+    {ok, Info2} = ?FILE_MODULE:read_file_info(Fd),
+    Time = Info2#file_info.mtime,
+
+    %% A path-based read reports the same values as the handle.
+    {ok, ViaPath} = ?FILE_MODULE:read_file_info(Name),
+    Time = ViaPath#file_info.mtime,
+    true = ViaPath#file_info.mode =:= Info2#file_info.mode,
+
+    %% The three argument form accepts the same options as it does on a path.
+    {ok, Info3} = ?FILE_MODULE:read_file_info(Fd, [{time, posix}]),
+    ok = ?FILE_MODULE:write_file_info(Fd, Info3#file_info{mtime = 1000000},
+                                      [{time, posix}]),
+    {ok, Info4} = ?FILE_MODULE:read_file_info(Fd, [{time, posix}]),
+    1000000 = Info4#file_info.mtime,
+
+    ok = ?FILE_MODULE:close(Fd),
+
+    file_write_handle_info_symlink(TestDir),
+
+    ok = ?FILE_MODULE:write_file_info(Name, Info#file_info{mode = 8#644}),
+    ok = ?FILE_MODULE:delete(Name),
+    ok = ?FILE_MODULE:del_dir(TestDir),
+    ok.
+
+%% An open file is changed without resolving its path again. Replacing the path
+%% that the file was opened through does not change which file is written.
+file_write_handle_info_symlink(TestDir) ->
+    Target = filename:join(TestDir, "target"),
+    Other = filename:join(TestDir, "other"),
+    Link = filename:join(TestDir, "link"),
+
+    ok = ?FILE_MODULE:write_file(Target, "target"),
+    ok = ?FILE_MODULE:write_file(Other, "other"),
+
+    case ?FILE_MODULE:make_symlink(Target, Link) of
+        {error, enotsup} ->
+            ok;
+        {error, eperm} ->
+            {win32,_} = os:type(),
+            ok;
+        ok ->
+            {ok, Fd} = ?FILE_MODULE:open(Link, [raw, read, write]),
+            {ok, Info} = ?FILE_MODULE:read_file_info(Fd),
+
+            %% Point the symlink at the other file now that it is open.
+            ok = ?FILE_MODULE:delete(Link),
+            ok = ?FILE_MODULE:make_symlink(Other, Link),
+
+            LinkTime = {{2003, 4, 5}, {6, 7, 8}},
+            ok = ?FILE_MODULE:write_file_info(Fd,
+                                              Info#file_info{mtime = LinkTime}),
+            ok = ?FILE_MODULE:close(Fd),
+
+            %% The write reached the file that was opened, not the file the
+            %% path resolves to now. The time is compared rather than the
+            %% mode, because Windows models only the read only bit.
+            {ok, TargetInfo} = ?FILE_MODULE:read_file_info(Target),
+            {ok, OtherInfo} = ?FILE_MODULE:read_file_info(Other),
+            LinkTime = TargetInfo#file_info.mtime,
+            true = OtherInfo#file_info.mtime =/= LinkTime,
+
+            ok = ?FILE_MODULE:delete(Link),
+            ok = ?FILE_MODULE:delete(Target),
+            ok = ?FILE_MODULE:delete(Other),
+            ok
     end.
 
 untranslatable_names(Config) ->
