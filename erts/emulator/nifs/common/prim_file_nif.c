@@ -183,6 +183,7 @@ WRAP_FILE_HANDLE_EXPORT(set_handle_permissions_nif)
 WRAP_FILE_HANDLE_EXPORT(set_handle_owner_nif)
 WRAP_FILE_HANDLE_EXPORT(set_handle_time_nif)
 WRAP_FILE_HANDLE_EXPORT(open_at_nif)
+WRAP_FILE_HANDLE_EXPORT(open_in_root_nif)
 WRAP_FILE_HANDLE_EXPORT(read_info_at_nif)
 WRAP_FILE_HANDLE_EXPORT(read_link_at_nif)
 WRAP_FILE_HANDLE_EXPORT(list_dir_at_nif)
@@ -211,6 +212,7 @@ static ErlNifFunc nif_funcs[] = {
     {"set_handle_owner_nif", 3, set_handle_owner_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"set_handle_time_nif", 4, set_handle_time_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"open_at_nif", 3, open_at_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"open_in_root_nif", 3, open_in_root_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"read_info_at_nif", 3, read_info_at_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"read_link_at_nif", 2, read_link_at_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"list_dir_at_nif", 2, list_dir_at_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
@@ -683,6 +685,34 @@ static ERL_NIF_TERM open_at_nif_impl(efile_data_t *dir, ErlNifEnv *env, int argc
         return posix_error_to_tuple(env, posix_errno);
     } else if((posix_errno = efile_open_at(dir, &path, modes,
                                            efile_resource_type, &d))) {
+        return posix_error_to_tuple(env, posix_errno);
+    }
+
+    return create_ref_or_error_tuple(env, d);
+}
+
+static ERL_NIF_TERM open_in_root_nif_impl(efile_data_t *root, ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    posix_errno_t posix_errno;
+    efile_data_t *d;
+
+    enum efile_modes_t modes;
+    efile_path_t path;
+
+    ASSERT(argc == 2);
+    if(!enif_is_list(env, argv[1])) {
+        return enif_make_badarg(env);
+    }
+
+    if(!(root->modes & EFILE_MODE_DIRECTORY)) {
+        return posix_error_to_tuple(env, ENOTDIR);
+    }
+
+    modes = efile_translate_modelist(env, argv[1]);
+
+    if((posix_errno = efile_marshal_name(env, argv[0], &path))) {
+        return posix_error_to_tuple(env, posix_errno);
+    } else if((posix_errno = efile_open_in_root(root, &path, modes,
+                                                efile_resource_type, &d))) {
         return posix_error_to_tuple(env, posix_errno);
     }
 

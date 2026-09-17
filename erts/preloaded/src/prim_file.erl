@@ -76,6 +76,7 @@
        make_dir_at_nif/2, del_at_nif/3, rename_at_nif/4,
        set_permissions_at_nif/3, set_owner_at_nif/4, set_time_at_nif/5,
        make_hard_link_at_nif/4, make_soft_link_at_nif/3,
+       open_in_root_nif/3,
        make_hard_link_nif/2, make_soft_link_nif/2, rename_nif/2,
        read_info_nif/2, set_permissions_nif/2, set_owner_nif/3, set_time_nif/4,
        read_link_nif/1, list_dir_nif/1, make_dir_nif/1, del_file_nif/1,
@@ -139,6 +140,18 @@ copy(#file_descriptor{module = ?MODULE} = Source,
 %% caller always opens a file inside the directory it holds. The name itself is
 %% not checked. A name that contains ".." still reaches a file outside the
 %% directory.
+%% A name in a root is resolved one component at a time against that root, so
+%% it cannot reach a file outside the root.
+open({root, #file_descriptor{module = ?MODULE} = Root, Name}, Modes) ->
+    try
+        #{ handle := RootRef } = get_fd_data(Root),
+        case open_in_root_nif(RootRef, encode_path(Name), Modes) of
+            {ok, Ref} -> {ok, make_fd(Modes, Ref)};
+            {error, Reason} -> {error, Reason}
+        end
+    catch
+        error:badarg -> {error, badarg}
+    end;
 open({#file_descriptor{module = ?MODULE} = Dir, Name}, Modes) ->
     try
         #{ handle := DirRef } = get_fd_data(Dir),
@@ -549,6 +562,8 @@ build_fd_data([_Ignored | Modes], FRef, Owner, RASz, Mode) ->
 open_nif(_Name, _Modes) ->
     erlang:nif_error(undef).
 open_at_nif(_DirRef, _Name, _Modes) ->
+    erlang:nif_error(undef).
+open_in_root_nif(_RootRef, _Name, _Modes) ->
     erlang:nif_error(undef).
 read_info_at_nif(_DirRef, _Name, _FollowLinks) ->
     erlang:nif_error(undef).

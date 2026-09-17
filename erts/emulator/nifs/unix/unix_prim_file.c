@@ -44,6 +44,12 @@
 #endif
 
 #include <utime.h>
+#include <limits.h>
+
+/* Old platforms might not define PATH_MAX. */
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 #define FALLBACK_RW_LENGTH ((1ull << 31) - 1)
 
@@ -266,6 +272,382 @@ posix_errno_t efile_open_at(efile_data_t *dir, const efile_path_t *path,
     do {
         fd = openat(u->fd, (const char*)path->data, flags, mode);
     } while(fd == -1 && errno == EINTR);
+
+    return build_open_resource(path, fd, modes, nif_type, d);
+#endif
+}
+
+/* The most links that may be followed while one name is resolved. The limit
+ * stops a cycle of links from resolving forever. */
+#define EFILE_MAX_LINK_DEPTH 32
+
+/* The most components a name may have. A name that is longer than this is
+ * refused rather than resolved, so the walk cannot be made to run for an
+ * unreasonable time. */
+#define EFILE_MAX_WALK_STEPS 4096
+
+/* One position in a walk from a root directory.
+ *
+ * "fd" is the directory the next component is resolved against. "depth" counts
+ * how far the walk has moved below the root, so that ".." can be refused when
+ * it would leave the root. The root itself is at depth 0 and is never closed
+ * by the walk. */
+struct root_walk {
+    int root_fd;
+    int fd;
+    int depth;
+    int links_followed;
+};
+
+static void walk_init(struct root_walk *walk, int root_fd) {
+    walk->root_fd = root_fd;
+    walk->fd = root_fd;
+    walk->depth = 0;
+    walk->links_followed = 0;
+}
+
+static void walk_close(struct root_walk *walk) {
+    if(walk->fd != walk->root_fd && walk->fd != -1) {
+        close(walk->fd);
+    }
+
+    walk->fd = walk->root_fd;
+}
+
+/* Moves the walk to the root, which is where an absolute name and the target
+ * of an absolute link both start. */
+static void walk_reset(struct root_walk *walk) {
+    walk_close(walk);
+    walk->depth = 0;
+}
+
+static void walk_enter(struct root_walk *walk, int fd) {
+    walk_close(walk);
+    walk->fd = fd;
+    walk->depth++;
+}
+
+/* Moves the walk to the directory above. The root has nothing above it, so a
+ * caller that asks for that is leaving the root. */
+static posix_errno_t walk_leave(struct root_walk *walk) {
+    int parent_fd;
+
+    if(walk->depth == 0) {
+        return EXDEV;
+    }
+
+    do {
+        parent_fd = openat(walk->fd, "..", O_RDONLY | O_NOFOLLOW
+#ifdef O_DIRECTORY
+                           | O_DIRECTORY
+#endif
+                           );
+    } while(parent_fd == -1 && errno == EINTR);
+
+    if(parent_fd == -1) {
+        return errno;
+    }
+
+    walk_close(walk);
+    walk->fd = parent_fd;
+    walk->depth--;
+
+    return 0;
+}
+
+/* Reads the length of the component that starts at "name", and where the next
+ * component starts. Repeated separators are skipped. */
+static size_t component_length(const char *name, size_t *next) {
+    size_t length = 0;
+
+    while(name[length] != '\0' && name[length] != '/') {
+        length++;
+    }
+
+    *next = length;
+
+    while(name[*next] == '/') {
+        (*next)++;
+    }
+
+    return length;
+}
+
+static int component_is(const char *name, size_t length, const char *against) {
+    return strlen(against) == length && memcmp(name, against, length) == 0;
+}
+
+/* Resolves every component of "name" but the last one, so that the caller is
+ * left holding the directory the last component belongs to.
+ *
+ * On success "last" points at the last component and "last_length" holds its
+ * length. A name whose last component is "." or ".." has no last component of
+ * its own, and is resolved in full, leaving "last_length" at 0. */
+static posix_errno_t walk_to_last(struct root_walk *walk, const char *name,
+        const char **last, size_t *last_length) {
+    int steps = 0;
+
+    /* A name that starts at the root is resolved from the root, as it would be
+     * if the root were the whole file system. */
+    if(name[0] == '/') {
+        walk_reset(walk);
+
+        while(name[0] == '/') {
+            name++;
+        }
+    }
+
+    for(;;) {
+        size_t length, next;
+        int fd;
+
+        if(steps++ > EFILE_MAX_WALK_STEPS) {
+            return ENAMETOOLONG;
+        }
+
+        length = component_length(name, &next);
+
+        if(length == 0) {
+            /* The name ended, so the walk is at the directory that holds it
+             * and there is no component left to open. */
+            *last = name;
+            *last_length = 0;
+
+            return 0;
+        }
+
+        if(component_is(name, length, ".")) {
+            name += next;
+            continue;
+        }
+
+        if(component_is(name, length, "..")) {
+            posix_errno_t posix_errno = walk_leave(walk);
+
+            if(posix_errno != 0) {
+                return posix_errno;
+            }
+
+            name += next;
+            continue;
+        }
+
+        if(name[next] == '\0' && next == length) {
+            /* This is the last component, and the caller opens it. */
+            *last = name;
+            *last_length = length;
+
+            return 0;
+        }
+
+        /* A component in the middle of the name has to be a directory, so it
+         * is opened as one. The link flag makes a symbolic link fail rather
+         * than be followed, so that a link is seen here and followed only as
+         * far as the root. */
+        {
+            char component[PATH_MAX];
+
+            if(length >= sizeof(component)) {
+                return ENAMETOOLONG;
+            }
+
+            sys_memcpy(component, name, length);
+            component[length] = '\0';
+
+            do {
+                fd = openat(walk->fd, component, O_RDONLY | O_NOFOLLOW
+#ifdef O_DIRECTORY
+                            | O_DIRECTORY
+#endif
+                            );
+            } while(fd == -1 && errno == EINTR);
+
+            if(fd == -1) {
+                posix_errno_t saved_errno = errno;
+
+                /* ELOOP means the component is a symbolic link, because the
+                 * link flag stopped the system from following it. ENOTDIR
+                 * means the same on the systems that report it that way. */
+                if(saved_errno == ELOOP || saved_errno == EMLINK
+                   || saved_errno == ENOTDIR) {
+                    char target[PATH_MAX];
+                    ssize_t target_length;
+
+                    if(walk->links_followed++ > EFILE_MAX_LINK_DEPTH) {
+                        return ELOOP;
+                    }
+
+                    target_length = readlinkat(walk->fd, component, target,
+                                               sizeof(target) - 1);
+
+                    if(target_length < 0) {
+                        /* Not a link after all, so report what the open
+                         * reported. */
+                        return saved_errno;
+                    }
+
+                    target[target_length] = '\0';
+
+                    /* The link is followed by resolving its target from here,
+                     * and the rest of the name is then resolved from wherever
+                     * the target led. */
+                    {
+                        const char *ignored_last;
+                        size_t ignored_length;
+                        posix_errno_t posix_errno;
+
+                        posix_errno = walk_to_last(walk, target,
+                                                   &ignored_last,
+                                                   &ignored_length);
+
+                        if(posix_errno != 0) {
+                            return posix_errno;
+                        }
+
+                        if(ignored_length > 0) {
+                            /* The target named a file rather than a
+                             * directory, so open that as the next step. */
+                            char last_component[PATH_MAX];
+                            int target_fd;
+
+                            if(ignored_length >= sizeof(last_component)) {
+                                return ENAMETOOLONG;
+                            }
+
+                            sys_memcpy(last_component, ignored_last,
+                                       ignored_length);
+                            last_component[ignored_length] = '\0';
+
+                            do {
+                                target_fd = openat(walk->fd, last_component,
+                                    O_RDONLY | O_NOFOLLOW
+#ifdef O_DIRECTORY
+                                    | O_DIRECTORY
+#endif
+                                    );
+                            } while(target_fd == -1 && errno == EINTR);
+
+                            if(target_fd == -1) {
+                                return errno;
+                            }
+
+                            walk_enter(walk, target_fd);
+                        }
+                    }
+
+                    name += next;
+                    continue;
+                }
+
+                return saved_errno;
+            }
+
+            walk_enter(walk, fd);
+        }
+
+        name += next;
+    }
+}
+
+posix_errno_t efile_open_in_root(efile_data_t *root, const efile_path_t *path,
+        enum efile_modes_t modes, ErlNifResourceType *nif_type, efile_data_t **d) {
+#if !defined(HAVE_OPENAT) || !defined(HAVE_READLINKAT)
+    (void)root;
+    (void)path;
+    (void)modes;
+    (void)nif_type;
+
+    (*d) = NULL;
+    return ENOTSUP;
+#else
+    efile_unix_t *u = (efile_unix_t*)root;
+    posix_errno_t posix_errno;
+    struct root_walk walk;
+    char name[PATH_MAX];
+    const char *last;
+    size_t last_length;
+    int mode, flags, fd;
+
+    if(path->size > sizeof(name)) {
+        (*d) = NULL;
+        return ENAMETOOLONG;
+    }
+
+    sys_memcpy(name, path->data, path->size);
+    name[sizeof(name) - 1] = '\0';
+
+    get_open_flags(modes, &flags, &mode);
+    walk_init(&walk, u->fd);
+
+    /* Each turn resolves the name to the directory that holds its last
+     * component, then opens that component. A last component that is a
+     * symbolic link starts another turn with the target of the link, which is
+     * resolved from the directory that holds the link. */
+    for(;;) {
+        char component[PATH_MAX];
+        char target[PATH_MAX];
+        ssize_t target_length;
+
+        posix_errno = walk_to_last(&walk, name, &last, &last_length);
+
+        if(posix_errno != 0) {
+            walk_close(&walk);
+            (*d) = NULL;
+
+            return posix_errno;
+        }
+
+        if(last_length == 0) {
+            /* The name resolved to a directory that the walk already holds,
+             * so that directory is what the caller asked for. */
+            do {
+                fd = openat(walk.fd, ".", flags, mode);
+            } while(fd == -1 && errno == EINTR);
+
+            break;
+        }
+
+        if(last_length >= sizeof(component)) {
+            walk_close(&walk);
+            (*d) = NULL;
+
+            return ENAMETOOLONG;
+        }
+
+        sys_memcpy(component, last, last_length);
+        component[last_length] = '\0';
+
+        /* The system would follow a symbolic link here, and the link can
+         * reach a file outside the root. It is opened without following, and
+         * followed by this loop instead. */
+        do {
+            fd = openat(walk.fd, component, flags | O_NOFOLLOW, mode);
+        } while(fd == -1 && errno == EINTR);
+
+        if(fd != -1 || (errno != ELOOP && errno != EMLINK)) {
+            break;
+        }
+
+        target_length = readlinkat(walk.fd, component, target,
+                                   sizeof(target) - 1);
+
+        if(target_length < 0) {
+            /* Not a link after all, so report what the open reported. */
+            break;
+        }
+
+        if(walk.links_followed++ > EFILE_MAX_LINK_DEPTH) {
+            walk_close(&walk);
+            (*d) = NULL;
+
+            return ELOOP;
+        }
+
+        target[target_length] = '\0';
+        sys_memcpy(name, target, target_length + 1);
+    }
+
+    walk_close(&walk);
 
     return build_open_resource(path, fd, modes, nif_type, d);
 #endif

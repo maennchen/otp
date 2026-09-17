@@ -201,6 +201,20 @@ posix_errno_t efile_open(const efile_path_t *path, enum efile_modes_t modes,
 posix_errno_t efile_open_at(efile_data_t *dir, const efile_path_t *path,
         enum efile_modes_t modes, ErlNifResourceType *nif_type, efile_data_t **d);
 
+/** @brief Opens a name inside a root directory, and does not let the name
+ * reach a file outside that root.
+ *
+ * The name is resolved one component at a time against the root. A component
+ * that is a symbolic link is followed only as far as the root. A ".." that
+ * would leave the root is refused. The caller therefore cannot be made to
+ * reach a file outside the root, whatever the name contains and whatever
+ * another process does to the file system while the name is resolved.
+ *
+ * @param root A file that was opened with EFILE_MODE_DIRECTORY.
+ * @return EXDEV if the name leaves the root. */
+posix_errno_t efile_open_in_root(efile_data_t *root, const efile_path_t *path,
+        enum efile_modes_t modes, ErlNifResourceType *nif_type, efile_data_t **d);
+
 posix_errno_t efile_from_fd(int fd,
                             ErlNifResourceType *nif_type,
                             efile_data_t **d);
