@@ -818,9 +818,11 @@ posix_errno_t efile_read_handle_info(efile_data_t *d, efile_fileinfo_t *result) 
 #endif
 }
 
+#define EFILE_MUTABLE_MODES \
+    (S_ISUID | S_ISGID | S_IRWXU | S_IRWXG | S_IRWXO)
+
 posix_errno_t efile_set_permissions(const efile_path_t *path, Uint32 permissions) {
-    const mode_t MUTABLE_MODES = (S_ISUID | S_ISGID | S_IRWXU | S_IRWXG | S_IRWXO);
-    mode_t new_modes = permissions & MUTABLE_MODES;
+    mode_t new_modes = permissions & EFILE_MUTABLE_MODES;
 
     if(chmod((const char*)path->data, new_modes) < 0) {
         new_modes &= ~(S_ISUID | S_ISGID);
@@ -833,8 +835,35 @@ posix_errno_t efile_set_permissions(const efile_path_t *path, Uint32 permissions
     return 0;
 }
 
+posix_errno_t efile_set_handle_permissions(efile_data_t *d, Uint32 permissions) {
+    efile_unix_t *u = (efile_unix_t*)d;
+    mode_t new_modes = permissions & EFILE_MUTABLE_MODES;
+
+    /* Some file systems refuse the set-user-ID and set-group-ID bits. The path
+     * variant drops them and retries, so this function does the same. */
+    if(fchmod(u->fd, new_modes) < 0) {
+        new_modes &= ~(S_ISUID | S_ISGID);
+
+        if(fchmod(u->fd, new_modes) < 0) {
+            return errno;
+        }
+    }
+
+    return 0;
+}
+
 posix_errno_t efile_set_owner(const efile_path_t *path, Sint32 owner, Sint32 group) {
     if(chown((const char*)path->data, owner, group) < 0) {
+        return errno;
+    }
+
+    return 0;
+}
+
+posix_errno_t efile_set_handle_owner(efile_data_t *d, Sint32 owner, Sint32 group) {
+    efile_unix_t *u = (efile_unix_t*)d;
+
+    if(fchown(u->fd, owner, group) < 0) {
         return errno;
     }
 
@@ -854,6 +883,53 @@ posix_errno_t efile_set_time(const efile_path_t *path, Sint64 a_time, Sint64 m_t
     }
 
     return 0;
+}
+
+posix_errno_t efile_set_handle_time(efile_data_t *d, Sint64 a_time, Sint64 m_time,
+        Sint64 c_time) {
+#if defined(HAVE_FUTIMENS) || defined(HAVE_FUTIMES)
+    efile_unix_t *u = (efile_unix_t*)d;
+
+    /* Unix cannot set the creation time, so the path variant ignores it too. */
+    (void)c_time;
+
+#ifdef HAVE_FUTIMENS
+    {
+        struct timespec times[2];
+
+        times[0].tv_sec = (time_t)a_time;
+        times[0].tv_nsec = 0;
+        times[1].tv_sec = (time_t)m_time;
+        times[1].tv_nsec = 0;
+
+        if(futimens(u->fd, times) < 0) {
+            return errno;
+        }
+    }
+#else
+    {
+        struct timeval times[2];
+
+        times[0].tv_sec = (time_t)a_time;
+        times[0].tv_usec = 0;
+        times[1].tv_sec = (time_t)m_time;
+        times[1].tv_usec = 0;
+
+        if(futimes(u->fd, times) < 0) {
+            return errno;
+        }
+    }
+#endif
+
+    return 0;
+#else
+    (void)d;
+    (void)a_time;
+    (void)m_time;
+    (void)c_time;
+
+    return ENOTSUP;
+#endif
 }
 
 posix_errno_t efile_read_link(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_TERM *result) {

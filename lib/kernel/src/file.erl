@@ -907,9 +907,12 @@ read_link_all(Name) ->
 
 -doc(#{equiv => write_file_info(Filename, FileInfo, [])}).
 -spec write_file_info(Filename, FileInfo) -> ok | {error, Reason} when
-      Filename :: name_all(),
+      Filename :: name_all() | io_device(),
       FileInfo :: file_info(),
       Reason :: posix() | badarg.
+
+write_file_info(#file_descriptor{module = Module} = Handle, Info = #file_info{}) ->
+    Module:write_file_info(Handle, Info);
 
 write_file_info(Name, Info = #file_info{}) ->
     check_and_call(write_file_info, [file_name(Name), Info]).
@@ -996,13 +999,22 @@ Typical error reasons:
 
 - **`enotdir`** - A component of the filename is not a directory. On some
   platforms, `enoent` is returned instead.
+
+`Filename` can also be a file opened with `open/2` in [`raw`](`m:file#raw`)
+mode. This function then changes the open file without resolving its path
+again. The change always applies to the file you opened, even if another
+process replaces the path.
 """.
 -doc(#{since => <<"OTP R15B">>}).
 -spec write_file_info(Filename, FileInfo, Opts) -> ok | {error, Reason} when
-      Filename :: name_all(),
+      Filename :: name_all() | io_device(),
       Opts :: [file_info_option()],
       FileInfo :: file_info(),
       Reason :: posix() | badarg.
+
+write_file_info(#file_descriptor{module = Module} = Handle, Info = #file_info{}, Opts)
+  when is_list(Opts) ->
+    Module:write_file_info(Handle, Info, Opts);
 
 write_file_info(Name, Info = #file_info{}, Opts) when is_list(Opts) ->
     Args = [file_name(Name), Info, Opts],

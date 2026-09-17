@@ -196,14 +196,32 @@ posix_errno_t efile_read_handle_info(efile_data_t *d, efile_fileinfo_t *result);
  * for a description of each. */
 posix_errno_t efile_set_time(const efile_path_t *path, Sint64 a_time, Sint64 m_time, Sint64 c_time);
 
+/** @brief As \c efile_set_time, but on a file that is already open.
+ *
+ * This function does not resolve a path. The caller always changes the file it
+ * opened, even if another process replaces the path. */
+posix_errno_t efile_set_handle_time(efile_data_t *d, Sint64 a_time, Sint64 m_time, Sint64 c_time);
+
 /** @brief On Unix, this sets the file permissions according to the docs for
  * file:write_file_info/2. On Windows it uses the "owner write permission" flag
  * to toggle whether the file is read-only or not. */
 posix_errno_t efile_set_permissions(const efile_path_t *path, Uint32 permissions);
 
+/** @brief As \c efile_set_permissions, but on a file that is already open.
+ *
+ * This function does not resolve a path. The caller always changes the file it
+ * opened, even if another process replaces the path. */
+posix_errno_t efile_set_handle_permissions(efile_data_t *d, Uint32 permissions);
+
 /** @brief On Unix, this will set the owner/group to the given values. It will
  * do nothing on other platforms. */
 posix_errno_t efile_set_owner(const efile_path_t *path, Sint32 owner, Sint32 group);
+
+/** @brief As \c efile_set_owner, but on a file that is already open.
+ *
+ * This function does not resolve a path. The caller always changes the file it
+ * opened, even if another process replaces the path. */
+posix_errno_t efile_set_handle_owner(efile_data_t *d, Sint32 owner, Sint32 group);
 
 /** @brief Resolves the final path of the given link. */
 posix_errno_t efile_read_link(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_TERM *result);

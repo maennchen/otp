@@ -43,6 +43,8 @@
          list_dir/1,
          list_dir_handle/1]).
 
+-export([file_write_handle_info/1]).
+
 -export([advise/1]).
 -export([large_write/1]).
 
@@ -76,7 +78,8 @@ groups() ->
      {file_info, [],
       [file_info_basic_file,file_info_basic_directory, file_info_bad,
        file_info_times, file_write_file_info, file_read_file_info_opts,
-       file_write_file_info_opts, file_write_read_file_info_opts
+       file_write_file_info_opts, file_write_read_file_info_opts,
+       file_write_handle_info
       ]},
      {errors, [],
       [e_delete, e_rename, e_make_dir, e_del_dir]},
@@ -1805,6 +1808,50 @@ list_dir_handle(Config) ->
     {error, einval} = ?PRIM_FILE:list_dir(ClosedFd),
 
     [ok = ?PRIM_FILE:delete(filename:join(TestDir, N)) || N <- ["file4" | Names]],
+    ok = ?PRIM_FILE:del_dir(TestDir),
+    ok.
+
+%% Tests that an open file can be changed without resolving its path again,
+%% so changes to the path do not change which file is written.
+file_write_handle_info(Config) ->
+    RootDir = proplists:get_value(priv_dir, Config),
+    TestDir = filename:join(RootDir, ?MODULE_STRING++"_write_handle_info"),
+    ok = ?PRIM_FILE:make_dir(TestDir),
+    Name = filename:join(TestDir, "file"),
+    ok = ?PRIM_FILE:write_file(Name, "contents"),
+
+    {ok, Fd} = ?PRIM_FILE:open(Name, [read, write]),
+    {ok, Info} = ?PRIM_FILE:read_handle_info(Fd),
+
+    %% Permissions.
+    ok = ?PRIM_FILE:write_file_info(Fd, Info#file_info{mode = 8#600}),
+    {ok, Info1} = ?PRIM_FILE:read_handle_info(Fd),
+    8#600 = Info1#file_info.mode band 8#777,
+
+    %% Times. The path variant reports the same values afterwards.
+    Time = {{2001, 2, 3}, {4, 5, 6}},
+    ok = ?PRIM_FILE:write_file_info(Fd, Info1#file_info{mtime = Time,
+                                                       atime = Time}),
+    {ok, Info2} = ?PRIM_FILE:read_handle_info(Fd),
+    Time = Info2#file_info.mtime,
+    {ok, ViaPath} = ?PRIM_FILE:read_file_info(Name),
+    Time = ViaPath#file_info.mtime,
+    8#600 = ViaPath#file_info.mode band 8#777,
+
+    %% The posix time option works the same way as it does on a path.
+    {ok, Info3} = ?PRIM_FILE:read_handle_info(Fd, [{time, posix}]),
+    ok = ?PRIM_FILE:write_file_info(Fd, Info3#file_info{mtime = 1000000},
+                                    [{time, posix}]),
+    {ok, Info4} = ?PRIM_FILE:read_handle_info(Fd, [{time, posix}]),
+    1000000 = Info4#file_info.mtime,
+
+    ok = ?PRIM_FILE:close(Fd),
+
+    %% Writing through a closed handle is an error.
+    {error, einval} = ?PRIM_FILE:write_file_info(Fd, Info#file_info{mode = 8#644}),
+
+    ok = ?PRIM_FILE:write_file_info(Name, Info#file_info{mode = 8#644}),
+    ok = ?PRIM_FILE:delete(Name),
     ok = ?PRIM_FILE:del_dir(TestDir),
     ok.
 
