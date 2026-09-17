@@ -116,6 +116,7 @@ static ERL_NIF_TERM set_controlling_process_nif(ErlNifEnv *env, int argc, const 
 /* Helper functions */
 
 static ERL_NIF_TERM create_ref_or_error_tuple(ErlNifEnv *env, efile_data_t *d);
+static ERL_NIF_TERM build_file_info(ErlNifEnv *env, efile_fileinfo_t *info);
 
 /* All file handle operations are passed through a wrapper that handles state
  * transitions, marking it as busy during the course of the operation, and
@@ -179,6 +180,9 @@ WRAP_FILE_HANDLE_EXPORT(set_handle_permissions_nif)
 WRAP_FILE_HANDLE_EXPORT(set_handle_owner_nif)
 WRAP_FILE_HANDLE_EXPORT(set_handle_time_nif)
 WRAP_FILE_HANDLE_EXPORT(open_at_nif)
+WRAP_FILE_HANDLE_EXPORT(read_info_at_nif)
+WRAP_FILE_HANDLE_EXPORT(read_link_at_nif)
+WRAP_FILE_HANDLE_EXPORT(list_dir_at_nif)
 
 static ErlNifFunc nif_funcs[] = {
     /* File handle ops */
@@ -199,6 +203,9 @@ static ErlNifFunc nif_funcs[] = {
     {"set_handle_owner_nif", 3, set_handle_owner_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"set_handle_time_nif", 4, set_handle_time_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"open_at_nif", 3, open_at_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"read_info_at_nif", 3, read_info_at_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"read_link_at_nif", 2, read_link_at_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"list_dir_at_nif", 2, list_dir_at_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
 
     /* Filesystem ops */
     {"make_hard_link_nif", 2, make_hard_link_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
@@ -664,6 +671,70 @@ static ERL_NIF_TERM open_at_nif_impl(efile_data_t *dir, ErlNifEnv *env, int argc
     }
 
     return create_ref_or_error_tuple(env, d);
+}
+
+static ERL_NIF_TERM read_info_at_nif_impl(efile_data_t *dir, ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    posix_errno_t posix_errno;
+    efile_fileinfo_t info = {0};
+    efile_path_t path;
+    int follow_links;
+
+    ASSERT(argc == 2);
+    if(!enif_get_int(env, argv[1], &follow_links)) {
+        return enif_make_badarg(env);
+    }
+
+    if(!(dir->modes & EFILE_MODE_DIRECTORY)) {
+        return posix_error_to_tuple(env, ENOTDIR);
+    }
+
+    if((posix_errno = efile_marshal_name(env, argv[0], &path))) {
+        return posix_error_to_tuple(env, posix_errno);
+    } else if((posix_errno = efile_read_info_at(dir, &path, follow_links, &info))) {
+        return posix_error_to_tuple(env, posix_errno);
+    }
+
+    return build_file_info(env, &info);
+}
+
+static ERL_NIF_TERM read_link_at_nif_impl(efile_data_t *dir, ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    posix_errno_t posix_errno;
+    ERL_NIF_TERM result;
+    efile_path_t path;
+
+    ASSERT(argc == 1);
+
+    if(!(dir->modes & EFILE_MODE_DIRECTORY)) {
+        return posix_error_to_tuple(env, ENOTDIR);
+    }
+
+    if((posix_errno = efile_marshal_name(env, argv[0], &path))) {
+        return posix_error_to_tuple(env, posix_errno);
+    } else if((posix_errno = efile_read_link_at(env, dir, &path, &result))) {
+        return posix_error_to_tuple(env, posix_errno);
+    }
+
+    return enif_make_tuple2(env, am_ok, result);
+}
+
+static ERL_NIF_TERM list_dir_at_nif_impl(efile_data_t *dir, ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    posix_errno_t posix_errno;
+    ERL_NIF_TERM result;
+    efile_path_t path;
+
+    ASSERT(argc == 1);
+
+    if(!(dir->modes & EFILE_MODE_DIRECTORY)) {
+        return posix_error_to_tuple(env, ENOTDIR);
+    }
+
+    if((posix_errno = efile_marshal_name(env, argv[0], &path))) {
+        return posix_error_to_tuple(env, posix_errno);
+    } else if((posix_errno = efile_list_dir_at(env, dir, &path, &result))) {
+        return posix_error_to_tuple(env, posix_errno);
+    }
+
+    return enif_make_tuple2(env, am_ok, result);
 }
 
 static ERL_NIF_TERM file_desc_to_ref_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {

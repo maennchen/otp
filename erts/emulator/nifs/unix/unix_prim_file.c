@@ -814,6 +814,46 @@ posix_errno_t efile_read_info(const efile_path_t *path, int follow_links, efile_
     return 0;
 }
 
+posix_errno_t efile_read_info_at(efile_data_t *dir, const efile_path_t *path,
+        int follow_links, efile_fileinfo_t *result) {
+#if !defined(HAVE_FSTATAT)
+    (void)dir;
+    (void)path;
+    (void)follow_links;
+    (void)result;
+
+    return ENOTSUP;
+#else
+    efile_unix_t *u = (efile_unix_t*)dir;
+    struct stat data;
+    int flags;
+
+    flags = follow_links ? 0 : AT_SYMLINK_NOFOLLOW;
+
+    if(fstatat(u->fd, (const char*)path->data, &data, flags) < 0) {
+        return errno;
+    }
+
+    build_file_info(&data, result);
+
+#if defined(HAVE_FACCESSAT) && !defined(NO_ACCESS)
+    result->access = EFILE_ACCESS_NONE;
+
+    if(faccessat(u->fd, (const char*)path->data, R_OK, 0) == 0) {
+        result->access |= EFILE_ACCESS_READ;
+    }
+    if(faccessat(u->fd, (const char*)path->data, W_OK, 0) == 0) {
+        result->access |= EFILE_ACCESS_WRITE;
+    }
+#else
+    /* Just look at read/write access for owner. */
+    result->access = ((data.st_mode >> 6) & 07) >> 1;
+#endif
+
+    return 0;
+#endif
+}
+
 static int check_access(struct stat *st) {
     int ret = EFILE_ACCESS_NONE;
 
@@ -978,7 +1018,12 @@ posix_errno_t efile_set_handle_time(efile_data_t *d, Sint64 a_time, Sint64 m_tim
 #endif
 }
 
-posix_errno_t efile_read_link(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_TERM *result) {
+/* Reads a link into a binary, growing the buffer until the result fits. The
+ * reader either reads a path, or reads a name against an open directory. */
+typedef ssize_t (*read_link_fun_t)(void *context, char *buffer, size_t size);
+
+static posix_errno_t read_link_into_binary(ErlNifEnv *env,
+        read_link_fun_t read_link_fun, void *context, ERL_NIF_TERM *result) {
     ErlNifBinary result_bin;
 
     if(!enif_alloc_binary(256, &result_bin)) {
@@ -988,7 +1033,7 @@ posix_errno_t efile_read_link(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_
     for(;;) {
         ssize_t bytes_copied;
 
-        bytes_copied = readlink((const char*)path->data, (char*)result_bin.data,
+        bytes_copied = read_link_fun(context, (char*)result_bin.data,
             result_bin.size);
 
         if(bytes_copied <= 0) {
@@ -1014,6 +1059,49 @@ posix_errno_t efile_read_link(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_
             return ENOMEM;
         }
     }
+}
+
+static ssize_t read_link_path(void *context, char *buffer, size_t size) {
+    const efile_path_t *path = (const efile_path_t*)context;
+
+    return readlink((const char*)path->data, buffer, size);
+}
+
+posix_errno_t efile_read_link(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_TERM *result) {
+    return read_link_into_binary(env, read_link_path, (void*)path, result);
+}
+
+#ifdef HAVE_READLINKAT
+struct read_link_at_context {
+    int dir_fd;
+    const efile_path_t *path;
+};
+
+static ssize_t read_link_at_name(void *context, char *buffer, size_t size) {
+    struct read_link_at_context *c = (struct read_link_at_context*)context;
+
+    return readlinkat(c->dir_fd, (const char*)c->path->data, buffer, size);
+}
+#endif
+
+posix_errno_t efile_read_link_at(ErlNifEnv *env, efile_data_t *dir,
+        const efile_path_t *path, ERL_NIF_TERM *result) {
+#ifndef HAVE_READLINKAT
+    (void)env;
+    (void)dir;
+    (void)path;
+    (void)result;
+
+    return ENOTSUP;
+#else
+    efile_unix_t *u = (efile_unix_t*)dir;
+    struct read_link_at_context context;
+
+    context.dir_fd = u->fd;
+    context.path = path;
+
+    return read_link_into_binary(env, read_link_at_name, &context, result);
+#endif
 }
 
 static int is_ignored_name(int name_length, const char *name) {
@@ -1068,6 +1156,53 @@ posix_errno_t efile_list_dir(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_T
     }
 
     return list_dir_stream(env, dir_stream, result);
+}
+
+posix_errno_t efile_list_dir_at(ErlNifEnv *env, efile_data_t *dir,
+        const efile_path_t *path, ERL_NIF_TERM *result) {
+#if !defined(HAVE_OPENAT) || !defined(HAVE_FDOPENDIR)
+    (void)dir;
+    (void)path;
+
+    *result = enif_make_list(env, 0);
+    return ENOTSUP;
+#else
+    efile_unix_t *u = (efile_unix_t*)dir;
+    DIR *dir_stream;
+    int fd;
+
+    /* The name is resolved against the open directory, and the listing then
+     * comes from the descriptor that openat returned. Neither step resolves a
+     * path, so the caller lists the directory it named in the directory it
+     * holds. */
+    do {
+        int flags = O_RDONLY;
+
+#ifdef O_DIRECTORY
+        flags |= O_DIRECTORY;
+#endif
+
+        fd = openat(u->fd, (const char*)path->data, flags);
+    } while(fd == -1 && errno == EINTR);
+
+    if(fd == -1) {
+        posix_errno_t saved_errno = errno;
+        *result = enif_make_list(env, 0);
+        return saved_errno;
+    }
+
+    dir_stream = fdopendir(fd);
+
+    if(dir_stream == NULL) {
+        posix_errno_t saved_errno = errno;
+        close(fd);
+        *result = enif_make_list(env, 0);
+        return saved_errno;
+    }
+
+    /* list_dir_stream closes the stream, which closes the descriptor. */
+    return list_dir_stream(env, dir_stream, result);
+#endif
 }
 
 posix_errno_t efile_list_handle_dir(ErlNifEnv *env, efile_data_t *d, ERL_NIF_TERM *result) {

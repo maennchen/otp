@@ -654,13 +654,16 @@ del_dir_r(File) -> % rm -rf File
 
 -doc(#{equiv => read_file_info(File, [])}).
 -spec read_file_info(File) -> {ok, FileInfo} | {error, Reason} when
-      File :: name_all() | io_device(),
+      File :: name_all() | io_device() | {io_device(), name_all()},
       FileInfo :: file_info(),
       Reason :: posix() | badarg.
 
 read_file_info(IoDevice)
   when is_pid(IoDevice); is_record(IoDevice, file_descriptor) ->
     read_file_info(IoDevice, []);
+
+read_file_info({#file_descriptor{}, _Name} = Target) ->
+    ?PRIM_FILE:read_file_info(at_target(Target));
 
 read_file_info(Name) ->
     check_and_call(read_file_info, [file_name(Name)]).
@@ -777,10 +780,16 @@ Typical error reasons:
 
 - **`enotdir`** - A component of the filename is not a directory. On some
   platforms, `enoent` is returned instead.
+
+`File` can also be a `{Dir, Name}` tuple. `Dir` is a directory that was opened
+with the modes `raw`, `read` and `directory`. The operating system resolves
+`Name` against that open directory, so another process cannot replace a
+directory in the path of `Dir` and make this function reach a different file.
+See `open/2`.
 """.
 -doc(#{since => <<"OTP R15B">>}).
 -spec read_file_info(File, Opts) -> {ok, FileInfo} | {error, Reason} when
-      File :: name_all() | io_device(),
+      File :: name_all() | io_device() | {io_device(), name_all()},
       Opts :: [file_info_option()],
       FileInfo :: file_info(),
       Reason :: posix() | badarg.
@@ -790,6 +799,9 @@ read_file_info(IoDevice, Opts) when is_pid(IoDevice), is_list(Opts) ->
 
 read_file_info(#file_descriptor{module = Module} = Handle, Opts) when is_list(Opts) ->
     Module:read_handle_info(Handle, Opts);
+
+read_file_info({#file_descriptor{}, _Name} = Target, Opts) when is_list(Opts) ->
+    ?PRIM_FILE:read_file_info(at_target(Target), Opts);
 
 read_file_info(Name, Opts) when is_list(Opts) ->
     Args = [file_name(Name), Opts],
@@ -814,9 +826,12 @@ altname(Name) ->
 
 -doc(#{equiv => read_link_info(Name, [])}).
 -spec read_link_info(Name) -> {ok, FileInfo} | {error, Reason} when
-      Name :: name_all(),
+      Name :: name_all() | {io_device(), name_all()},
       FileInfo :: file_info(),
       Reason :: posix() | badarg.
+
+read_link_info({#file_descriptor{}, _Name} = Target) ->
+    ?PRIM_FILE:read_link_info(at_target(Target));
 
 read_link_info(Name) ->
     check_and_call(read_link_info, [file_name(Name)]).
@@ -838,10 +853,13 @@ symbolic links, this function is always equivalent to
 """.
 -doc(#{since => <<"OTP R15B">>}).
 -spec read_link_info(Name, Opts) -> {ok, FileInfo} | {error, Reason} when
-      Name :: name_all(),
+      Name :: name_all() | {io_device(), name_all()},
       Opts :: [file_info_option()],
       FileInfo :: file_info(),
       Reason :: posix() | badarg.
+
+read_link_info({#file_descriptor{}, _Name} = Target, Opts) when is_list(Opts) ->
+    ?PRIM_FILE:read_link_info(at_target(Target), Opts);
 
 read_link_info(Name, Opts) when is_list(Opts) ->
     Args = [file_name(Name), Opts],
@@ -874,9 +892,12 @@ Typical error reasons:
 - **`enotsup`** - Symbolic links are not supported on this platform.
 """.
 -spec read_link(Name) -> {ok, Filename} | {error, Reason} when
-      Name :: name_all(),
+      Name :: name_all() | {io_device(), name_all()},
       Filename :: filename(),
       Reason :: posix() | badarg.
+
+read_link({#file_descriptor{}, _Name} = Target) ->
+    ?PRIM_FILE:read_link(at_target(Target));
 
 read_link(Name) ->
     check_and_call(read_link, [file_name(Name)]).
@@ -898,9 +919,12 @@ Typical error reasons:
 """.
 -doc(#{since => <<"OTP R16B">>}).
 -spec read_link_all(Name) -> {ok, Filename} | {error, Reason} when
-      Name :: name_all(),
+      Name :: name_all() | {io_device(), name_all()},
       Filename :: filename_all(),
       Reason :: posix() | badarg.
+
+read_link_all({#file_descriptor{}, _Name} = Target) ->
+    ?PRIM_FILE:read_link_all(at_target(Target));
 
 read_link_all(Name) ->
     check_and_call(read_link_all, [file_name(Name)]).
@@ -1052,7 +1076,7 @@ resolving its path again. The result always describes the directory you opened,
 even if another process replaces the path.
 """.
 -spec list_dir(Dir) -> {ok, Filenames} | {error, Reason} when
-      Dir :: name_all() | io_device(),
+      Dir :: name_all() | io_device() | {io_device(), name_all()},
       Filenames :: [filename()],
       Reason :: posix()
               | badarg
@@ -1060,6 +1084,9 @@ even if another process replaces the path.
 
 list_dir(#file_descriptor{module = Module} = Handle) ->
     Module:list_dir(Handle);
+
+list_dir({#file_descriptor{}, _Name} = Target) ->
+    ?PRIM_FILE:list_dir(at_target(Target));
 
 list_dir(Name) ->
     check_and_call(list_dir, [file_name(Name)]).
@@ -1082,21 +1109,27 @@ Typical error reasons:
 """.
 -doc(#{since => <<"OTP R16B">>}).
 -spec list_dir_all(Dir) -> {ok, Filenames} | {error, Reason} when
-      Dir :: name_all() | io_device(),
+      Dir :: name_all() | io_device() | {io_device(), name_all()},
       Filenames :: [filename_all()],
       Reason :: posix() | badarg.
 
 list_dir_all(#file_descriptor{module = Module} = Handle) ->
     Module:list_dir_all(Handle);
 
+list_dir_all({#file_descriptor{}, _Name} = Target) ->
+    ?PRIM_FILE:list_dir_all(at_target(Target));
+
 list_dir_all(Name) ->
     check_and_call(list_dir_all, [file_name(Name)]).
 
 -doc(#{equiv => read_file(Filename, [])}).
 -spec read_file(Filename) -> {ok, Binary} | {error, Reason} when
-      Filename :: name_all(),
+      Filename :: name_all() | {io_device(), name_all()},
       Binary :: binary(),
       Reason :: posix() | badarg | terminated | system_limit.
+
+read_file({#file_descriptor{}, _Name} = Target) ->
+    ?PRIM_FILE:read_file(at_target(Target));
 
 read_file(Name) ->
     check_and_call(read_file, [file_name(Name)]).
@@ -1572,6 +1605,11 @@ open(Item, Mode) ->
 %% operating system against the directory the caller holds, so another process
 %% cannot replace a directory in the path and make the caller open a different
 %% file.
+%% Builds the {Dir, Name} pair that prim_file expects. The directory is
+%% unwrapped, and the name is encoded the same way a path would be.
+at_target({Dir, Name}) ->
+    {unwrap_fd(Dir), file_name(Name)}.
+
 %% A directory that file:open/2 returned is wrapped in the layers that were
 %% asked for, and only the file underneath them can open a name.
 unwrap_fd(#file_descriptor{module = ?PRIM_FILE} = Fd) ->

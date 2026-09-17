@@ -215,6 +215,13 @@ int efile_close(efile_data_t *d, posix_errno_t *error);
 /* **** **** **** **** **** **** **** **** **** **** **** **** **** **** **** */
 
 posix_errno_t efile_read_info(const efile_path_t *path, int follow_link, efile_fileinfo_t *result);
+
+/** @brief As \c efile_read_info, but the name is resolved against an open
+ * directory rather than a path.
+ *
+ * @param dir A file that was opened with EFILE_MODE_DIRECTORY. */
+posix_errno_t efile_read_info_at(efile_data_t *dir, const efile_path_t *path,
+        int follow_link, efile_fileinfo_t *result);
 posix_errno_t efile_read_handle_info(efile_data_t *d, efile_fileinfo_t *result);
 
 /** @brief Sets the file times to the given values. Refer to efile_fileinfo_t
@@ -251,6 +258,13 @@ posix_errno_t efile_set_handle_owner(efile_data_t *d, Sint32 owner, Sint32 group
 /** @brief Resolves the final path of the given link. */
 posix_errno_t efile_read_link(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_TERM *result);
 
+/** @brief As \c efile_read_link, but the name is resolved against an open
+ * directory rather than a path.
+ *
+ * @param dir A file that was opened with EFILE_MODE_DIRECTORY. */
+posix_errno_t efile_read_link_at(ErlNifEnv *env, efile_data_t *dir,
+        const efile_path_t *path, ERL_NIF_TERM *result);
+
 /** @brief Lists the contents of the given directory.
  * @param result [out] A list of all the directory/file names contained in the
  * given directory. */
@@ -265,6 +279,13 @@ posix_errno_t efile_list_dir(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_T
  * @param result [out] A list of all the directory/file names contained in the
  * given directory. */
 posix_errno_t efile_list_handle_dir(ErlNifEnv *env, efile_data_t *d, ERL_NIF_TERM *result);
+
+/** @brief As \c efile_list_dir, but the name is resolved against an open
+ * directory rather than a path.
+ *
+ * @param dir A file that was opened with EFILE_MODE_DIRECTORY. */
+posix_errno_t efile_list_dir_at(ErlNifEnv *env, efile_data_t *dir,
+        const efile_path_t *path, ERL_NIF_TERM *result);
 
 /** @brief Changes the name of an existing file or directory, from old_path
  * to new_path.

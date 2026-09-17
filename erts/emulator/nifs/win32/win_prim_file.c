@@ -48,6 +48,12 @@
 #define EFILE_FILE_SYNCHRONOUS_IO_NONALERT 0x00000020
 #define EFILE_FILE_NON_DIRECTORY_FILE 0x00000040
 #define EFILE_FILE_OPEN_REPARSE_POINT 0x00200000
+#define EFILE_FILE_OPEN_FOR_BACKUP_INTENT 0x00004000
+
+/* The two statuses that report the wrong kind of file. They are matched on
+ * directly, because the error each maps to is not the one a path reports. */
+#define EFILE_STATUS_NOT_A_DIRECTORY ((NTSTATUS)0xC0000103L)
+#define EFILE_STATUS_FILE_IS_A_DIRECTORY ((NTSTATUS)0xC00000BAL)
 
 #define IS_SLASH(a)  ((a) == L'\\' || (a) == L'/')
 
@@ -682,6 +688,174 @@ posix_errno_t efile_open_at(efile_data_t *dir, const efile_path_t *path,
     }
 
     return 0;
+}
+
+/* Opens a name against an open directory and returns the raw handle. The
+ * caller closes it. Unlike efile_open_at this does not build a resource, so it
+ * can be used by the operations that only need a handle for a moment. */
+static posix_errno_t open_handle_at(efile_data_t *dir, const efile_path_t *path,
+        ACCESS_MASK access_flags, ULONG options, HANDLE *result) {
+    efile_win_t *parent = (efile_win_t*)dir;
+    OBJECT_ATTRIBUTES object_attributes;
+    IO_STATUS_BLOCK io_status_block;
+    UNICODE_STRING object_name;
+    NTSTATUS status;
+    size_t name_length;
+
+    name_length = wcslen((WCHAR*)path->data);
+
+    if(name_length == 0 || name_length > (USHRT_MAX / sizeof(WCHAR))) {
+        return EINVAL;
+    }
+
+    object_name.Buffer = (PWSTR)path->data;
+    object_name.Length = (USHORT)(name_length * sizeof(WCHAR));
+    object_name.MaximumLength = object_name.Length;
+
+    sys_memset(&object_attributes, 0, sizeof(object_attributes));
+    object_attributes.Length = sizeof(object_attributes);
+    object_attributes.RootDirectory = parent->handle;
+    object_attributes.ObjectName = &object_name;
+    object_attributes.Attributes = EFILE_OBJ_CASE_INSENSITIVE;
+
+    sys_memset(&io_status_block, 0, sizeof(io_status_block));
+
+    /* The synchronous option requires the right to wait on the file, so it is
+     * asked for here rather than at every call. */
+    status = NtCreateFile(result, access_flags | SYNCHRONIZE, &object_attributes,
+        &io_status_block, NULL, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_FLAGS,
+        EFILE_FILE_OPEN, options | EFILE_FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+
+    if(status < 0) {
+        posix_errno_t posix_errno = nt_status_to_posix_errno(status);
+
+        /* Asking for a directory and naming a file, or the other way about,
+         * reports a status that does not map to the error a path gives. */
+        if(posix_errno == EIO) {
+            if(options & EFILE_FILE_DIRECTORY_FILE) {
+                return ENOTDIR;
+            } else if(options & EFILE_FILE_NON_DIRECTORY_FILE) {
+                return EISDIR;
+            }
+        }
+
+        return posix_errno;
+    }
+
+    return 0;
+}
+
+posix_errno_t efile_read_info_at(efile_data_t *dir, const efile_path_t *path,
+        int follow_links, efile_fileinfo_t *result) {
+    posix_errno_t posix_errno;
+    efile_win_t file;
+    ULONG options;
+    HANDLE handle;
+
+    /* A link is read as the link itself unless the caller asked to follow it.
+     * FILE_FLAG_BACKUP_SEMANTICS has no native equivalent, so the directory
+     * option is what lets this open a directory as well as a file. */
+    options = EFILE_FILE_OPEN_FOR_BACKUP_INTENT;
+
+    if(!follow_links) {
+        options |= EFILE_FILE_OPEN_REPARSE_POINT;
+    }
+
+    posix_errno = open_handle_at(dir, path, GENERIC_READ, options, &handle);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    /* efile_read_handle_info only reads the handle, so a resource that is not
+     * registered is enough here. */
+    sys_memset(&file, 0, sizeof(file));
+    file.handle = handle;
+
+    posix_errno = efile_read_handle_info(&file.common, result);
+
+    /* efile_read_handle_info answers for the file a handle refers to, and a
+     * handle never refers to a link there, so it cannot report one. The
+     * caller asked for the link itself, so the type is corrected here. */
+    if(posix_errno == 0 && !follow_links
+       && handle_has_file_attributes(handle, FILE_ATTRIBUTE_REPARSE_POINT)) {
+        result->type = EFILE_FILETYPE_SYMLINK;
+    }
+
+    CloseHandle(handle);
+
+    return posix_errno;
+}
+
+posix_errno_t efile_read_link_at(ErlNifEnv *env, efile_data_t *dir,
+        const efile_path_t *path, ERL_NIF_TERM *result) {
+    posix_errno_t posix_errno;
+    ErlNifBinary result_bin;
+    HANDLE handle;
+
+    posix_errno = open_handle_at(dir, path, GENERIC_READ,
+        EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_OPEN_REPARSE_POINT,
+        &handle);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    if(!handle_has_file_attributes(handle, FILE_ATTRIBUTE_REPARSE_POINT)) {
+        CloseHandle(handle);
+        return EINVAL;
+    }
+
+    CloseHandle(handle);
+
+    /* The link is then opened again without the reparse point option, so that
+     * it is followed and the name of the file it points at can be read. This
+     * is what the path variant does as well. */
+    posix_errno = open_handle_at(dir, path, GENERIC_READ,
+        EFILE_FILE_OPEN_FOR_BACKUP_INTENT, EFILE_FILE_OPEN, &handle);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    posix_errno = internal_read_link(handle, &result_bin);
+
+    CloseHandle(handle);
+
+    if(posix_errno == 0) {
+        if(!normalize_path_result(&result_bin)) {
+            enif_release_binary(&result_bin);
+            return ENOMEM;
+        }
+
+        (*result) = enif_make_binary(env, &result_bin);
+    }
+
+    return posix_errno;
+}
+
+posix_errno_t efile_list_dir_at(ErlNifEnv *env, efile_data_t *dir,
+        const efile_path_t *path, ERL_NIF_TERM *result) {
+    posix_errno_t posix_errno;
+    efile_win_t listed;
+    HANDLE handle;
+
+    posix_errno = open_handle_at(dir, path, GENERIC_READ,
+        EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_DIRECTORY_FILE,
+        &handle);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    sys_memset(&listed, 0, sizeof(listed));
+    listed.handle = handle;
+
+    posix_errno = efile_list_handle_dir(env, &listed.common, result);
+
+    CloseHandle(handle);
+
+    return posix_errno;
 }
 
 static void tmp_nop_invalid_parameter_handler(const wchar_t* expression,

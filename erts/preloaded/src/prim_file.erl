@@ -72,6 +72,7 @@
        advise_nif/4, read_handle_info_nif/1, list_handle_dir_nif/1,
        set_handle_permissions_nif/2, set_handle_owner_nif/3,
        set_handle_time_nif/4, open_at_nif/3, set_controlling_process_nif/2,
+       read_info_at_nif/3, read_link_at_nif/2, list_dir_at_nif/2,
        make_hard_link_nif/2, make_soft_link_nif/2, rename_nif/2,
        read_info_nif/2, set_permissions_nif/2, set_owner_nif/3, set_time_nif/4,
        read_link_nif/1, list_dir_nif/1, make_dir_nif/1, del_file_nif/1,
@@ -546,6 +547,12 @@ open_nif(_Name, _Modes) ->
     erlang:nif_error(undef).
 open_at_nif(_DirRef, _Name, _Modes) ->
     erlang:nif_error(undef).
+read_info_at_nif(_DirRef, _Name, _FollowLinks) ->
+    erlang:nif_error(undef).
+read_link_at_nif(_DirRef, _Name) ->
+    erlang:nif_error(undef).
+list_dir_at_nif(_DirRef, _Name) ->
+    erlang:nif_error(undef).
 
 %% Takes over a file that another process opened. A file is closed when the
 %% process that owns it dies, so a file that changes hands has to change the
@@ -599,12 +606,30 @@ read_handle_info_nif(_FileRef) ->
 %% Quality-of-life helpers
 %%
 
+read_file({#file_descriptor{module = ?MODULE}, _Name} = Target) ->
+    %% There is no single call that reads a name in an open directory, so the
+    %% file is opened against the directory and read from the open file.
+    case open(Target, [read, binary]) of
+        {ok, Fd} ->
+            Result = read_whole_file(Fd, []),
+            _ = close(Fd),
+            Result;
+        {error, Reason} ->
+            {error, Reason}
+    end;
 read_file(Filename) ->
     %% We're doing this operation in the NIF to avoid excessive rescheduling.
     try
         read_file_nif(encode_path(Filename))
     catch
         error:badarg -> {error, badarg}
+    end.
+
+read_whole_file(Fd, Acc) ->
+    case read(Fd, 64 * 1024) of
+        {ok, Data} -> read_whole_file(Fd, [Data | Acc]);
+        eof -> {ok, iolist_to_binary(lists:reverse(Acc))};
+        {error, Reason} -> {error, Reason}
     end.
 read_file_nif(_Filename) ->
     erlang:nif_error(undef).
@@ -628,6 +653,16 @@ write_file(Filename, Bytes, Modes) ->
 read_link(Name) -> read_link_1(Name, false).
 read_link_all(Name) -> read_link_1(Name, true).
 
+read_link_1({#file_descriptor{module = ?MODULE} = Dir, Name}, AcceptRawNames) ->
+    try
+        #{ handle := DirRef } = get_fd_data(Dir),
+        case read_link_at_nif(DirRef, encode_path(Name)) of
+            {ok, RawName} -> translate_raw_name(RawName, AcceptRawNames);
+            {error, Reason} -> {error, Reason}
+        end
+    catch
+        error:badarg -> {error, badarg}
+    end;
 read_link_1(Name, AcceptRawNames) ->
     try read_link_nif(encode_path(Name)) of
         {ok, RawName} -> translate_raw_name(RawName, AcceptRawNames);
@@ -649,6 +684,16 @@ list_dir_all(Name) -> list_dir_1(Name, false).
 %% Listing an open directory does not resolve the path a second time. The
 %% caller always lists the directory it opened, even if another process
 %% replaces the path.
+list_dir_1({#file_descriptor{module = ?MODULE} = Dir, Name}, SkipInvalid) ->
+    try
+        #{ handle := DirRef } = get_fd_data(Dir),
+        case list_dir_at_nif(DirRef, encode_path(Name)) of
+            {ok, RawNames} -> list_dir_convert(RawNames, SkipInvalid, []);
+            {error, Reason} -> {error, Reason}
+        end
+    catch
+        error:badarg -> {error, badarg}
+    end;
 list_dir_1(#file_descriptor{module = ?MODULE} = Fd, SkipInvalid) ->
     try
         #{ handle := FRef } = get_fd_data(Fd),
@@ -705,6 +750,16 @@ read_link_info(Name) ->
 read_link_info(Name, Opts) ->
     read_info_1(Name, 0, proplist_get_value(time, Opts, local)).
 
+read_info_1({#file_descriptor{module = ?MODULE} = Dir, Name}, FollowLinks, TimeType) ->
+    try
+        #{ handle := DirRef } = get_fd_data(Dir),
+        case read_info_at_nif(DirRef, encode_path(Name), FollowLinks) of
+            {error, Reason} -> {error, Reason};
+            FileInfo -> {ok, adjust_times(FileInfo, TimeType)}
+        end
+    catch
+        error:_ -> {error, badarg}
+    end;
 read_info_1(Name, FollowLinks, TimeType) ->
     try
         case read_info_nif(encode_path(Name), FollowLinks) of
