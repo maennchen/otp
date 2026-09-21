@@ -673,12 +673,28 @@ system_limit(Config) when is_list(Config) ->
     {'EXIT',{system_limit,_}} = (catch <<0:(1 bsl 67)>>),
     {'EXIT',{system_limit,_}} = (catch <<0:((1 bsl 64)+1)>>),
 
+    %% Sizes within the limit must still be accepted.
+    137 = byte_size(bs_unit8(id(143), id(6))),
+    100 = byte_size(bs_unit8(id(1000), id(900))),
+    0 = byte_size(bs_unit8(id(5), id(5))),
+    1 = byte_size(bs_unit8(id(1), id(0))),
+    137 = byte_size(<<0:(id(137))/unit:8>>),
+    137 = bit_size(<<0:(id(137))/unit:1>>),
+    274 = byte_size(<<0:(id(137))/unit:16>>),
+    {'EXIT',{system_limit,_}} = (catch <<0:(id(1 bsl 60))/unit:8>>),
+
     case WordSize of
 	4 ->
 	    system_limit_32();
 	8 ->
 	    ok
     end.
+
+%% min/2 keeps the size out of reach of the compiler, which makes the
+%% emulator calculate it.
+bs_unit8(D, C) ->
+    B = min(D - C, 4 bsl 20),
+    <<0:(B)/unit:8>>.
 
 system_limit_32() ->
     {'EXIT',{badarg,_}} = (catch <<42:(-1)>>),
