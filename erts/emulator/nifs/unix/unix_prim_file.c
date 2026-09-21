@@ -382,7 +382,12 @@ static int component_is(const char *name, size_t length, const char *against) {
  *
  * On success "last" points at the last component and "last_length" holds its
  * length. A name whose last component is "." or ".." has no last component of
- * its own, and is resolved in full, leaving "last_length" at 0. */
+ * its own, and is resolved in full, leaving "last_length" at 0.
+ *
+ * The last component is always a plain name. It holds no separator, and it is
+ * never "." or ".."; the walk resolves both of those itself. A caller may
+ * therefore give it to an *at call without the system reaching a file outside
+ * the directory the walk ended on. */
 static posix_errno_t walk_to_last(struct root_walk *walk, const char *name,
         const char **last, size_t *last_length) {
     int steps = 0;
@@ -433,7 +438,14 @@ static posix_errno_t walk_to_last(struct root_walk *walk, const char *name,
         }
 
         if(name[next] == '\0' && next == length) {
-            /* This is the last component, and the caller opens it. */
+            /* This is the last component, and the caller opens it. The checks
+             * above have already consumed "." and "..", and a name that holds
+             * a separator does not reach here, so what is returned is a plain
+             * name. */
+            ASSERT(!component_is(name, length, ".")
+                   && !component_is(name, length, ".."));
+            ASSERT(memchr(name, '/', length) == NULL);
+
             *last = name;
             *last_length = length;
 
@@ -547,6 +559,88 @@ static posix_errno_t walk_to_last(struct root_walk *walk, const char *name,
 
         name += next;
     }
+}
+
+/* Turns a target that is not a path into the directory its last component
+ * belongs to, and that component.
+ *
+ * A name in an open directory is used as it is, against that directory. A name
+ * in a root is walked, so it cannot leave the root, and the walk answers with
+ * the directory that holds its last component.
+ *
+ * The component is always a plain name, so the *at call the caller makes
+ * cannot reach a file outside the directory it is given.
+ *
+ * "owned" says whether the caller closes the descriptor. */
+static posix_errno_t resolve_target(const efile_target_t *target,
+        char *component, size_t component_size, const char **name,
+        int *parent_fd, int *owned) {
+#if !defined(HAVE_OPENAT) || !defined(HAVE_READLINKAT)
+    (void)target;
+    (void)component;
+    (void)component_size;
+    (void)name;
+    (void)parent_fd;
+    (void)owned;
+
+    return ENOTSUP;
+#else
+    efile_unix_t *u = (efile_unix_t*)target->dir;
+
+    if(target->kind == EFILE_TARGET_AT) {
+        *name = (const char*)target->name.data;
+        *parent_fd = u->fd;
+        *owned = 0;
+
+        return 0;
+    }
+
+    {
+        struct root_walk walk;
+        posix_errno_t posix_errno;
+        const char *last;
+        size_t last_length;
+
+        walk_init(&walk, u->fd);
+
+        posix_errno = walk_to_last(&walk, (const char*)target->name.data,
+                                   &last, &last_length);
+
+        if(posix_errno != 0) {
+            walk_close(&walk);
+            return posix_errno;
+        }
+
+        if(last_length == 0) {
+            /* The name has no last component of its own, so there is nothing
+             * for the caller to act on. */
+            walk_close(&walk);
+            return EISDIR;
+        }
+
+        if(last_length >= component_size) {
+            walk_close(&walk);
+            return ENAMETOOLONG;
+        }
+
+        sys_memcpy(component, last, last_length);
+        component[last_length] = '\0';
+
+        *name = component;
+
+        /* The walk holds the directory, so it is handed over rather than
+         * closed. */
+        if(walk.fd == walk.root_fd) {
+            *parent_fd = walk.root_fd;
+            *owned = 0;
+        } else {
+            *parent_fd = walk.fd;
+            *owned = 1;
+        }
+
+        return 0;
+    }
+#endif
 }
 
 posix_errno_t efile_open_in_root(efile_data_t *root, const efile_path_t *path,
@@ -1808,34 +1902,50 @@ posix_errno_t efile_make_soft_link_at(const efile_path_t *existing_path,
 #endif
 }
 
-posix_errno_t efile_make_dir(const efile_path_t *path) {
+posix_errno_t efile_make_dir(const efile_target_t *target) {
+    const char *name = (const char*)target->name.data;
+
+    if(target->kind == EFILE_TARGET_PATH) {
 #ifdef NO_MKDIR_MODE
-    if(mkdir((const char*)path->data) < 0) {
+        if(mkdir(name) < 0) {
 #else
-    if(mkdir((const char*)path->data, DIR_MODE) < 0) {
+        if(mkdir(name, DIR_MODE) < 0) {
 #endif
-        return errno;
+            return errno;
+        }
+
+        return 0;
     }
 
-    return 0;
-}
-
-posix_errno_t efile_make_dir_at(efile_data_t *dir, const efile_path_t *path) {
 #ifndef HAVE_MKDIRAT
-    (void)dir;
-    (void)path;
-
     return ENOTSUP;
 #else
-    efile_unix_t *u = (efile_unix_t*)dir;
+    {
+        posix_errno_t posix_errno;
+        char component[PATH_MAX];
+        int parent_fd, owned;
 
-    if(mkdirat(u->fd, (const char*)path->data, DIR_MODE) < 0) {
-        return errno;
+        posix_errno = resolve_target(target, component, sizeof(component),
+                                     &name, &parent_fd, &owned);
+
+        if(posix_errno != 0) {
+            return posix_errno;
+        }
+
+        if(mkdirat(parent_fd, name, DIR_MODE) < 0) {
+            posix_errno = errno;
+        }
+
+        if(owned) {
+            close(parent_fd);
+        }
+
+        return posix_errno;
     }
-
-    return 0;
 #endif
 }
+
+
 
 posix_errno_t efile_del_at(efile_data_t *dir, const efile_path_t *path, int is_dir) {
 #ifndef HAVE_UNLINKAT

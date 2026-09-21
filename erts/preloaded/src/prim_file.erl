@@ -73,7 +73,7 @@
        set_handle_permissions_nif/2, set_handle_owner_nif/3,
        set_handle_time_nif/4, open_at_nif/3, set_controlling_process_nif/2,
        read_info_at_nif/3, read_link_at_nif/2, list_dir_at_nif/2,
-       make_dir_at_nif/2, del_at_nif/3, rename_at_nif/4,
+       del_at_nif/3, rename_at_nif/4,
        set_permissions_at_nif/3, set_owner_at_nif/4, set_time_at_nif/5,
        make_hard_link_at_nif/4, make_soft_link_at_nif/3,
        open_in_root_nif/3,
@@ -571,8 +571,6 @@ read_link_at_nif(_DirRef, _Name) ->
     erlang:nif_error(undef).
 list_dir_at_nif(_DirRef, _Name) ->
     erlang:nif_error(undef).
-make_dir_at_nif(_DirRef, _Name) ->
-    erlang:nif_error(undef).
 del_at_nif(_DirRef, _Name, _IsDir) ->
     erlang:nif_error(undef).
 rename_at_nif(_SourceDirRef, _Source, _DestDirRef, _Destination) ->
@@ -711,6 +709,18 @@ translate_raw_name(RawName, SilentFailure) ->
         {error, _Reason} when SilentFailure =:= false -> {error, einval};
         {error, _Reason} when SilentFailure =:= true -> {ok, RawName}
     end.
+
+%% Turns what the caller named into what a NIF takes. A path is encoded as it
+%% always was. A name in an open directory carries the directory as well, and
+%% says whether the name may leave it.
+encode_target({#file_descriptor{module = ?MODULE} = Dir, Name}) ->
+    #{ handle := DirRef } = get_fd_data(Dir),
+    {dir, DirRef, encode_path(Name)};
+encode_target({root, #file_descriptor{module = ?MODULE} = Root, Name}) ->
+    #{ handle := RootRef } = get_fd_data(Root),
+    {root, RootRef, encode_path(Name)};
+encode_target(Path) ->
+    encode_path(Path).
 
 list_dir(Name) -> list_dir_1(Name, true).
 list_dir_all(Name) -> list_dir_1(Name, false).
@@ -1006,16 +1016,9 @@ rename(Source, Destination) ->
     catch
         error:badarg -> {error, badarg}
     end.
-make_dir({#file_descriptor{module = ?MODULE} = Dir, Name}) ->
+make_dir(Target) ->
     try
-        #{ handle := DirRef } = get_fd_data(Dir),
-        make_dir_at_nif(DirRef, encode_path(Name))
-    catch
-        error:badarg -> {error, badarg}
-    end;
-make_dir(Path) ->
-    try
-        make_dir_nif(encode_path(Path))
+        make_dir_nif(encode_target(Target))
     catch
         error:badarg -> {error, badarg}
     end.

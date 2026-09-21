@@ -122,6 +122,34 @@ typedef struct {
 
 typedef ErlNifBinary efile_path_t;
 
+/* What a file operation acts on. A name is either a path, or a name that is
+ * resolved against an open directory.
+ *
+ * EFILE_TARGET_PATH names a file by its path, as the operations have always
+ * done. The directory is not used.
+ *
+ * EFILE_TARGET_AT resolves the name against the directory, so the path of the
+ * directory is not resolved again. The name itself is not checked, so a name
+ * that holds ".." still reaches a file outside the directory.
+ *
+ * EFILE_TARGET_ROOT resolves the name against the directory one component at
+ * a time, so the name cannot reach a file outside it. */
+enum efile_target_kind_t {
+    EFILE_TARGET_PATH,
+    EFILE_TARGET_AT,
+    EFILE_TARGET_ROOT
+};
+
+typedef struct {
+    enum efile_target_kind_t kind;
+
+    /* The directory the name is resolved against. NULL for a path. */
+    efile_data_t *dir;
+
+    /* A path for EFILE_TARGET_PATH, a name for the other two. */
+    efile_path_t name;
+} efile_target_t;
+
 /** @brief Translates the given "raw name" into the format expected by the APIs
  * used by the underlying implementation. The result is transient and does not
  * need to be released.
@@ -381,13 +409,11 @@ posix_errno_t efile_make_hard_link_at(efile_data_t *existing_dir,
  * @param new_dir A file that was opened with EFILE_MODE_DIRECTORY. */
 posix_errno_t efile_make_soft_link_at(const efile_path_t *existing_path,
         efile_data_t *new_dir, const efile_path_t *new_path);
-posix_errno_t efile_make_dir(const efile_path_t *path);
-
-/** @brief As \c efile_make_dir, but the name is resolved against an open
- * directory rather than a path.
+/** @brief Makes a directory.
  *
- * @param dir A file that was opened with EFILE_MODE_DIRECTORY. */
-posix_errno_t efile_make_dir_at(efile_data_t *dir, const efile_path_t *path);
+ * The target says whether the name is a path, a name in an open directory, or
+ * a name in a root that the name may not leave. */
+posix_errno_t efile_make_dir(const efile_target_t *target);
 
 posix_errno_t efile_del_file(const efile_path_t *path);
 posix_errno_t efile_del_dir(const efile_path_t *path);

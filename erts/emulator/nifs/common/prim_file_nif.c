@@ -57,6 +57,8 @@ static ERL_NIF_TERM am_exclusive;
 static ERL_NIF_TERM am_append;
 static ERL_NIF_TERM am_sync;
 static ERL_NIF_TERM am_skip_type_check;
+static ERL_NIF_TERM am_dir;
+static ERL_NIF_TERM am_root;
 
 /* enum efile_access_t; read and write are defined above.*/
 static ERL_NIF_TERM am_read_write;
@@ -120,6 +122,54 @@ static ERL_NIF_TERM make_soft_link_at_nif(ErlNifEnv *env, int argc, const ERL_NI
 
 static ERL_NIF_TERM create_ref_or_error_tuple(ErlNifEnv *env, efile_data_t *d);
 static ERL_NIF_TERM build_file_info(ErlNifEnv *env, efile_fileinfo_t *info);
+static int get_file_data(ErlNifEnv *env, ERL_NIF_TERM opaque, efile_data_t **d);
+
+/* Turns a term into the file an operation acts on. The term is a path, or a
+ * {dir, Ref, Name} or {root, Ref, Name} tuple naming a file in an open
+ * directory.
+ *
+ * The state of the directory is not changed, so the caller does not have to
+ * put it back. Reading a directory does not make it busy. */
+static posix_errno_t marshal_target(ErlNifEnv *env, ERL_NIF_TERM term,
+        efile_target_t *target) {
+    const ERL_NIF_TERM *elements;
+    int arity;
+
+    if(!enif_get_tuple(env, term, &arity, &elements)) {
+        target->kind = EFILE_TARGET_PATH;
+        target->dir = NULL;
+
+        return efile_marshal_path(env, term, &target->name);
+    }
+
+    if(arity != 3) {
+        return EINVAL;
+    }
+
+    if(enif_is_identical(elements[0], am_dir)) {
+        target->kind = EFILE_TARGET_AT;
+    } else if(enif_is_identical(elements[0], am_root)) {
+        target->kind = EFILE_TARGET_ROOT;
+    } else {
+        return EINVAL;
+    }
+
+    if(!get_file_data(env, elements[1], &target->dir)) {
+        return EINVAL;
+    }
+
+    if(!(target->dir->modes & EFILE_MODE_DIRECTORY)) {
+        return ENOTDIR;
+    }
+
+    if(erts_atomic32_read_acqb(&target->dir->state) != EFILE_STATE_IDLE) {
+        return EINVAL;
+    }
+
+    /* A name is kept as it is given. Expanding it into a path, as a path is
+     * expanded on Windows, would name a file somewhere else. */
+    return efile_marshal_name(env, elements[2], &target->name);
+}
 
 /* All file handle operations are passed through a wrapper that handles state
  * transitions, marking it as busy during the course of the operation, and
@@ -187,7 +237,6 @@ WRAP_FILE_HANDLE_EXPORT(open_in_root_nif)
 WRAP_FILE_HANDLE_EXPORT(read_info_at_nif)
 WRAP_FILE_HANDLE_EXPORT(read_link_at_nif)
 WRAP_FILE_HANDLE_EXPORT(list_dir_at_nif)
-WRAP_FILE_HANDLE_EXPORT(make_dir_at_nif)
 WRAP_FILE_HANDLE_EXPORT(del_at_nif)
 WRAP_FILE_HANDLE_EXPORT(set_permissions_at_nif)
 WRAP_FILE_HANDLE_EXPORT(set_owner_at_nif)
@@ -216,7 +265,6 @@ static ErlNifFunc nif_funcs[] = {
     {"read_info_at_nif", 3, read_info_at_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"read_link_at_nif", 2, read_link_at_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"list_dir_at_nif", 2, list_dir_at_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"make_dir_at_nif", 2, make_dir_at_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"del_at_nif", 3, del_at_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"rename_at_nif", 4, rename_at_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"make_hard_link_at_nif", 4, make_hard_link_at_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
@@ -283,6 +331,8 @@ static int load(ErlNifEnv *env, void** priv_data, ERL_NIF_TERM prim_file_pid)
     am_append = enif_make_atom(env, "append");
     am_sync = enif_make_atom(env, "sync");
     am_skip_type_check = enif_make_atom(env, "skip_type_check");
+    am_dir = enif_make_atom(env, "dir");
+    am_root = enif_make_atom(env, "root");
     am_directory = enif_make_atom(env, "directory");
 
     am_read_write = enif_make_atom(env, "read_write");
@@ -783,24 +833,6 @@ static ERL_NIF_TERM list_dir_at_nif_impl(efile_data_t *dir, ErlNifEnv *env, int 
     return enif_make_tuple2(env, am_ok, result);
 }
 
-static ERL_NIF_TERM make_dir_at_nif_impl(efile_data_t *dir, ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    posix_errno_t posix_errno;
-    efile_path_t path;
-
-    ASSERT(argc == 1);
-
-    if(!(dir->modes & EFILE_MODE_DIRECTORY)) {
-        return posix_error_to_tuple(env, ENOTDIR);
-    }
-
-    if((posix_errno = efile_marshal_name(env, argv[0], &path))) {
-        return posix_error_to_tuple(env, posix_errno);
-    } else if((posix_errno = efile_make_dir_at(dir, &path))) {
-        return posix_error_to_tuple(env, posix_errno);
-    }
-
-    return am_ok;
-}
 
 static ERL_NIF_TERM del_at_nif_impl(efile_data_t *dir, ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     posix_errno_t posix_errno;
@@ -1678,14 +1710,13 @@ static ERL_NIF_TERM make_soft_link_nif(ErlNifEnv *env, int argc, const ERL_NIF_T
 
 static ERL_NIF_TERM make_dir_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     posix_errno_t posix_errno;
-
-    efile_path_t path;
+    efile_target_t target;
 
     ASSERT(argc == 1);
 
-    if((posix_errno = efile_marshal_path(env, argv[0], &path))) {
+    if((posix_errno = marshal_target(env, argv[0], &target))) {
         return posix_error_to_tuple(env, posix_errno);
-    } else if((posix_errno = efile_make_dir(&path))) {
+    } else if((posix_errno = efile_make_dir(&target))) {
         return posix_error_to_tuple(env, posix_errno);
     }
 

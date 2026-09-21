@@ -606,6 +606,9 @@ Typical error reasons:
 make_dir({#file_descriptor{}, _Name} = Target) ->
     ?PRIM_FILE:make_dir(at_target(Target));
 
+make_dir({root, #file_descriptor{} = Root, Name}) ->
+    ?PRIM_FILE:make_dir({root, unwrap_fd(Root), file_name(Name)});
+
 make_dir(Name) ->
     check_and_call(make_dir, [file_name(Name)]).
 
