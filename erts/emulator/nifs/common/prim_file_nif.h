@@ -215,33 +215,7 @@ int efile_truncate(efile_data_t *d);
 posix_errno_t efile_open(const efile_path_t *path, enum efile_modes_t modes,
         ErlNifResourceType *nif_type, efile_data_t **d);
 
-/** @brief Opens a file whose name is resolved against an open directory.
- *
- * This function does not resolve a path. The name is resolved against the
- * directory the caller holds, so another process cannot replace a directory in
- * the path and make the caller open a different file.
- *
- * The name itself is not checked. A name that contains ".." or that starts
- * with a separator still reaches a file outside the directory. Callers that
- * need containment must check the name first.
- *
- * @param dir A file that was opened with EFILE_MODE_DIRECTORY. */
-posix_errno_t efile_open_at(efile_data_t *dir, const efile_path_t *path,
-        enum efile_modes_t modes, ErlNifResourceType *nif_type, efile_data_t **d);
 
-/** @brief Opens a name inside a root directory, and does not let the name
- * reach a file outside that root.
- *
- * The name is resolved one component at a time against the root. A component
- * that is a symbolic link is followed only as far as the root. A ".." that
- * would leave the root is refused. The caller therefore cannot be made to
- * reach a file outside the root, whatever the name contains and whatever
- * another process does to the file system while the name is resolved.
- *
- * @param root A file that was opened with EFILE_MODE_DIRECTORY.
- * @return EXDEV if the name leaves the root. */
-posix_errno_t efile_open_in_root(efile_data_t *root, const efile_path_t *path,
-        enum efile_modes_t modes, ErlNifResourceType *nif_type, efile_data_t **d);
 
 posix_errno_t efile_from_fd(int fd,
                             ErlNifResourceType *nif_type,
@@ -256,19 +230,14 @@ int efile_close(efile_data_t *d, posix_errno_t *error);
 
 /* **** **** **** **** **** **** **** **** **** **** **** **** **** **** **** */
 
-posix_errno_t efile_read_info(const efile_path_t *path, int follow_link, efile_fileinfo_t *result);
-
-/** @brief As \c efile_read_info, but the name is resolved against an open
- * directory rather than a path.
- *
- * @param dir A file that was opened with EFILE_MODE_DIRECTORY. */
-posix_errno_t efile_read_info_at(efile_data_t *dir, const efile_path_t *path,
-        int follow_link, efile_fileinfo_t *result);
+posix_errno_t efile_read_info(const efile_target_t *target, int follow_link,
+        efile_fileinfo_t *result);
 posix_errno_t efile_read_handle_info(efile_data_t *d, efile_fileinfo_t *result);
 
 /** @brief Sets the file times to the given values. Refer to efile_fileinfo_t
  * for a description of each. */
-posix_errno_t efile_set_time(const efile_path_t *path, Sint64 a_time, Sint64 m_time, Sint64 c_time);
+posix_errno_t efile_set_time(const efile_target_t *target, Sint64 a_time,
+        Sint64 m_time, Sint64 c_time);
 
 /** @brief As \c efile_set_time, but on a file that is already open.
  *
@@ -276,17 +245,11 @@ posix_errno_t efile_set_time(const efile_path_t *path, Sint64 a_time, Sint64 m_t
  * opened, even if another process replaces the path. */
 posix_errno_t efile_set_handle_time(efile_data_t *d, Sint64 a_time, Sint64 m_time, Sint64 c_time);
 
-/** @brief As \c efile_set_time, but the name is resolved against an open
- * directory rather than a path.
- *
- * @param dir A file that was opened with EFILE_MODE_DIRECTORY. */
-posix_errno_t efile_set_time_at(efile_data_t *dir, const efile_path_t *path,
-        Sint64 a_time, Sint64 m_time, Sint64 c_time);
 
 /** @brief On Unix, this sets the file permissions according to the docs for
  * file:write_file_info/2. On Windows it uses the "owner write permission" flag
  * to toggle whether the file is read-only or not. */
-posix_errno_t efile_set_permissions(const efile_path_t *path, Uint32 permissions);
+posix_errno_t efile_set_permissions(const efile_target_t *target, Uint32 permissions);
 
 /** @brief As \c efile_set_permissions, but on a file that is already open.
  *
@@ -294,16 +257,10 @@ posix_errno_t efile_set_permissions(const efile_path_t *path, Uint32 permissions
  * opened, even if another process replaces the path. */
 posix_errno_t efile_set_handle_permissions(efile_data_t *d, Uint32 permissions);
 
-/** @brief As \c efile_set_permissions, but the name is resolved against an
- * open directory rather than a path.
- *
- * @param dir A file that was opened with EFILE_MODE_DIRECTORY. */
-posix_errno_t efile_set_permissions_at(efile_data_t *dir, const efile_path_t *path,
-        Uint32 permissions);
 
 /** @brief On Unix, this will set the owner/group to the given values. It will
  * do nothing on other platforms. */
-posix_errno_t efile_set_owner(const efile_path_t *path, Sint32 owner, Sint32 group);
+posix_errno_t efile_set_owner(const efile_target_t *target, Sint32 owner, Sint32 group);
 
 /** @brief As \c efile_set_owner, but on a file that is already open.
  *
@@ -311,27 +268,17 @@ posix_errno_t efile_set_owner(const efile_path_t *path, Sint32 owner, Sint32 gro
  * opened, even if another process replaces the path. */
 posix_errno_t efile_set_handle_owner(efile_data_t *d, Sint32 owner, Sint32 group);
 
-/** @brief As \c efile_set_owner, but the name is resolved against an open
- * directory rather than a path.
- *
- * @param dir A file that was opened with EFILE_MODE_DIRECTORY. */
-posix_errno_t efile_set_owner_at(efile_data_t *dir, const efile_path_t *path,
-        Sint32 owner, Sint32 group);
 
 /** @brief Resolves the final path of the given link. */
-posix_errno_t efile_read_link(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_TERM *result);
+posix_errno_t efile_read_link(ErlNifEnv *env, const efile_target_t *target,
+        ERL_NIF_TERM *result);
 
-/** @brief As \c efile_read_link, but the name is resolved against an open
- * directory rather than a path.
- *
- * @param dir A file that was opened with EFILE_MODE_DIRECTORY. */
-posix_errno_t efile_read_link_at(ErlNifEnv *env, efile_data_t *dir,
-        const efile_path_t *path, ERL_NIF_TERM *result);
 
 /** @brief Lists the contents of the given directory.
  * @param result [out] A list of all the directory/file names contained in the
  * given directory. */
-posix_errno_t efile_list_dir(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_TERM *result);
+posix_errno_t efile_list_dir(ErlNifEnv *env, const efile_target_t *target,
+        ERL_NIF_TERM *result);
 
 /** @brief Lists the contents of a directory that has already been opened with
  * EFILE_MODE_DIRECTORY.
@@ -343,12 +290,6 @@ posix_errno_t efile_list_dir(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_T
  * given directory. */
 posix_errno_t efile_list_handle_dir(ErlNifEnv *env, efile_data_t *d, ERL_NIF_TERM *result);
 
-/** @brief As \c efile_list_dir, but the name is resolved against an open
- * directory rather than a path.
- *
- * @param dir A file that was opened with EFILE_MODE_DIRECTORY. */
-posix_errno_t efile_list_dir_at(ErlNifEnv *env, efile_data_t *dir,
-        const efile_path_t *path, ERL_NIF_TERM *result);
 
 /** @brief Changes the name of an existing file or directory, from old_path
  * to new_path.
@@ -378,52 +319,25 @@ posix_errno_t efile_list_dir_at(ErlNifEnv *env, efile_data_t *dir,
  * The implementation of rename may allow cross-filesystem renames,
  * but the caller should be prepared to emulate it with copy and
  * delete if errno is EXDEV. */
-posix_errno_t efile_rename(const efile_path_t *old_path, const efile_path_t *new_path);
+posix_errno_t efile_rename(const efile_target_t *old_target,
+        const efile_target_t *new_target);
 
-/** @brief As \c efile_rename, but both names are resolved against an open
- * directory rather than a path. The two directories may be the same.
- *
- * @param old_dir A file that was opened with EFILE_MODE_DIRECTORY.
- * @param new_dir A file that was opened with EFILE_MODE_DIRECTORY. */
-posix_errno_t efile_rename_at(efile_data_t *old_dir, const efile_path_t *old_path,
-        efile_data_t *new_dir, const efile_path_t *new_path);
 
-posix_errno_t efile_make_hard_link(const efile_path_t *existing_path, const efile_path_t *new_path);
-posix_errno_t efile_make_soft_link(const efile_path_t *existing_path, const efile_path_t *new_path);
+posix_errno_t efile_make_hard_link(const efile_target_t *existing_target,
+        const efile_target_t *new_target);
+posix_errno_t efile_make_soft_link(const efile_path_t *existing_path,
+        const efile_target_t *new_target);
 
-/** @brief As \c efile_make_hard_link, but both names are resolved against an
- * open directory rather than a path. The two directories may be the same.
- *
- * @param existing_dir A file that was opened with EFILE_MODE_DIRECTORY.
- * @param new_dir A file that was opened with EFILE_MODE_DIRECTORY. */
-posix_errno_t efile_make_hard_link_at(efile_data_t *existing_dir,
-        const efile_path_t *existing_path, efile_data_t *new_dir,
-        const efile_path_t *new_path);
 
-/** @brief As \c efile_make_soft_link, but the new name is resolved against an
- * open directory rather than a path.
- *
- * The target is stored in the link as it is given. The system does not read it
- * until the link is used, so it is not resolved against the directory.
- *
- * @param new_dir A file that was opened with EFILE_MODE_DIRECTORY. */
-posix_errno_t efile_make_soft_link_at(const efile_path_t *existing_path,
-        efile_data_t *new_dir, const efile_path_t *new_path);
 /** @brief Makes a directory.
  *
  * The target says whether the name is a path, a name in an open directory, or
  * a name in a root that the name may not leave. */
 posix_errno_t efile_make_dir(const efile_target_t *target);
 
-posix_errno_t efile_del_file(const efile_path_t *path);
-posix_errno_t efile_del_dir(const efile_path_t *path);
+posix_errno_t efile_del_file(const efile_target_t *target);
+posix_errno_t efile_del_dir(const efile_target_t *target);
 
-/** @brief As \c efile_del_file and \c efile_del_dir, but the name is resolved
- * against an open directory rather than a path.
- *
- * @param dir A file that was opened with EFILE_MODE_DIRECTORY.
- * @param is_dir Whether to remove a directory rather than a file. */
-posix_errno_t efile_del_at(efile_data_t *dir, const efile_path_t *path, int is_dir);
 
 posix_errno_t efile_get_cwd(ErlNifEnv *env, ERL_NIF_TERM *result);
 posix_errno_t efile_set_cwd(const efile_path_t *path);

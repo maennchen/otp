@@ -643,6 +643,24 @@ static posix_errno_t resolve_target(const efile_target_t *target,
 #endif
 }
 
+/* As resolve_target, but a target that is a path is answered with the working
+ * directory and the path itself. An operation that takes two names may be
+ * given a path for one of them and a name in a directory for the other. */
+static posix_errno_t resolve_either(const efile_target_t *target,
+        char *component, size_t component_size, const char **name,
+        int *parent_fd, int *owned) {
+    if(target->kind == EFILE_TARGET_PATH) {
+        *name = (const char*)target->name.data;
+        *parent_fd = AT_FDCWD;
+        *owned = 0;
+
+        return 0;
+    }
+
+    return resolve_target(target, component, component_size, name, parent_fd,
+                          owned);
+}
+
 posix_errno_t efile_open_in_root(efile_data_t *root, const efile_path_t *path,
         enum efile_modes_t modes, ErlNifResourceType *nif_type, efile_data_t **d) {
 #if !defined(HAVE_OPENAT) || !defined(HAVE_READLINKAT)
@@ -1258,77 +1276,86 @@ static void build_file_info(struct stat *data, efile_fileinfo_t *result) {
     result->gid = data->st_gid;
 }
 
-posix_errno_t efile_read_info(const efile_path_t *path, int follow_links, efile_fileinfo_t *result) {
+posix_errno_t efile_read_info(const efile_target_t *target, int follow_links,
+        efile_fileinfo_t *result) {
+    const char *name = (const char*)target->name.data;
     struct stat data;
 
-    if(follow_links) {
-        if(stat((const char*)path->data, &data) < 0) {
-            return errno;
+    if(target->kind == EFILE_TARGET_PATH) {
+        if(follow_links) {
+            if(stat(name, &data) < 0) {
+                return errno;
+            }
+        } else {
+            if(lstat(name, &data) < 0) {
+                return errno;
+            }
         }
-    } else {
-        if(lstat((const char*)path->data, &data) < 0) {
-            return errno;
-        }
-    }
 
-    build_file_info(&data, result);
+        build_file_info(&data, result);
 
 #ifndef NO_ACCESS
-    result->access = EFILE_ACCESS_NONE;
+        result->access = EFILE_ACCESS_NONE;
 
-    if(access((const char*)path->data, R_OK) == 0) {
-        result->access |= EFILE_ACCESS_READ;
-    }
-    if(access((const char*)path->data, W_OK) == 0) {
-        result->access |= EFILE_ACCESS_WRITE;
-    }
+        if(access(name, R_OK) == 0) {
+            result->access |= EFILE_ACCESS_READ;
+        }
+        if(access(name, W_OK) == 0) {
+            result->access |= EFILE_ACCESS_WRITE;
+        }
 #else
-    /* Just look at read/write access for owner. */
-    result->access = ((data.st_mode >> 6) & 07) >> 1;
+        /* Just look at read/write access for owner. */
+        result->access = ((data.st_mode >> 6) & 07) >> 1;
 #endif
 
-    return 0;
-}
+        return 0;
+    }
 
-posix_errno_t efile_read_info_at(efile_data_t *dir, const efile_path_t *path,
-        int follow_links, efile_fileinfo_t *result) {
-#if !defined(HAVE_FSTATAT)
-    (void)dir;
-    (void)path;
-    (void)follow_links;
-    (void)result;
-
+#ifndef HAVE_FSTATAT
     return ENOTSUP;
 #else
-    efile_unix_t *u = (efile_unix_t*)dir;
-    struct stat data;
-    int flags;
+    {
+        char component[PATH_MAX];
+        posix_errno_t posix_errno;
+        int parent_fd, owned, flags;
 
-    flags = follow_links ? 0 : AT_SYMLINK_NOFOLLOW;
+        posix_errno = resolve_target(target, component, sizeof(component),
+                                     &name, &parent_fd, &owned);
 
-    if(fstatat(u->fd, (const char*)path->data, &data, flags) < 0) {
-        return errno;
-    }
+        if(posix_errno != 0) {
+            return posix_errno;
+        }
 
-    build_file_info(&data, result);
+        flags = follow_links ? 0 : AT_SYMLINK_NOFOLLOW;
+
+        if(fstatat(parent_fd, name, &data, flags) < 0) {
+            posix_errno = errno;
+        } else {
+            build_file_info(&data, result);
 
 #if defined(HAVE_FACCESSAT) && !defined(NO_ACCESS)
-    result->access = EFILE_ACCESS_NONE;
+            result->access = EFILE_ACCESS_NONE;
 
-    if(faccessat(u->fd, (const char*)path->data, R_OK, 0) == 0) {
-        result->access |= EFILE_ACCESS_READ;
-    }
-    if(faccessat(u->fd, (const char*)path->data, W_OK, 0) == 0) {
-        result->access |= EFILE_ACCESS_WRITE;
-    }
+            if(faccessat(parent_fd, name, R_OK, 0) == 0) {
+                result->access |= EFILE_ACCESS_READ;
+            }
+            if(faccessat(parent_fd, name, W_OK, 0) == 0) {
+                result->access |= EFILE_ACCESS_WRITE;
+            }
 #else
-    /* Just look at read/write access for owner. */
-    result->access = ((data.st_mode >> 6) & 07) >> 1;
+            result->access = ((data.st_mode >> 6) & 07) >> 1;
 #endif
+        }
 
-    return 0;
+        if(owned) {
+            close(parent_fd);
+        }
+
+        return posix_errno;
+    }
 #endif
 }
+
 
 static int check_access(struct stat *st) {
     int ret = EFILE_ACCESS_NONE;
@@ -1383,18 +1410,56 @@ posix_errno_t efile_read_handle_info(efile_data_t *d, efile_fileinfo_t *result) 
 #define EFILE_MUTABLE_MODES \
     (S_ISUID | S_ISGID | S_IRWXU | S_IRWXG | S_IRWXO)
 
-posix_errno_t efile_set_permissions(const efile_path_t *path, Uint32 permissions) {
+posix_errno_t efile_set_permissions(const efile_target_t *target, Uint32 permissions) {
+    const char *name = (const char*)target->name.data;
     mode_t new_modes = permissions & EFILE_MUTABLE_MODES;
 
-    if(chmod((const char*)path->data, new_modes) < 0) {
-        new_modes &= ~(S_ISUID | S_ISGID);
+    if(target->kind == EFILE_TARGET_PATH) {
+        if(chmod(name, new_modes) < 0) {
+            new_modes &= ~(S_ISUID | S_ISGID);
 
-        if (chmod((const char*)path->data, new_modes) < 0) {
-            return errno;
+            if(chmod(name, new_modes) < 0) {
+                return errno;
+            }
         }
+
+        return 0;
     }
 
-    return 0;
+#ifndef HAVE_FCHMODAT
+    return ENOTSUP;
+#else
+    {
+        char component[PATH_MAX];
+        posix_errno_t posix_errno;
+        int parent_fd, owned;
+
+        posix_errno = resolve_target(target, component, sizeof(component),
+                                     &name, &parent_fd, &owned);
+
+        if(posix_errno != 0) {
+            return posix_errno;
+        }
+
+        posix_errno = 0;
+
+        /* Some file systems refuse the set-user-ID and set-group-ID bits, so
+         * they are dropped and the call is made again. */
+        if(fchmodat(parent_fd, name, new_modes, 0) < 0) {
+            new_modes &= ~(S_ISUID | S_ISGID);
+
+            if(fchmodat(parent_fd, name, new_modes, 0) < 0) {
+                posix_errno = errno;
+            }
+        }
+
+        if(owned) {
+            close(parent_fd);
+        }
+
+        return posix_errno;
+    }
+#endif
 }
 
 posix_errno_t efile_set_handle_permissions(efile_data_t *d, Uint32 permissions) {
@@ -1414,89 +1479,49 @@ posix_errno_t efile_set_handle_permissions(efile_data_t *d, Uint32 permissions) 
     return 0;
 }
 
-posix_errno_t efile_set_owner(const efile_path_t *path, Sint32 owner, Sint32 group) {
-    if(chown((const char*)path->data, owner, group) < 0) {
-        return errno;
-    }
+posix_errno_t efile_set_owner(const efile_target_t *target, Sint32 owner, Sint32 group) {
+    const char *name = (const char*)target->name.data;
 
-    return 0;
-}
-
-posix_errno_t efile_set_permissions_at(efile_data_t *dir, const efile_path_t *path,
-        Uint32 permissions) {
-#ifndef HAVE_FCHMODAT
-    (void)dir;
-    (void)path;
-    (void)permissions;
-
-    return ENOTSUP;
-#else
-    efile_unix_t *u = (efile_unix_t*)dir;
-    mode_t new_modes = permissions & EFILE_MUTABLE_MODES;
-
-    /* Some file systems refuse the set-user-ID and set-group-ID bits. The path
-     * variant drops them and retries, so this function does the same. */
-    if(fchmodat(u->fd, (const char*)path->data, new_modes, 0) < 0) {
-        new_modes &= ~(S_ISUID | S_ISGID);
-
-        if(fchmodat(u->fd, (const char*)path->data, new_modes, 0) < 0) {
+    if(target->kind == EFILE_TARGET_PATH) {
+        if(chown(name, owner, group) < 0) {
             return errno;
         }
+
+        return 0;
     }
 
-    return 0;
-#endif
-}
-
-posix_errno_t efile_set_owner_at(efile_data_t *dir, const efile_path_t *path,
-        Sint32 owner, Sint32 group) {
 #ifndef HAVE_FCHOWNAT
-    (void)dir;
-    (void)path;
-    (void)owner;
-    (void)group;
-
     return ENOTSUP;
 #else
-    efile_unix_t *u = (efile_unix_t*)dir;
+    {
+        char component[PATH_MAX];
+        posix_errno_t posix_errno;
+        int parent_fd, owned;
 
-    if(fchownat(u->fd, (const char*)path->data, owner, group, 0) < 0) {
-        return errno;
+        posix_errno = resolve_target(target, component, sizeof(component),
+                                     &name, &parent_fd, &owned);
+
+        if(posix_errno != 0) {
+            return posix_errno;
+        }
+
+        posix_errno = 0;
+
+        if(fchownat(parent_fd, name, owner, group, 0) < 0) {
+            posix_errno = errno;
+        }
+
+        if(owned) {
+            close(parent_fd);
+        }
+
+        return posix_errno;
     }
-
-    return 0;
 #endif
 }
 
-posix_errno_t efile_set_time_at(efile_data_t *dir, const efile_path_t *path,
-        Sint64 a_time, Sint64 m_time, Sint64 c_time) {
-#ifndef HAVE_UTIMENSAT
-    (void)dir;
-    (void)path;
-    (void)a_time;
-    (void)m_time;
-    (void)c_time;
 
-    return ENOTSUP;
-#else
-    efile_unix_t *u = (efile_unix_t*)dir;
-    struct timespec times[2];
 
-    /* Unix cannot set the creation time, so the path variant ignores it too. */
-    (void)c_time;
-
-    times[0].tv_sec = (time_t)a_time;
-    times[0].tv_nsec = 0;
-    times[1].tv_sec = (time_t)m_time;
-    times[1].tv_nsec = 0;
-
-    if(utimensat(u->fd, (const char*)path->data, times, 0) < 0) {
-        return errno;
-    }
-
-    return 0;
-#endif
-}
 
 posix_errno_t efile_set_handle_owner(efile_data_t *d, Sint32 owner, Sint32 group) {
     efile_unix_t *u = (efile_unix_t*)d;
@@ -1508,19 +1533,60 @@ posix_errno_t efile_set_handle_owner(efile_data_t *d, Sint32 owner, Sint32 group
     return 0;
 }
 
-posix_errno_t efile_set_time(const efile_path_t *path, Sint64 a_time, Sint64 m_time, Sint64 c_time) {
-    struct utimbuf tval;
+posix_errno_t efile_set_time(const efile_target_t *target, Sint64 a_time,
+        Sint64 m_time, Sint64 c_time) {
+    const char *name = (const char*)target->name.data;
 
-    tval.actime = (time_t)a_time;
-    tval.modtime = (time_t)m_time;
-
+    /* Unix cannot set the creation time. */
     (void)c_time;
 
-    if(utime((const char*)path->data, &tval) < 0) {
-        return errno;
+    if(target->kind == EFILE_TARGET_PATH) {
+        struct utimbuf tval;
+
+        tval.actime = (time_t)a_time;
+        tval.modtime = (time_t)m_time;
+
+        if(utime(name, &tval) < 0) {
+            return errno;
+        }
+
+        return 0;
     }
 
-    return 0;
+#ifndef HAVE_UTIMENSAT
+    return ENOTSUP;
+#else
+    {
+        char component[PATH_MAX];
+        struct timespec times[2];
+        posix_errno_t posix_errno;
+        int parent_fd, owned;
+
+        posix_errno = resolve_target(target, component, sizeof(component),
+                                     &name, &parent_fd, &owned);
+
+        if(posix_errno != 0) {
+            return posix_errno;
+        }
+
+        times[0].tv_sec = (time_t)a_time;
+        times[0].tv_nsec = 0;
+        times[1].tv_sec = (time_t)m_time;
+        times[1].tv_nsec = 0;
+
+        posix_errno = 0;
+
+        if(utimensat(parent_fd, name, times, 0) < 0) {
+            posix_errno = errno;
+        }
+
+        if(owned) {
+            close(parent_fd);
+        }
+
+        return posix_errno;
+    }
+#endif
 }
 
 posix_errno_t efile_set_handle_time(efile_data_t *d, Sint64 a_time, Sint64 m_time,
@@ -1613,48 +1679,65 @@ static posix_errno_t read_link_into_binary(ErlNifEnv *env,
     }
 }
 
+#ifdef HAVE_READLINKAT
+struct read_link_at_context {
+    int dir_fd;
+    const char *name;
+};
+
+static ssize_t read_link_at_name(void *context, char *buffer, size_t size) {
+    struct read_link_at_context *c = (struct read_link_at_context*)context;
+
+    return readlinkat(c->dir_fd, c->name, buffer, size);
+}
+#endif
+
 static ssize_t read_link_path(void *context, char *buffer, size_t size) {
     const efile_path_t *path = (const efile_path_t*)context;
 
     return readlink((const char*)path->data, buffer, size);
 }
 
-posix_errno_t efile_read_link(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_TERM *result) {
-    return read_link_into_binary(env, read_link_path, (void*)path, result);
-}
+posix_errno_t efile_read_link(ErlNifEnv *env, const efile_target_t *target,
+        ERL_NIF_TERM *result) {
+    if(target->kind == EFILE_TARGET_PATH) {
+        return read_link_into_binary(env, read_link_path,
+                                     (void*)&target->name, result);
+    }
 
-#ifdef HAVE_READLINKAT
-struct read_link_at_context {
-    int dir_fd;
-    const efile_path_t *path;
-};
-
-static ssize_t read_link_at_name(void *context, char *buffer, size_t size) {
-    struct read_link_at_context *c = (struct read_link_at_context*)context;
-
-    return readlinkat(c->dir_fd, (const char*)c->path->data, buffer, size);
-}
-#endif
-
-posix_errno_t efile_read_link_at(ErlNifEnv *env, efile_data_t *dir,
-        const efile_path_t *path, ERL_NIF_TERM *result) {
 #ifndef HAVE_READLINKAT
-    (void)env;
-    (void)dir;
-    (void)path;
-    (void)result;
-
     return ENOTSUP;
 #else
-    efile_unix_t *u = (efile_unix_t*)dir;
-    struct read_link_at_context context;
+    {
+        struct read_link_at_context context;
+        char component[PATH_MAX];
+        posix_errno_t posix_errno;
+        const char *name;
+        int parent_fd, owned;
 
-    context.dir_fd = u->fd;
-    context.path = path;
+        posix_errno = resolve_target(target, component, sizeof(component),
+                                     &name, &parent_fd, &owned);
 
-    return read_link_into_binary(env, read_link_at_name, &context, result);
+        if(posix_errno != 0) {
+            return posix_errno;
+        }
+
+        context.dir_fd = parent_fd;
+        context.name = name;
+
+        posix_errno = read_link_into_binary(env, read_link_at_name, &context,
+                                            result);
+
+        if(owned) {
+            close(parent_fd);
+        }
+
+        return posix_errno;
+    }
 #endif
 }
+
+
 
 static int is_ignored_name(int name_length, const char *name) {
     if(name_length == 1 && name[0] == '.') {
@@ -1697,65 +1780,75 @@ static posix_errno_t list_dir_stream(ErlNifEnv *env, DIR *dir_stream, ERL_NIF_TE
     return 0;
 }
 
-posix_errno_t efile_list_dir(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_TERM *result) {
+posix_errno_t efile_list_dir(ErlNifEnv *env, const efile_target_t *target,
+        ERL_NIF_TERM *result) {
     DIR *dir_stream;
 
-    dir_stream = opendir((const char*)path->data);
-    if(dir_stream == NULL) {
-        posix_errno_t saved_errno = errno;
-        *result = enif_make_list(env, 0);
-        return saved_errno;
+    if(target->kind == EFILE_TARGET_PATH) {
+        dir_stream = opendir((const char*)target->name.data);
+
+        if(dir_stream == NULL) {
+            posix_errno_t saved_errno = errno;
+            *result = enif_make_list(env, 0);
+            return saved_errno;
+        }
+
+        return list_dir_stream(env, dir_stream, result);
     }
 
-    return list_dir_stream(env, dir_stream, result);
-}
-
-posix_errno_t efile_list_dir_at(ErlNifEnv *env, efile_data_t *dir,
-        const efile_path_t *path, ERL_NIF_TERM *result) {
 #if !defined(HAVE_OPENAT) || !defined(HAVE_FDOPENDIR)
-    (void)dir;
-    (void)path;
-
     *result = enif_make_list(env, 0);
     return ENOTSUP;
 #else
-    efile_unix_t *u = (efile_unix_t*)dir;
-    DIR *dir_stream;
-    int fd;
+    {
+        char component[PATH_MAX];
+        posix_errno_t posix_errno;
+        const char *name;
+        int parent_fd, owned, fd, flags;
 
-    /* The name is resolved against the open directory, and the listing then
-     * comes from the descriptor that openat returned. Neither step resolves a
-     * path, so the caller lists the directory it named in the directory it
-     * holds. */
-    do {
-        int flags = O_RDONLY;
+        posix_errno = resolve_target(target, component, sizeof(component),
+                                     &name, &parent_fd, &owned);
+
+        if(posix_errno != 0) {
+            *result = enif_make_list(env, 0);
+            return posix_errno;
+        }
+
+        flags = O_RDONLY;
 
 #ifdef O_DIRECTORY
         flags |= O_DIRECTORY;
 #endif
 
-        fd = openat(u->fd, (const char*)path->data, flags);
-    } while(fd == -1 && errno == EINTR);
+        do {
+            fd = openat(parent_fd, name, flags);
+        } while(fd == -1 && errno == EINTR);
 
-    if(fd == -1) {
-        posix_errno_t saved_errno = errno;
-        *result = enif_make_list(env, 0);
-        return saved_errno;
+        if(owned) {
+            close(parent_fd);
+        }
+
+        if(fd == -1) {
+            posix_errno = errno;
+            *result = enif_make_list(env, 0);
+            return posix_errno;
+        }
+
+        dir_stream = fdopendir(fd);
+
+        if(dir_stream == NULL) {
+            posix_errno = errno;
+            close(fd);
+            *result = enif_make_list(env, 0);
+            return posix_errno;
+        }
+
+        /* list_dir_stream closes the stream, which closes the descriptor. */
+        return list_dir_stream(env, dir_stream, result);
     }
-
-    dir_stream = fdopendir(fd);
-
-    if(dir_stream == NULL) {
-        posix_errno_t saved_errno = errno;
-        close(fd);
-        *result = enif_make_list(env, 0);
-        return saved_errno;
-    }
-
-    /* list_dir_stream closes the stream, which closes the descriptor. */
-    return list_dir_stream(env, dir_stream, result);
 #endif
 }
+
 
 posix_errno_t efile_list_handle_dir(ErlNifEnv *env, efile_data_t *d, ERL_NIF_TERM *result) {
 #ifndef HAVE_FDOPENDIR
@@ -1796,111 +1889,191 @@ posix_errno_t efile_list_handle_dir(ErlNifEnv *env, efile_data_t *d, ERL_NIF_TER
 #endif
 }
 
-posix_errno_t efile_rename(const efile_path_t *old_path, const efile_path_t *new_path) {
-    if(rename((const char*)old_path->data, (const char*)new_path->data) < 0) {
-        if(errno == ENOTEMPTY) {
-            return EEXIST;
+posix_errno_t efile_rename(const efile_target_t *old_target,
+        const efile_target_t *new_target) {
+    const char *old_name = (const char*)old_target->name.data;
+    const char *new_name = (const char*)new_target->name.data;
+
+    if(old_target->kind == EFILE_TARGET_PATH
+       && new_target->kind == EFILE_TARGET_PATH) {
+        if(rename(old_name, new_name) < 0) {
+            if(errno == ENOTEMPTY) {
+                return EEXIST;
+            }
+
+            if(strcmp(old_name, "/") == 0) {
+                /* Alpha reports renaming / as EBUSY and Linux reports it as
+                 * EACCES instead of EINVAL. */
+                return EINVAL;
+            }
+
+            return errno;
         }
 
-        if(strcmp((const char*)old_path->data, "/") == 0) {
-            /* Alpha reports renaming / as EBUSY and Linux reports it as EACCES
-             * instead of EINVAL.*/
-             return EINVAL;
-        }
-
-        return errno;
+        return 0;
     }
 
-    return 0;
-}
-
-posix_errno_t efile_rename_at(efile_data_t *old_dir, const efile_path_t *old_path,
-        efile_data_t *new_dir, const efile_path_t *new_path) {
 #ifndef HAVE_RENAMEAT
-    (void)old_dir;
-    (void)old_path;
-    (void)new_dir;
-    (void)new_path;
-
     return ENOTSUP;
 #else
-    efile_unix_t *old_u = (efile_unix_t*)old_dir;
-    efile_unix_t *new_u = (efile_unix_t*)new_dir;
+    {
+        char old_component[PATH_MAX], new_component[PATH_MAX];
+        posix_errno_t posix_errno;
+        int old_fd, new_fd, old_owned, new_owned;
 
-    if(renameat(old_u->fd, (const char*)old_path->data,
-                new_u->fd, (const char*)new_path->data) < 0) {
-        if(errno == ENOTEMPTY) {
-            return EEXIST;
+        posix_errno = resolve_either(old_target, old_component,
+                                     sizeof(old_component), &old_name,
+                                     &old_fd, &old_owned);
+
+        if(posix_errno != 0) {
+            return posix_errno;
         }
 
-        return errno;
-    }
+        posix_errno = resolve_either(new_target, new_component,
+                                     sizeof(new_component), &new_name,
+                                     &new_fd, &new_owned);
 
-    return 0;
+        if(posix_errno != 0) {
+            if(old_owned) {
+                close(old_fd);
+            }
+
+            return posix_errno;
+        }
+
+        posix_errno = 0;
+
+        if(renameat(old_fd, old_name, new_fd, new_name) < 0) {
+            posix_errno = errno;
+
+            if(posix_errno == ENOTEMPTY) {
+                posix_errno = EEXIST;
+            }
+        }
+
+        if(old_owned) {
+            close(old_fd);
+        }
+
+        if(new_owned) {
+            close(new_fd);
+        }
+
+        return posix_errno;
+    }
 #endif
 }
 
-posix_errno_t efile_make_hard_link(const efile_path_t *existing_path, const efile_path_t *new_path) {
-    if(link((const char*)existing_path->data, (const char*)new_path->data) < 0) {
-        return errno;
+
+posix_errno_t efile_make_hard_link(const efile_target_t *existing_target,
+        const efile_target_t *new_target) {
+    const char *existing_name = (const char*)existing_target->name.data;
+    const char *new_name = (const char*)new_target->name.data;
+
+    if(existing_target->kind == EFILE_TARGET_PATH
+       && new_target->kind == EFILE_TARGET_PATH) {
+        if(link(existing_name, new_name) < 0) {
+            return errno;
+        }
+
+        return 0;
     }
 
-    return 0;
-}
-
-posix_errno_t efile_make_soft_link(const efile_path_t *existing_path, const efile_path_t *new_path) {
-    if(symlink((const char*)existing_path->data, (const char*)new_path->data) < 0) {
-        return errno;
-    }
-
-    return 0;
-}
-
-posix_errno_t efile_make_hard_link_at(efile_data_t *existing_dir,
-        const efile_path_t *existing_path, efile_data_t *new_dir,
-        const efile_path_t *new_path) {
 #ifndef HAVE_LINKAT
-    (void)existing_dir;
-    (void)existing_path;
-    (void)new_dir;
-    (void)new_path;
-
     return ENOTSUP;
 #else
-    efile_unix_t *existing_u = (efile_unix_t*)existing_dir;
-    efile_unix_t *new_u = (efile_unix_t*)new_dir;
+    {
+        char existing_component[PATH_MAX], new_component[PATH_MAX];
+        posix_errno_t posix_errno;
+        int existing_fd, new_fd, existing_owned, new_owned;
 
-    /* A hard link names a file that has to exist, so both names are resolved
-     * against the directory they belong to. */
-    if(linkat(existing_u->fd, (const char*)existing_path->data,
-              new_u->fd, (const char*)new_path->data, 0) < 0) {
-        return errno;
+        posix_errno = resolve_either(existing_target, existing_component,
+                                     sizeof(existing_component),
+                                     &existing_name, &existing_fd,
+                                     &existing_owned);
+
+        if(posix_errno != 0) {
+            return posix_errno;
+        }
+
+        posix_errno = resolve_either(new_target, new_component,
+                                     sizeof(new_component), &new_name,
+                                     &new_fd, &new_owned);
+
+        if(posix_errno != 0) {
+            if(existing_owned) {
+                close(existing_fd);
+            }
+
+            return posix_errno;
+        }
+
+        posix_errno = 0;
+
+        if(linkat(existing_fd, existing_name, new_fd, new_name, 0) < 0) {
+            posix_errno = errno;
+        }
+
+        if(existing_owned) {
+            close(existing_fd);
+        }
+
+        if(new_owned) {
+            close(new_fd);
+        }
+
+        return posix_errno;
     }
-
-    return 0;
 #endif
 }
 
-posix_errno_t efile_make_soft_link_at(const efile_path_t *existing_path,
-        efile_data_t *new_dir, const efile_path_t *new_path) {
+posix_errno_t efile_make_soft_link(const efile_path_t *existing_path,
+        const efile_target_t *new_target) {
+    const char *existing_name = (const char*)existing_path->data;
+    const char *new_name = (const char*)new_target->name.data;
+
+    /* The target of a link is stored as it is given, so it is never resolved
+     * against a directory. */
+    if(new_target->kind == EFILE_TARGET_PATH) {
+        if(symlink(existing_name, new_name) < 0) {
+            return errno;
+        }
+
+        return 0;
+    }
+
 #ifndef HAVE_SYMLINKAT
-    (void)existing_path;
-    (void)new_dir;
-    (void)new_path;
-
     return ENOTSUP;
 #else
-    efile_unix_t *new_u = (efile_unix_t*)new_dir;
+    {
+        char new_component[PATH_MAX];
+        posix_errno_t posix_errno;
+        int new_fd, new_owned;
 
-    /* Only the new name is resolved. The target is stored as it is given. */
-    if(symlinkat((const char*)existing_path->data, new_u->fd,
-                 (const char*)new_path->data) < 0) {
-        return errno;
+        posix_errno = resolve_target(new_target, new_component,
+                                     sizeof(new_component), &new_name,
+                                     &new_fd, &new_owned);
+
+        if(posix_errno != 0) {
+            return posix_errno;
+        }
+
+        posix_errno = 0;
+
+        if(symlinkat(existing_name, new_fd, new_name) < 0) {
+            posix_errno = errno;
+        }
+
+        if(new_owned) {
+            close(new_fd);
+        }
+
+        return posix_errno;
     }
-
-    return 0;
 #endif
 }
+
+
 
 posix_errno_t efile_make_dir(const efile_target_t *target) {
     const char *name = (const char*)target->name.data;
@@ -1947,81 +2120,120 @@ posix_errno_t efile_make_dir(const efile_target_t *target) {
 
 
 
-posix_errno_t efile_del_at(efile_data_t *dir, const efile_path_t *path, int is_dir) {
-#ifndef HAVE_UNLINKAT
-    (void)dir;
-    (void)path;
-    (void)is_dir;
 
-    return ENOTSUP;
-#else
-    efile_unix_t *u = (efile_unix_t*)dir;
-    int flags;
+posix_errno_t efile_del_file(const efile_target_t *target) {
+    const char *name = (const char*)target->name.data;
 
-    flags = is_dir ? AT_REMOVEDIR : 0;
-
-    if(unlinkat(u->fd, (const char*)path->data, flags) < 0) {
-        posix_errno_t saved_errno = errno;
-
-        if(is_dir) {
-            /* The path variant reports a directory that is not empty as
-             * EEXIST, so this one does the same. */
-            if(saved_errno == ENOTEMPTY) {
-                saved_errno = EEXIST;
-            }
-        } else if(saved_errno == EISDIR) {
+    if(target->kind == EFILE_TARGET_PATH) {
+        if(unlink(name) < 0) {
             /* Linux sets the wrong error code. */
-            saved_errno = EPERM;
+            if(errno == EISDIR) {
+                return EPERM;
+            }
+
+            return errno;
         }
 
-        return saved_errno;
+        return 0;
     }
 
-    return 0;
+#ifndef HAVE_UNLINKAT
+    return ENOTSUP;
+#else
+    {
+        char component[PATH_MAX];
+        posix_errno_t posix_errno;
+        int parent_fd, owned;
+
+        posix_errno = resolve_target(target, component, sizeof(component),
+                                     &name, &parent_fd, &owned);
+
+        if(posix_errno != 0) {
+            return posix_errno;
+        }
+
+        if(unlinkat(parent_fd, name, 0) < 0) {
+            posix_errno = errno;
+
+            if(posix_errno == EISDIR) {
+                posix_errno = EPERM;
+            }
+        }
+
+        if(owned) {
+            close(parent_fd);
+        }
+
+        return posix_errno;
+    }
 #endif
 }
 
-posix_errno_t efile_del_file(const efile_path_t *path) {
-    if(unlink((const char*)path->data) < 0) {
-        /* Linux sets the wrong error code. */
-        if(errno == EISDIR) {
-            return EPERM;
+posix_errno_t efile_del_dir(const efile_target_t *target) {
+    const char *name = (const char*)target->name.data;
+
+    if(target->kind == EFILE_TARGET_PATH) {
+        if(rmdir(name) < 0) {
+            posix_errno_t saved_errno = errno;
+
+            if(saved_errno == ENOTEMPTY) {
+                saved_errno = EEXIST;
+            }
+
+            /* The error code might be wrong if we're trying to delete the
+             * current directory. */
+            if(saved_errno == EEXIST) {
+                struct stat path_stat, cwd_stat;
+                int has_stat;
+
+                has_stat = (stat(name, &path_stat) == 0);
+                has_stat &= (stat(".", &cwd_stat) == 0);
+
+                if(has_stat && path_stat.st_ino == cwd_stat.st_ino) {
+                    if(path_stat.st_dev == cwd_stat.st_dev) {
+                        return EINVAL;
+                    }
+                }
+            }
+
+            return saved_errno;
         }
 
-        return errno;
+        return 0;
     }
 
-    return 0;
-}
+#ifndef HAVE_UNLINKAT
+    return ENOTSUP;
+#else
+    {
+        char component[PATH_MAX];
+        posix_errno_t posix_errno;
+        int parent_fd, owned;
 
-posix_errno_t efile_del_dir(const efile_path_t *path) {
-    if(rmdir((const char*)path->data) < 0) {
-        posix_errno_t saved_errno = errno;
+        posix_errno = resolve_target(target, component, sizeof(component),
+                                     &name, &parent_fd, &owned);
 
-        if(saved_errno == ENOTEMPTY) {
-            saved_errno = EEXIST;
+        if(posix_errno != 0) {
+            return posix_errno;
         }
 
-        /* The error code might be wrong if we're trying to delete the current
-         * directory. */
-        if(saved_errno == EEXIST) {
-            struct stat path_stat, cwd_stat;
-            int has_stat;
+        posix_errno = 0;
 
-            has_stat = (stat((const char*)path->data, &path_stat) == 0);
-            has_stat &= (stat(".", &cwd_stat) == 0);
+        if(unlinkat(parent_fd, name, AT_REMOVEDIR) < 0) {
+            posix_errno = errno;
 
-            if(has_stat && path_stat.st_ino == cwd_stat.st_ino) {
-                if(path_stat.st_dev == cwd_stat.st_dev) {
-                    return EINVAL;
-                }
+            if(posix_errno == ENOTEMPTY) {
+                posix_errno = EEXIST;
             }
         }
 
-        return saved_errno;
-    }
+        if(owned) {
+            close(parent_fd);
+        }
 
-    return 0;
+        return posix_errno;
+    }
+#endif
 }
 
 posix_errno_t efile_set_cwd(const efile_path_t *path) {
