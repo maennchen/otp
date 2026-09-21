@@ -872,163 +872,9 @@ static posix_errno_t open_handle_at(efile_data_t *dir, const efile_path_t *path,
     return 0;
 }
 
-posix_errno_t efile_read_info_at(efile_data_t *dir, const efile_path_t *path,
-        int follow_links, efile_fileinfo_t *result) {
-    posix_errno_t posix_errno;
-    efile_win_t file;
-    ULONG options;
-    HANDLE handle;
 
-    /* A link is read as the link itself unless the caller asked to follow it.
-     * FILE_FLAG_BACKUP_SEMANTICS has no native equivalent, so the directory
-     * option is what lets this open a directory as well as a file. */
-    options = EFILE_FILE_OPEN_FOR_BACKUP_INTENT;
 
-    if(!follow_links) {
-        options |= EFILE_FILE_OPEN_REPARSE_POINT;
-    }
 
-    posix_errno = open_handle_at(dir, path, GENERIC_READ, options,
-        EFILE_FILE_OPEN, &handle);
-
-    if(posix_errno != 0) {
-        return posix_errno;
-    }
-
-    /* efile_read_handle_info only reads the handle, so a resource that is not
-     * registered is enough here. */
-    sys_memset(&file, 0, sizeof(file));
-    file.handle = handle;
-
-    posix_errno = efile_read_handle_info(&file.common, result);
-
-    /* efile_read_handle_info answers for the file a handle refers to, and a
-     * handle never refers to a link there, so it cannot report one. The
-     * caller asked for the link itself, so the type is corrected here. */
-    if(posix_errno == 0 && !follow_links
-       && handle_has_file_attributes(handle, FILE_ATTRIBUTE_REPARSE_POINT)) {
-        result->type = EFILE_FILETYPE_SYMLINK;
-    }
-
-    CloseHandle(handle);
-
-    return posix_errno;
-}
-
-posix_errno_t efile_read_link_at(ErlNifEnv *env, efile_data_t *dir,
-        const efile_path_t *path, ERL_NIF_TERM *result) {
-    posix_errno_t posix_errno;
-    ErlNifBinary result_bin;
-    HANDLE handle;
-
-    /* The link itself is opened first, so that a name that is not a link can
-     * be refused. */
-    posix_errno = open_handle_at(dir, path, FILE_READ_ATTRIBUTES,
-        EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_OPEN_REPARSE_POINT,
-        EFILE_FILE_OPEN, &handle);
-
-    if(posix_errno != 0) {
-        return posix_errno;
-    }
-
-    if(!handle_has_file_attributes(handle, FILE_ATTRIBUTE_REPARSE_POINT)) {
-        CloseHandle(handle);
-        return EINVAL;
-    }
-
-    CloseHandle(handle);
-
-    /* The link is then opened again without the reparse point option, so that
-     * it is followed and the name of the file it points at can be read. This
-     * is what the path variant does as well. */
-    posix_errno = open_handle_at(dir, path, GENERIC_READ,
-        EFILE_FILE_OPEN_FOR_BACKUP_INTENT, EFILE_FILE_OPEN, &handle);
-
-    if(posix_errno != 0) {
-        return posix_errno;
-    }
-
-    posix_errno = internal_read_link(handle, &result_bin);
-
-    CloseHandle(handle);
-
-    if(posix_errno == 0) {
-        if(!normalize_path_result(&result_bin)) {
-            enif_release_binary(&result_bin);
-            return ENOMEM;
-        }
-
-        (*result) = enif_make_binary(env, &result_bin);
-    }
-
-    return posix_errno;
-}
-
-posix_errno_t efile_make_hard_link_at(efile_data_t *existing_dir,
-        const efile_path_t *existing_path, efile_data_t *new_dir,
-        const efile_path_t *new_path) {
-    efile_win_t *new_parent = (efile_win_t*)new_dir;
-    EFILE_FILE_LINK_INFORMATION_T *link_info;
-    IO_STATUS_BLOCK io_status_block;
-    posix_errno_t posix_errno;
-    size_t name_size, info_size;
-    NTSTATUS status;
-    HANDLE handle;
-
-    /* The file that gets a second name is opened first, and the new name is
-     * then given to it relative to the directory it belongs to. */
-    posix_errno = open_handle_at(existing_dir, existing_path, FILE_READ_ATTRIBUTES,
-        EFILE_FILE_OPEN_FOR_BACKUP_INTENT, EFILE_FILE_OPEN, &handle);
-
-    if(posix_errno != 0) {
-        return posix_errno;
-    }
-
-    name_size = wcslen((WCHAR*)new_path->data) * sizeof(WCHAR);
-    info_size = sizeof(EFILE_FILE_LINK_INFORMATION_T) + name_size;
-
-    link_info = (EFILE_FILE_LINK_INFORMATION_T*)enif_alloc(info_size);
-
-    if(link_info == NULL) {
-        CloseHandle(handle);
-        return ENOMEM;
-    }
-
-    sys_memset(link_info, 0, sizeof(EFILE_FILE_LINK_INFORMATION_T));
-    link_info->ReplaceIfExists = FALSE;
-    link_info->RootDirectory = new_parent->handle;
-    link_info->FileNameLength = (ULONG)name_size;
-    sys_memcpy(link_info->FileName, new_path->data, name_size);
-
-    sys_memset(&io_status_block, 0, sizeof(io_status_block));
-
-    status = NtSetInformationFile(handle, &io_status_block, link_info,
-        (ULONG)info_size, EFILE_FILE_LINK_INFORMATION);
-
-    if(status < 0) {
-        posix_errno = nt_status_to_posix_errno(status);
-    } else {
-        posix_errno = 0;
-    }
-
-    enif_free(link_info);
-    CloseHandle(handle);
-
-    return posix_errno;
-}
-
-posix_errno_t efile_make_soft_link_at(const efile_path_t *existing_path,
-        efile_data_t *new_dir, const efile_path_t *new_path) {
-    (void)existing_path;
-    (void)new_dir;
-    (void)new_path;
-
-    /* CreateSymbolicLinkW needs a path for the new link, and Windows has no
-     * call that makes a link relative to a directory handle. Resolving the
-     * directory back to a path would resolve that path again, which is what
-     * this API avoids. */
-    return ENOTSUP;
-}
 
 /* The most links that may be followed while one name is resolved, and the most
  * times the walk may start again after a "..". Both stop a name from taking an
@@ -1186,6 +1032,309 @@ static posix_errno_t remove_parent_reference(WCHAR *name, size_t up_start,
              wcslen(&name[up_start + up_next]) + 1);
 
     return 0;
+}
+
+/* Resolves a name inside a root, stopping at the directory that holds its last
+ * component. The rules are those of efile_open_in_root, so the name cannot
+ * reach a file outside the root.
+ *
+ * "component" receives the last component, which is always a plain name. The
+ * caller closes "parent" when it is not the root itself, which "owned" says. */
+static posix_errno_t walk_to_parent(efile_data_t *root, const efile_path_t *path,
+        WCHAR *component, size_t component_size, HANDLE *parent, int *owned) {
+    efile_win_t *r = (efile_win_t*)root;
+    WCHAR name[MAX_PATH];
+    int links_followed, restarts;
+    size_t offset;
+    HANDLE current;
+
+    if(path->size >= sizeof(name)) {
+        return ENAMETOOLONG;
+    }
+
+    sys_memcpy(name, path->data, path->size);
+    name[path->size / sizeof(WCHAR)] = L'\0';
+
+    links_followed = 0;
+    restarts = 0;
+    offset = 0;
+    current = r->handle;
+
+    for(;;) {
+        WCHAR this_component[MAX_PATH];
+        size_t length, next;
+        NTSTATUS status;
+        HANDLE opened;
+
+        length = next_component(&name[offset], this_component, MAX_PATH, &next);
+
+        if(length == 0) {
+            /* The name has no last component of its own. */
+            if(current != r->handle) {
+                CloseHandle(current);
+            }
+
+            return EISDIR;
+        }
+
+        if(component_is(&name[offset], length, L".")) {
+            offset += next;
+            continue;
+        }
+
+        if(component_is(&name[offset], length, L"..")) {
+            posix_errno_t posix_errno;
+
+            posix_errno = remove_parent_reference(name, offset, next);
+
+            if(posix_errno != 0 || restarts++ > EFILE_MAX_WALK_RESTARTS) {
+                if(current != r->handle) {
+                    CloseHandle(current);
+                }
+
+                return posix_errno != 0 ? posix_errno : ELOOP;
+            }
+
+            if(current != r->handle) {
+                CloseHandle(current);
+            }
+
+            current = r->handle;
+            offset = 0;
+            continue;
+        }
+
+        if(name[offset + next] == L'\0') {
+            /* This is the last component, and it belongs to the directory the
+             * walk holds. */
+            if(length >= component_size) {
+                if(current != r->handle) {
+                    CloseHandle(current);
+                }
+
+                return ENAMETOOLONG;
+            }
+
+            sys_memcpy(component, this_component, (length + 1) * sizeof(WCHAR));
+
+            *parent = current;
+            *owned = (current != r->handle);
+
+            return 0;
+        }
+
+        /* A component in the middle is opened for its attributes alone, so
+         * that a link is seen rather than followed. */
+        status = open_name_at(current, this_component, FILE_READ_ATTRIBUTES,
+            EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_OPEN_REPARSE_POINT,
+            EFILE_FILE_OPEN, &opened);
+
+        if(status < 0) {
+            if(current != r->handle) {
+                CloseHandle(current);
+            }
+
+            if(status == EFILE_STATUS_NOT_A_DIRECTORY) {
+                return ENOTDIR;
+            }
+
+            return nt_status_to_posix_errno(status);
+        }
+
+        if(handle_has_file_attributes(opened, FILE_ATTRIBUTE_REPARSE_POINT)) {
+            WCHAR target[MAX_PATH];
+            posix_errno_t posix_errno;
+            int is_relative;
+
+            posix_errno = read_link_target(opened, target, MAX_PATH,
+                                           &is_relative);
+            CloseHandle(opened);
+
+            if(posix_errno != 0 && posix_errno != EINVAL) {
+                if(current != r->handle) {
+                    CloseHandle(current);
+                }
+
+                return posix_errno;
+            }
+
+            if(posix_errno == 0) {
+                /* A link that names a drive is refused, as it is when a name
+                 * is opened in a root. */
+                if(!is_relative || links_followed++ > EFILE_MAX_LINK_DEPTH) {
+                    if(current != r->handle) {
+                        CloseHandle(current);
+                    }
+
+                    return is_relative ? ELOOP : EXDEV;
+                }
+
+                {
+                    WCHAR rest[MAX_PATH];
+                    size_t target_length = wcslen(target);
+                    size_t rest_length = wcslen(&name[offset + next]);
+
+                    if(offset + target_length + 1 + rest_length >= MAX_PATH) {
+                        if(current != r->handle) {
+                            CloseHandle(current);
+                        }
+
+                        return ENAMETOOLONG;
+                    }
+
+                    sys_memcpy(rest, &name[offset + next],
+                               (rest_length + 1) * sizeof(WCHAR));
+                    sys_memcpy(&name[offset], target,
+                               target_length * sizeof(WCHAR));
+
+                    if(rest_length > 0) {
+                        name[offset + target_length] = L'\\';
+                        sys_memcpy(&name[offset + target_length + 1], rest,
+                                   (rest_length + 1) * sizeof(WCHAR));
+                    } else {
+                        name[offset + target_length] = L'\0';
+                    }
+                }
+
+                continue;
+            }
+
+            /* A reparse point that is not a symbolic link is entered like any
+             * other directory. */
+        }
+
+        CloseHandle(opened);
+
+        status = open_name_at(current, this_component,
+            FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            EFILE_FILE_DIRECTORY_FILE | EFILE_FILE_OPEN_FOR_BACKUP_INTENT,
+            EFILE_FILE_OPEN, &opened);
+
+        if(current != r->handle) {
+            CloseHandle(current);
+        }
+
+        if(status < 0) {
+            if(status == EFILE_STATUS_NOT_A_DIRECTORY) {
+                return ENOTDIR;
+            }
+
+            return nt_status_to_posix_errno(status);
+        }
+
+        current = opened;
+        offset += next;
+    }
+}
+
+/* Gives an open file a new name, relative to a directory.
+ * SetFileInformationByHandle ignores the directory it is given, so the native
+ * call is used. */
+static posix_errno_t set_rename_information(HANDLE handle, HANDLE new_parent,
+        const WCHAR *new_name) {
+    EFILE_FILE_RENAME_INFORMATION_T *rename_info;
+    IO_STATUS_BLOCK io_status_block;
+    posix_errno_t posix_errno;
+    size_t name_size, info_size;
+    NTSTATUS status;
+
+    name_size = wcslen(new_name) * sizeof(WCHAR);
+    info_size = sizeof(EFILE_FILE_RENAME_INFORMATION_T) + name_size;
+
+    rename_info = (EFILE_FILE_RENAME_INFORMATION_T*)enif_alloc(info_size);
+
+    if(rename_info == NULL) {
+        return ENOMEM;
+    }
+
+    sys_memset(rename_info, 0, sizeof(EFILE_FILE_RENAME_INFORMATION_T));
+    rename_info->ReplaceIfExists = TRUE;
+    rename_info->RootDirectory = new_parent;
+    rename_info->FileNameLength = (ULONG)name_size;
+    sys_memcpy(rename_info->FileName, new_name, name_size);
+
+    sys_memset(&io_status_block, 0, sizeof(io_status_block));
+
+    status = NtSetInformationFile(handle, &io_status_block, rename_info,
+        (ULONG)info_size, EFILE_FILE_RENAME_INFORMATION);
+
+    posix_errno = (status < 0) ? nt_status_to_posix_errno(status) : 0;
+
+    enif_free(rename_info);
+
+    return posix_errno;
+}
+
+/* Gives an open file a second name, relative to a directory. */
+static posix_errno_t set_link_information(HANDLE handle, HANDLE new_parent,
+        const WCHAR *new_name) {
+    EFILE_FILE_LINK_INFORMATION_T *link_info;
+    IO_STATUS_BLOCK io_status_block;
+    posix_errno_t posix_errno;
+    size_t name_size, info_size;
+    NTSTATUS status;
+
+    name_size = wcslen(new_name) * sizeof(WCHAR);
+    info_size = sizeof(EFILE_FILE_LINK_INFORMATION_T) + name_size;
+
+    link_info = (EFILE_FILE_LINK_INFORMATION_T*)enif_alloc(info_size);
+
+    if(link_info == NULL) {
+        return ENOMEM;
+    }
+
+    sys_memset(link_info, 0, sizeof(EFILE_FILE_LINK_INFORMATION_T));
+    link_info->ReplaceIfExists = FALSE;
+    link_info->RootDirectory = new_parent;
+    link_info->FileNameLength = (ULONG)name_size;
+    sys_memcpy(link_info->FileName, new_name, name_size);
+
+    sys_memset(&io_status_block, 0, sizeof(io_status_block));
+
+    status = NtSetInformationFile(handle, &io_status_block, link_info,
+        (ULONG)info_size, EFILE_FILE_LINK_INFORMATION);
+
+    posix_errno = (status < 0) ? nt_status_to_posix_errno(status) : 0;
+
+    enif_free(link_info);
+
+    return posix_errno;
+}
+
+/* Turns a target that is not a path into the directory its last component
+ * belongs to, and that component. */
+static posix_errno_t resolve_target(const efile_target_t *target,
+        WCHAR *component, size_t component_size, HANDLE *parent, int *owned) {
+    if(target->kind == EFILE_TARGET_AT) {
+        efile_win_t *w = (efile_win_t*)target->dir;
+        size_t length = wcslen((const WCHAR*)target->name.data);
+
+        if(length >= component_size) {
+            return ENAMETOOLONG;
+        }
+
+        sys_memcpy(component, target->name.data, (length + 1) * sizeof(WCHAR));
+
+        *parent = w->handle;
+        *owned = 0;
+
+        return 0;
+    }
+
+    return walk_to_parent(target->dir, &target->name, component,
+                          component_size, parent, owned);
+}
+
+/* As resolve_target, but for an operation that takes two names. Windows has no
+ * directory that means "the working directory", so a name that is a path
+ * cannot be mixed with one in a directory. */
+static posix_errno_t resolve_either(const efile_target_t *target,
+        WCHAR *component, size_t component_size, HANDLE *parent, int *owned) {
+    if(target->kind == EFILE_TARGET_PATH) {
+        return ENOTSUP;
+    }
+
+    return resolve_target(target, component, component_size, parent, owned);
 }
 
 posix_errno_t efile_open_in_root(efile_data_t *root, const efile_path_t *path,
@@ -1435,211 +1584,12 @@ posix_errno_t efile_open_in_root(efile_data_t *root, const efile_path_t *path,
     }
 }
 
-posix_errno_t efile_make_dir_at(efile_data_t *dir, const efile_path_t *path) {
-    posix_errno_t posix_errno;
-    HANDLE handle;
 
-    /* NtCreateFile makes the directory when it is told to create rather than
-     * open, so there is no separate call for this. */
-    posix_errno = open_handle_at(dir, path, GENERIC_READ,
-        EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_DIRECTORY_FILE,
-        EFILE_FILE_CREATE, &handle);
 
-    if(posix_errno != 0) {
-        return posix_errno;
-    }
 
-    CloseHandle(handle);
 
-    return 0;
-}
 
-posix_errno_t efile_del_at(efile_data_t *dir, const efile_path_t *path, int is_dir) {
-    FILE_DISPOSITION_INFO disposition;
-    posix_errno_t posix_errno;
-    ULONG options;
-    HANDLE handle;
 
-    /* A name is removed by opening it and marking it for deletion, because
-     * DeleteFileW and RemoveDirectoryW both need a path. The reparse point
-     * option removes a link rather than what the link points at. */
-    options = EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_OPEN_REPARSE_POINT;
-
-    if(is_dir) {
-        options |= EFILE_FILE_DIRECTORY_FILE;
-    } else {
-        options |= EFILE_FILE_NON_DIRECTORY_FILE;
-    }
-
-    posix_errno = open_handle_at(dir, path, DELETE, options,
-        EFILE_FILE_OPEN, &handle);
-
-    if(posix_errno != 0) {
-        /* The path variant reports removing a directory as a file as EPERM
-         * rather than EISDIR. */
-        if(!is_dir && posix_errno == EISDIR) {
-            return EPERM;
-        }
-
-        return posix_errno;
-    }
-
-    disposition.DeleteFile = TRUE;
-
-    if(!SetFileInformationByHandle(handle, FileDispositionInfo,
-                                   &disposition, sizeof(disposition))) {
-        posix_errno = windows_to_posix_errno(GetLastError());
-
-        /* A directory that is not empty reports as EEXIST, as it does for a
-         * path. */
-        if(is_dir && posix_errno == EACCES) {
-            posix_errno = EEXIST;
-        }
-
-        CloseHandle(handle);
-
-        return posix_errno;
-    }
-
-    CloseHandle(handle);
-
-    return 0;
-}
-
-posix_errno_t efile_rename_at(efile_data_t *old_dir, const efile_path_t *old_path,
-        efile_data_t *new_dir, const efile_path_t *new_path) {
-    efile_win_t *new_parent = (efile_win_t*)new_dir;
-    EFILE_FILE_RENAME_INFORMATION_T *rename_info;
-    IO_STATUS_BLOCK io_status_block;
-    posix_errno_t posix_errno;
-    size_t name_size, info_size;
-    NTSTATUS status;
-    HANDLE handle;
-
-    posix_errno = open_handle_at(old_dir, old_path, DELETE | SYNCHRONIZE,
-        EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_OPEN_REPARSE_POINT,
-        EFILE_FILE_OPEN, &handle);
-
-    if(posix_errno != 0) {
-        return posix_errno;
-    }
-
-    /* The new name goes in the same structure, so the structure has to be
-     * large enough to hold it. */
-    name_size = wcslen((WCHAR*)new_path->data) * sizeof(WCHAR);
-    info_size = sizeof(EFILE_FILE_RENAME_INFORMATION_T) + name_size;
-
-    rename_info = (EFILE_FILE_RENAME_INFORMATION_T*)enif_alloc(info_size);
-
-    if(rename_info == NULL) {
-        CloseHandle(handle);
-        return ENOMEM;
-    }
-
-    sys_memset(rename_info, 0, sizeof(EFILE_FILE_RENAME_INFORMATION_T));
-    rename_info->ReplaceIfExists = TRUE;
-    rename_info->RootDirectory = new_parent->handle;
-    rename_info->FileNameLength = (ULONG)name_size;
-    sys_memcpy(rename_info->FileName, new_path->data, name_size);
-
-    sys_memset(&io_status_block, 0, sizeof(io_status_block));
-
-    status = NtSetInformationFile(handle, &io_status_block, rename_info,
-        (ULONG)info_size, EFILE_FILE_RENAME_INFORMATION);
-
-    if(status < 0) {
-        posix_errno = nt_status_to_posix_errno(status);
-    } else {
-        posix_errno = 0;
-    }
-
-    enif_free(rename_info);
-    CloseHandle(handle);
-
-    return posix_errno;
-}
-
-posix_errno_t efile_set_permissions_at(efile_data_t *dir, const efile_path_t *path,
-        Uint32 permissions) {
-    posix_errno_t posix_errno;
-    efile_win_t file;
-    HANDLE handle;
-
-    posix_errno = open_handle_at(dir, path,
-        FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
-        EFILE_FILE_OPEN_FOR_BACKUP_INTENT, EFILE_FILE_OPEN, &handle);
-
-    if(posix_errno != 0) {
-        return posix_errno;
-    }
-
-    sys_memset(&file, 0, sizeof(file));
-    file.handle = handle;
-
-    posix_errno = efile_set_handle_permissions(&file.common, permissions);
-
-    CloseHandle(handle);
-
-    return posix_errno;
-}
-
-posix_errno_t efile_set_owner_at(efile_data_t *dir, const efile_path_t *path,
-        Sint32 owner, Sint32 group) {
-    (void)dir;
-    (void)path;
-    (void)owner;
-    (void)group;
-
-    return 0;
-}
-
-posix_errno_t efile_set_time_at(efile_data_t *dir, const efile_path_t *path,
-        Sint64 a_time, Sint64 m_time, Sint64 c_time) {
-    posix_errno_t posix_errno;
-    efile_win_t file;
-    HANDLE handle;
-
-    posix_errno = open_handle_at(dir, path,
-        FILE_WRITE_ATTRIBUTES | SYNCHRONIZE,
-        EFILE_FILE_OPEN_FOR_BACKUP_INTENT, EFILE_FILE_OPEN, &handle);
-
-    if(posix_errno != 0) {
-        return posix_errno;
-    }
-
-    sys_memset(&file, 0, sizeof(file));
-    file.handle = handle;
-
-    posix_errno = efile_set_handle_time(&file.common, a_time, m_time, c_time);
-
-    CloseHandle(handle);
-
-    return posix_errno;
-}
-
-posix_errno_t efile_list_dir_at(ErlNifEnv *env, efile_data_t *dir,
-        const efile_path_t *path, ERL_NIF_TERM *result) {
-    posix_errno_t posix_errno;
-    efile_win_t listed;
-    HANDLE handle;
-
-    posix_errno = open_handle_at(dir, path, GENERIC_READ,
-        EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_DIRECTORY_FILE,
-        EFILE_FILE_OPEN, &handle);
-
-    if(posix_errno != 0) {
-        return posix_errno;
-    }
-
-    sys_memset(&listed, 0, sizeof(listed));
-    listed.handle = handle;
-
-    posix_errno = efile_list_handle_dir(env, &listed.common, result);
-
-    CloseHandle(handle);
-
-    return posix_errno;
-}
 
 static void tmp_nop_invalid_parameter_handler(const wchar_t* expression,
                                               const wchar_t* function,
@@ -2050,78 +2000,136 @@ static void build_file_info_times(BY_HANDLE_FILE_INFORMATION *native_file_info, 
     }
 }
 
-posix_errno_t efile_read_info(const efile_path_t *path, int follow_links, efile_fileinfo_t *result) {
-    BY_HANDLE_FILE_INFORMATION native_file_info;
-    DWORD attributes;
-    int is_link;
+posix_errno_t efile_read_info(const efile_target_t *target, int follow_links,
+        efile_fileinfo_t *result) {
+    if(target->kind == EFILE_TARGET_PATH) {
+        const efile_path_t *path = &target->name;
 
-    sys_memset(&native_file_info, 0, sizeof(native_file_info));
-    is_link = 0;
 
-    attributes = GetFileAttributesW((WCHAR*)path->data);
+        BY_HANDLE_FILE_INFORMATION native_file_info;
+        DWORD attributes;
+        int is_link;
 
-    if(attributes == INVALID_FILE_ATTRIBUTES) {
-        DWORD last_error = GetLastError();
+        sys_memset(&native_file_info, 0, sizeof(native_file_info));
+        is_link = 0;
 
-        /* Querying a network share root fails with ERROR_BAD_NETPATH, so we'll
-         * fake it as a directory just like local roots. */
-        if(!is_path_root(path) || last_error != ERROR_BAD_NETPATH) {
-            return windows_to_posix_errno(last_error);
-        }
+        attributes = GetFileAttributesW((WCHAR*)path->data);
 
-        native_file_info.dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
-    } else if(is_path_root(path)) {
-        /* Local (or mounted) roots can be queried with GetFileAttributesW but
-         * lack support for GetFileInformationByHandle, so we'll skip that
-         * part. */
-        native_file_info.dwFileAttributes = attributes;
-    } else {
-        HANDLE handle;
-        DWORD last_error;
-        DWORD flags;
+        if(attributes == INVALID_FILE_ATTRIBUTES) {
+            DWORD last_error = GetLastError();
 
-        if(attributes & FILE_ATTRIBUTE_REPARSE_POINT) {
-            is_link = is_name_surrogate(path);
-        }
-
-        flags = FILE_FLAG_BACKUP_SEMANTICS;
-        if(!follow_links && is_link) {
-            flags |= FILE_FLAG_OPEN_REPARSE_POINT;
-        }
-
-        handle = CreateFileW((const WCHAR*)path->data, GENERIC_READ,
-            FILE_SHARE_FLAGS, NULL, OPEN_EXISTING, flags, NULL);
-        last_error = GetLastError();
-
-        if(handle == INVALID_HANDLE_VALUE) {
-            return windows_to_posix_errno(last_error);
-        }
-
-        if(follow_links && is_link) {
-            posix_errno_t posix_errno;
-            efile_path_t resolved_path;
-
-            posix_errno = internal_read_link(handle, &resolved_path);
-
-            CloseHandle(handle);
-
-            if(posix_errno == 0) {
-                posix_errno = efile_read_info(&resolved_path, 0, result);
-                enif_release_binary(&resolved_path);
+            /* Querying a network share root fails with ERROR_BAD_NETPATH, so we'll
+             * fake it as a directory just like local roots. */
+            if(!is_path_root(path) || last_error != ERROR_BAD_NETPATH) {
+                return windows_to_posix_errno(last_error);
             }
 
+            native_file_info.dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+        } else if(is_path_root(path)) {
+            /* Local (or mounted) roots can be queried with GetFileAttributesW but
+             * lack support for GetFileInformationByHandle, so we'll skip that
+             * part. */
+            native_file_info.dwFileAttributes = attributes;
+        } else {
+            HANDLE handle;
+            DWORD last_error;
+            DWORD flags;
+
+            if(attributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+                is_link = is_name_surrogate(path);
+            }
+
+            flags = FILE_FLAG_BACKUP_SEMANTICS;
+            if(!follow_links && is_link) {
+                flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+            }
+
+            handle = CreateFileW((const WCHAR*)path->data, GENERIC_READ,
+                FILE_SHARE_FLAGS, NULL, OPEN_EXISTING, flags, NULL);
+            last_error = GetLastError();
+
+            if(handle == INVALID_HANDLE_VALUE) {
+                return windows_to_posix_errno(last_error);
+            }
+
+            if(follow_links && is_link) {
+                posix_errno_t posix_errno;
+                efile_path_t resolved_path;
+
+                posix_errno = internal_read_link(handle, &resolved_path);
+
+                CloseHandle(handle);
+
+                if(posix_errno == 0) {
+                    posix_errno = efile_read_info(&resolved_path, 0, result);
+                    enif_release_binary(&resolved_path);
+                }
+
+                return posix_errno;
+            }
+
+            GetFileInformationByHandle(handle, &native_file_info);
+            CloseHandle(handle);
+
+            build_file_info_times(&native_file_info, result);
+        }
+
+        build_file_info(&native_file_info, path, is_link, result);
+
+        return 0;
+    }
+
+    {
+        WCHAR component[MAX_PATH];
+        posix_errno_t posix_errno;
+        HANDLE parent;
+        int owned;
+
+        posix_errno = resolve_target(target, component, MAX_PATH, &parent,
+                                     &owned);
+
+        if(posix_errno != 0) {
             return posix_errno;
         }
 
-        GetFileInformationByHandle(handle, &native_file_info);
+        efile_win_t file;
+        HANDLE handle;
+        NTSTATUS status;
+        ULONG options;
+
+        options = EFILE_FILE_OPEN_FOR_BACKUP_INTENT;
+
+        if(!follow_links) {
+            options |= EFILE_FILE_OPEN_REPARSE_POINT;
+        }
+
+        status = open_name_at(parent, component, GENERIC_READ, options,
+            EFILE_FILE_OPEN, &handle);
+
+        if(owned) {
+            CloseHandle(parent);
+        }
+
+        if(status < 0) {
+            return nt_status_to_posix_errno(status);
+        }
+
+        sys_memset(&file, 0, sizeof(file));
+        file.handle = handle;
+
+        posix_errno = efile_read_handle_info(&file.common, result);
+
+        /* efile_read_handle_info answers for the file a handle refers to, and
+         * a handle never refers to a link there, so it cannot report one. */
+        if(posix_errno == 0 && !follow_links
+           && handle_has_file_attributes(handle, FILE_ATTRIBUTE_REPARSE_POINT)) {
+            result->type = EFILE_FILETYPE_SYMLINK;
+        }
+
         CloseHandle(handle);
 
-        build_file_info_times(&native_file_info, result);
+        return posix_errno;
     }
-
-    build_file_info(&native_file_info, path, is_link, result);
-
-    return 0;
 }
 
 posix_errno_t efile_read_handle_info(efile_data_t *d, efile_fileinfo_t *result) {
@@ -2157,24 +2165,68 @@ posix_errno_t efile_read_handle_info(efile_data_t *d, efile_fileinfo_t *result) 
     return posix_errno;
 }
 
-posix_errno_t efile_set_permissions(const efile_path_t *path, Uint32 permissions) {
-    DWORD attributes = GetFileAttributesW((WCHAR*)path->data);
+posix_errno_t efile_set_permissions(const efile_target_t *target, Uint32 permissions) {
+    if(target->kind == EFILE_TARGET_PATH) {
+        const efile_path_t *path = &target->name;
 
-    if(attributes == INVALID_FILE_ATTRIBUTES) {
+
+        DWORD attributes = GetFileAttributesW((WCHAR*)path->data);
+
+        if(attributes == INVALID_FILE_ATTRIBUTES) {
+            return windows_to_posix_errno(GetLastError());
+        }
+
+        if(permissions & _S_IWRITE) {
+            attributes &= ~FILE_ATTRIBUTE_READONLY;
+        } else {
+            attributes |= FILE_ATTRIBUTE_READONLY;
+        }
+
+        if(SetFileAttributesW((WCHAR*)path->data, attributes)) {
+            return 0;
+        }
+
         return windows_to_posix_errno(GetLastError());
     }
 
-    if(permissions & _S_IWRITE) {
-        attributes &= ~FILE_ATTRIBUTE_READONLY;
-    } else {
-        attributes |= FILE_ATTRIBUTE_READONLY;
-    }
+    {
+        WCHAR component[MAX_PATH];
+        posix_errno_t posix_errno;
+        HANDLE parent;
+        int owned;
 
-    if(SetFileAttributesW((WCHAR*)path->data, attributes)) {
-        return 0;
-    }
+        posix_errno = resolve_target(target, component, MAX_PATH, &parent,
+                                     &owned);
 
-    return windows_to_posix_errno(GetLastError());
+        if(posix_errno != 0) {
+            return posix_errno;
+        }
+
+        efile_win_t file;
+        HANDLE handle;
+        NTSTATUS status;
+
+        status = open_name_at(parent, component,
+            FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+            EFILE_FILE_OPEN_FOR_BACKUP_INTENT, EFILE_FILE_OPEN, &handle);
+
+        if(owned) {
+            CloseHandle(parent);
+        }
+
+        if(status < 0) {
+            return nt_status_to_posix_errno(status);
+        }
+
+        sys_memset(&file, 0, sizeof(file));
+        file.handle = handle;
+
+        posix_errno = efile_set_handle_permissions(&file.common, permissions);
+
+        CloseHandle(handle);
+
+        return posix_errno;
+    }
 }
 
 posix_errno_t efile_set_handle_permissions(efile_data_t *d, Uint32 permissions) {
@@ -2211,8 +2263,8 @@ posix_errno_t efile_set_handle_permissions(efile_data_t *d, Uint32 permissions) 
     return 0;
 }
 
-posix_errno_t efile_set_owner(const efile_path_t *path, Sint32 owner, Sint32 group) {
-    (void)path;
+posix_errno_t efile_set_owner(const efile_target_t *target, Sint32 owner, Sint32 group) {
+    (void)target;
     (void)owner;
     (void)group;
 
@@ -2227,50 +2279,96 @@ posix_errno_t efile_set_handle_owner(efile_data_t *d, Sint32 owner, Sint32 group
     return 0;
 }
 
-posix_errno_t efile_set_time(const efile_path_t *path, Sint64 a_time, Sint64 m_time, Sint64 c_time) {
-    FILETIME accessed, modified, created;
-    DWORD last_error, attributes;
-    HANDLE handle;
+posix_errno_t efile_set_time(const efile_target_t *target, Sint64 a_time,
+        Sint64 m_time, Sint64 c_time) {
+    if(target->kind == EFILE_TARGET_PATH) {
+        const efile_path_t *path = &target->name;
 
-    attributes = GetFileAttributesW((WCHAR*)path->data);
 
-    if(attributes == INVALID_FILE_ATTRIBUTES) {
-        return windows_to_posix_errno(GetLastError());
-    }
+        FILETIME accessed, modified, created;
+        DWORD last_error, attributes;
+        HANDLE handle;
 
-    /* If the file is read-only, we have to make it temporarily writable while
-     * setting new metadata. */
-    if(attributes & FILE_ATTRIBUTE_READONLY) {
-        DWORD without_readonly = attributes & ~FILE_ATTRIBUTE_READONLY;
+        attributes = GetFileAttributesW((WCHAR*)path->data);
 
-        if(!SetFileAttributesW((WCHAR*)path->data, without_readonly)) {
+        if(attributes == INVALID_FILE_ATTRIBUTES) {
             return windows_to_posix_errno(GetLastError());
         }
-    }
 
-    EPOCH_TO_FILETIME(modified, m_time);
-    EPOCH_TO_FILETIME(accessed, a_time);
-    EPOCH_TO_FILETIME(created, c_time);
+        /* If the file is read-only, we have to make it temporarily writable while
+         * setting new metadata. */
+        if(attributes & FILE_ATTRIBUTE_READONLY) {
+            DWORD without_readonly = attributes & ~FILE_ATTRIBUTE_READONLY;
 
-    handle = CreateFileW((WCHAR*)path->data, GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_FLAGS, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
-    last_error = GetLastError();
-
-    if(handle != INVALID_HANDLE_VALUE) {
-        if(SetFileTime(handle, &created, &accessed, &modified)) {
-            last_error = ERROR_SUCCESS;
-        } else {
-            last_error = GetLastError();
+            if(!SetFileAttributesW((WCHAR*)path->data, without_readonly)) {
+                return windows_to_posix_errno(GetLastError());
+            }
         }
 
+        EPOCH_TO_FILETIME(modified, m_time);
+        EPOCH_TO_FILETIME(accessed, a_time);
+        EPOCH_TO_FILETIME(created, c_time);
+
+        handle = CreateFileW((WCHAR*)path->data, GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_FLAGS, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        last_error = GetLastError();
+
+        if(handle != INVALID_HANDLE_VALUE) {
+            if(SetFileTime(handle, &created, &accessed, &modified)) {
+                last_error = ERROR_SUCCESS;
+            } else {
+                last_error = GetLastError();
+            }
+
+            CloseHandle(handle);
+        }
+
+        if(attributes & FILE_ATTRIBUTE_READONLY) {
+            SetFileAttributesW((WCHAR*)path->data, attributes);
+        }
+
+        return windows_to_posix_errno(last_error);
+    }
+
+    {
+        WCHAR component[MAX_PATH];
+        posix_errno_t posix_errno;
+        HANDLE parent;
+        int owned;
+
+        posix_errno = resolve_target(target, component, MAX_PATH, &parent,
+                                     &owned);
+
+        if(posix_errno != 0) {
+            return posix_errno;
+        }
+
+        efile_win_t file;
+        HANDLE handle;
+        NTSTATUS status;
+
+        status = open_name_at(parent, component,
+            FILE_WRITE_ATTRIBUTES | SYNCHRONIZE,
+            EFILE_FILE_OPEN_FOR_BACKUP_INTENT, EFILE_FILE_OPEN, &handle);
+
+        if(owned) {
+            CloseHandle(parent);
+        }
+
+        if(status < 0) {
+            return nt_status_to_posix_errno(status);
+        }
+
+        sys_memset(&file, 0, sizeof(file));
+        file.handle = handle;
+
+        posix_errno = efile_set_handle_time(&file.common, a_time, m_time,
+                                            c_time);
+
         CloseHandle(handle);
-    }
 
-    if(attributes & FILE_ATTRIBUTE_READONLY) {
-        SetFileAttributesW((WCHAR*)path->data, attributes);
+        return posix_errno;
     }
-
-    return windows_to_posix_errno(last_error);
 }
 
 posix_errno_t efile_set_handle_time(efile_data_t *d, Sint64 a_time, Sint64 m_time,
@@ -2326,49 +2424,127 @@ static posix_errno_t internal_read_link(HANDLE link_handle, efile_path_t *result
     return 0;
 }
 
-posix_errno_t efile_read_link(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_TERM *result) {
-    posix_errno_t posix_errno;
-    ErlNifBinary result_bin;
-    DWORD attributes;
-    HANDLE handle;
-    DWORD last_error;
+posix_errno_t efile_read_link(ErlNifEnv *env, const efile_target_t *target,
+        ERL_NIF_TERM *result) {
+    if(target->kind == EFILE_TARGET_PATH) {
+        const efile_path_t *path = &target->name;
 
-    ASSERT_PATH_FORMAT(path);
 
-    attributes = GetFileAttributesW((WCHAR*)path->data);
+        posix_errno_t posix_errno;
+        ErlNifBinary result_bin;
+        DWORD attributes;
+        HANDLE handle;
+        DWORD last_error;
 
-    if(attributes == INVALID_FILE_ATTRIBUTES) {
-        return windows_to_posix_errno(GetLastError());
-    } else if(!(attributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
-        return EINVAL;
-    }
+        ASSERT_PATH_FORMAT(path);
 
-    if(!is_name_surrogate(path)) {
-        return EINVAL;
-    }
+        attributes = GetFileAttributesW((WCHAR*)path->data);
 
-    handle = CreateFileW((WCHAR*)path->data, GENERIC_READ,
-        FILE_SHARE_FLAGS, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS,
-        NULL);
-    last_error = GetLastError();
-
-    if(handle == INVALID_HANDLE_VALUE) {
-        return windows_to_posix_errno(last_error);
-    }
-    posix_errno = internal_read_link(handle, &result_bin);
-
-    CloseHandle(handle);
-
-    if(posix_errno == 0) {
-        if(!normalize_path_result(&result_bin)) {
-            enif_release_binary(&result_bin);
-            return ENOMEM;
+        if(attributes == INVALID_FILE_ATTRIBUTES) {
+            return windows_to_posix_errno(GetLastError());
+        } else if(!(attributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            return EINVAL;
         }
 
-        (*result) = enif_make_binary(env, &result_bin);
+        if(!is_name_surrogate(path)) {
+            return EINVAL;
+        }
+
+        handle = CreateFileW((WCHAR*)path->data, GENERIC_READ,
+            FILE_SHARE_FLAGS, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS,
+            NULL);
+        last_error = GetLastError();
+
+        if(handle == INVALID_HANDLE_VALUE) {
+            return windows_to_posix_errno(last_error);
+        }
+        posix_errno = internal_read_link(handle, &result_bin);
+
+        CloseHandle(handle);
+
+        if(posix_errno == 0) {
+            if(!normalize_path_result(&result_bin)) {
+                enif_release_binary(&result_bin);
+                return ENOMEM;
+            }
+
+            (*result) = enif_make_binary(env, &result_bin);
+        }
+
+        return posix_errno;
     }
 
-    return posix_errno;
+    {
+        WCHAR component[MAX_PATH];
+        posix_errno_t posix_errno;
+        HANDLE parent;
+        int owned;
+
+        posix_errno = resolve_target(target, component, MAX_PATH, &parent,
+                                     &owned);
+
+        if(posix_errno != 0) {
+            return posix_errno;
+        }
+
+        ErlNifBinary result_bin;
+        HANDLE handle;
+        NTSTATUS status;
+
+        /* The link itself is opened first, so that a name that is not a link
+         * can be refused. */
+        status = open_name_at(parent, component, FILE_READ_ATTRIBUTES,
+            EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_OPEN_REPARSE_POINT,
+            EFILE_FILE_OPEN, &handle);
+
+        if(status < 0) {
+            if(owned) {
+                CloseHandle(parent);
+            }
+
+            return nt_status_to_posix_errno(status);
+        }
+
+        if(!handle_has_file_attributes(handle, FILE_ATTRIBUTE_REPARSE_POINT)) {
+            CloseHandle(handle);
+
+            if(owned) {
+                CloseHandle(parent);
+            }
+
+            return EINVAL;
+        }
+
+        CloseHandle(handle);
+
+        /* It is opened again without that option, so that it is followed and
+         * the name of the file it points at can be read. */
+        status = open_name_at(parent, component, GENERIC_READ,
+            EFILE_FILE_OPEN_FOR_BACKUP_INTENT, EFILE_FILE_OPEN, &handle);
+
+        if(owned) {
+            CloseHandle(parent);
+        }
+
+        if(status < 0) {
+            return nt_status_to_posix_errno(status);
+        }
+
+        posix_errno = internal_read_link(handle, &result_bin);
+
+        CloseHandle(handle);
+
+        if(posix_errno == 0) {
+            if(!normalize_path_result(&result_bin)) {
+                enif_release_binary(&result_bin);
+                return ENOMEM;
+            }
+
+            (*result) = enif_make_binary(env, &result_bin);
+        }
+
+        return posix_errno;
+    }
 }
 
 static posix_errno_t list_dir_path(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_TERM *result) {
@@ -2425,8 +2601,59 @@ static posix_errno_t list_dir_path(ErlNifEnv *env, const efile_path_t *path, ERL
     return 0;
 }
 
-posix_errno_t efile_list_dir(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_TERM *result) {
-    return list_dir_path(env, path, result);
+posix_errno_t efile_list_dir(ErlNifEnv *env, const efile_target_t *target,
+        ERL_NIF_TERM *result) {
+    if(target->kind == EFILE_TARGET_PATH) {
+        const efile_path_t *path = &target->name;
+
+
+        return list_dir_path(env, path, result);
+    }
+
+    {
+        WCHAR component[MAX_PATH];
+        posix_errno_t posix_errno;
+        HANDLE parent;
+        int owned;
+
+        posix_errno = resolve_target(target, component, MAX_PATH, &parent,
+                                     &owned);
+
+        if(posix_errno != 0) {
+            return posix_errno;
+        }
+
+        efile_win_t listed;
+        HANDLE handle;
+        NTSTATUS status;
+
+        status = open_name_at(parent, component, GENERIC_READ,
+            EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_DIRECTORY_FILE,
+            EFILE_FILE_OPEN, &handle);
+
+        if(owned) {
+            CloseHandle(parent);
+        }
+
+        if(status < 0) {
+            *result = enif_make_list(env, 0);
+
+            if(status == EFILE_STATUS_NOT_A_DIRECTORY) {
+                return ENOTDIR;
+            }
+
+            return nt_status_to_posix_errno(status);
+        }
+
+        sys_memset(&listed, 0, sizeof(listed));
+        listed.handle = handle;
+
+        posix_errno = efile_list_handle_dir(env, &listed.common, result);
+
+        CloseHandle(handle);
+
+        return posix_errno;
+    }
 }
 
 posix_errno_t efile_list_handle_dir(ErlNifEnv *env, efile_data_t *d, ERL_NIF_TERM *result) {
@@ -2451,214 +2678,532 @@ posix_errno_t efile_list_handle_dir(ErlNifEnv *env, efile_data_t *d, ERL_NIF_TER
     return posix_errno;
 }
 
-posix_errno_t efile_rename(const efile_path_t *old_path, const efile_path_t *new_path) {
-    BOOL old_is_directory, new_is_directory;
-    DWORD move_flags, last_error;
+posix_errno_t efile_rename(const efile_target_t *old_target,
+        const efile_target_t *new_target) {
+    if(old_target->kind == EFILE_TARGET_PATH
+       && new_target->kind == EFILE_TARGET_PATH) {
+        const efile_path_t *old_path = &old_target->name;
+        const efile_path_t *new_path = &new_target->name;
 
-    ASSERT_PATH_FORMAT(old_path);
-    ASSERT_PATH_FORMAT(new_path);
 
-    move_flags = MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH;
+        BOOL old_is_directory, new_is_directory;
+        DWORD move_flags, last_error;
 
-    if(MoveFileExW((WCHAR*)old_path->data, (WCHAR*)new_path->data, move_flags)) {
-        return 0;
-    }
+        ASSERT_PATH_FORMAT(old_path);
+        ASSERT_PATH_FORMAT(new_path);
 
-    last_error = GetLastError();
+        move_flags = MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH;
 
-    old_is_directory = has_file_attributes(old_path, FILE_ATTRIBUTE_DIRECTORY);
-    new_is_directory = has_file_attributes(new_path, FILE_ATTRIBUTE_DIRECTORY);
-
-    switch(last_error) {
-    case ERROR_SHARING_VIOLATION:
-    case ERROR_ACCESS_DENIED:
-        if(old_is_directory) {
-            BOOL moved_into_itself;
-
-            moved_into_itself = (old_path->size <= new_path->size) &&
-                !_wcsnicmp((WCHAR*)old_path->data, (WCHAR*)new_path->data,
-                    PATH_LENGTH(old_path));
-
-            if(moved_into_itself) {
-                return EINVAL;
-            } else if(is_path_root(old_path)) {
-                return EINVAL;
-            }
-
-            /* Renaming a directory across volumes needs to be rewritten as
-             * EXDEV so that the caller can respond by simulating it with
-             * copy/delete operations.
-             *
-             * Files are handled through MOVEFILE_COPY_ALLOWED. */
-            if(!has_same_mount_point(old_path, new_path)) {
-                return EXDEV;
-            }
+        if(MoveFileExW((WCHAR*)old_path->data, (WCHAR*)new_path->data, move_flags)) {
+            return 0;
         }
-        break;
-    case ERROR_PATH_NOT_FOUND:
-    case ERROR_FILE_NOT_FOUND:
-        return ENOENT;
-    case ERROR_ALREADY_EXISTS:
-    case ERROR_FILE_EXISTS:
-        if(old_is_directory && !new_is_directory) {
-            return ENOTDIR;
-        } else if(!old_is_directory && new_is_directory) {
-            return EISDIR;
-        } else if(old_is_directory && new_is_directory) {
-            /* This will fail if the destination isn't empty. */
-            if(RemoveDirectoryW((WCHAR*)new_path->data)) {
-                return efile_rename(old_path, new_path);
+
+        last_error = GetLastError();
+
+        old_is_directory = has_file_attributes(old_path, FILE_ATTRIBUTE_DIRECTORY);
+        new_is_directory = has_file_attributes(new_path, FILE_ATTRIBUTE_DIRECTORY);
+
+        switch(last_error) {
+        case ERROR_SHARING_VIOLATION:
+        case ERROR_ACCESS_DENIED:
+            if(old_is_directory) {
+                BOOL moved_into_itself;
+
+                moved_into_itself = (old_path->size <= new_path->size) &&
+                    !_wcsnicmp((WCHAR*)old_path->data, (WCHAR*)new_path->data,
+                        PATH_LENGTH(old_path));
+
+                if(moved_into_itself) {
+                    return EINVAL;
+                } else if(is_path_root(old_path)) {
+                    return EINVAL;
+                }
+
+                /* Renaming a directory across volumes needs to be rewritten as
+                 * EXDEV so that the caller can respond by simulating it with
+                 * copy/delete operations.
+                 *
+                 * Files are handled through MOVEFILE_COPY_ALLOWED. */
+                if(!has_same_mount_point(old_path, new_path)) {
+                    return EXDEV;
+                }
+            }
+            break;
+        case ERROR_PATH_NOT_FOUND:
+        case ERROR_FILE_NOT_FOUND:
+            return ENOENT;
+        case ERROR_ALREADY_EXISTS:
+        case ERROR_FILE_EXISTS:
+            if(old_is_directory && !new_is_directory) {
+                return ENOTDIR;
+            } else if(!old_is_directory && new_is_directory) {
+                return EISDIR;
+            } else if(old_is_directory && new_is_directory) {
+                /* This will fail if the destination isn't empty. */
+                if(RemoveDirectoryW((WCHAR*)new_path->data)) {
+                    return efile_rename(old_path, new_path);
+                }
+
+                return EEXIST;
+            } else if(!old_is_directory && !new_is_directory) {
+                /* This is pretty iffy; the public documentation says that the
+                 * operation may EACCES on some systems when either file is open,
+                 * which gives us room to use MOVEFILE_REPLACE_EXISTING and be done
+                 * with it, but the old implementation simulated Unix semantics and
+                 * there's a lot of code that relies on that.
+                 *
+                 * The simulation renames the destination to a scratch name to get
+                 * around the fact that it's impossible to open (and by extension
+                 * rename) a file that's been deleted while open. It has a few
+                 * drawbacks though;
+                 *
+                 * 1) It's not atomic as there's a small window where there's no
+                 *    file at all on the destination path.
+                 * 2) It will confuse applications that subscribe to folder
+                 *    changes.
+                 * 3) It will fail if we lack general permission to write in the
+                 *    same folder. */
+
+                WCHAR *swap_path = enif_alloc(new_path->size + sizeof(WCHAR) * 64);
+
+                if(swap_path == NULL) {
+                    return ENOMEM;
+                } else {
+                    static LONGLONG unique_counter = 0;
+                    WCHAR *swap_path_end;
+
+                    /* We swap in the same folder as the destination to be
+                     * reasonably sure that it's on the same volume. Note that
+                     * we're avoiding GetTempFileNameW as it will fail on long
+                     * paths. */
+
+                    sys_memcpy(swap_path, (WCHAR*)new_path->data, new_path->size);
+                    swap_path_end = swap_path + PATH_LENGTH(new_path);
+
+                    while(!IS_SLASH(*swap_path_end)) {
+                        ASSERT(swap_path_end > swap_path);
+                        swap_path_end--;
+                    }
+
+                    StringCchPrintfW(&swap_path_end[1], 64, L"erl-%lx-%llx.tmp",
+                        GetCurrentProcessId(), unique_counter);
+                    InterlockedIncrement64(&unique_counter);
+                }
+
+                if(MoveFileExW((WCHAR*)new_path->data, swap_path, MOVEFILE_REPLACE_EXISTING)) {
+                    if(MoveFileExW((WCHAR*)old_path->data, (WCHAR*)new_path->data, move_flags)) {
+                        last_error = ERROR_SUCCESS;
+                        DeleteFileW(swap_path);
+                    } else {
+                        last_error = GetLastError();
+                        MoveFileW(swap_path, (WCHAR*)new_path->data);
+                    }
+                } else {
+                    last_error = GetLastError();
+                    DeleteFileW(swap_path);
+                }
+
+                enif_free(swap_path);
+
+                return windows_to_posix_errno(last_error);
             }
 
             return EEXIST;
-        } else if(!old_is_directory && !new_is_directory) {
-            /* This is pretty iffy; the public documentation says that the
-             * operation may EACCES on some systems when either file is open,
-             * which gives us room to use MOVEFILE_REPLACE_EXISTING and be done
-             * with it, but the old implementation simulated Unix semantics and
-             * there's a lot of code that relies on that.
-             *
-             * The simulation renames the destination to a scratch name to get
-             * around the fact that it's impossible to open (and by extension
-             * rename) a file that's been deleted while open. It has a few
-             * drawbacks though;
-             *
-             * 1) It's not atomic as there's a small window where there's no
-             *    file at all on the destination path.
-             * 2) It will confuse applications that subscribe to folder
-             *    changes.
-             * 3) It will fail if we lack general permission to write in the
-             *    same folder. */
+        }
 
-            WCHAR *swap_path = enif_alloc(new_path->size + sizeof(WCHAR) * 64);
+        return windows_to_posix_errno(last_error);
+    }
 
-            if(swap_path == NULL) {
-                return ENOMEM;
-            } else {
-                static LONGLONG unique_counter = 0;
-                WCHAR *swap_path_end;
+    {
+        WCHAR old_component[MAX_PATH], new_component[MAX_PATH];
+        posix_errno_t posix_errno;
+        HANDLE old_parent, new_parent, handle;
+        int old_owned, new_owned;
+        NTSTATUS status;
 
-                /* We swap in the same folder as the destination to be
-                 * reasonably sure that it's on the same volume. Note that
-                 * we're avoiding GetTempFileNameW as it will fail on long
-                 * paths. */
+        posix_errno = resolve_either(old_target, old_component, MAX_PATH,
+                                     &old_parent, &old_owned);
 
-                sys_memcpy(swap_path, (WCHAR*)new_path->data, new_path->size);
-                swap_path_end = swap_path + PATH_LENGTH(new_path);
+        if(posix_errno != 0) {
+            return posix_errno;
+        }
 
-                while(!IS_SLASH(*swap_path_end)) {
-                    ASSERT(swap_path_end > swap_path);
-                    swap_path_end--;
-                }
+        posix_errno = resolve_either(new_target, new_component, MAX_PATH,
+                                     &new_parent, &new_owned);
 
-                StringCchPrintfW(&swap_path_end[1], 64, L"erl-%lx-%llx.tmp",
-                    GetCurrentProcessId(), unique_counter);
-                InterlockedIncrement64(&unique_counter);
+        if(posix_errno != 0) {
+            if(old_owned) {
+                CloseHandle(old_parent);
             }
 
-            if(MoveFileExW((WCHAR*)new_path->data, swap_path, MOVEFILE_REPLACE_EXISTING)) {
-                if(MoveFileExW((WCHAR*)old_path->data, (WCHAR*)new_path->data, move_flags)) {
-                    last_error = ERROR_SUCCESS;
-                    DeleteFileW(swap_path);
-                } else {
-                    last_error = GetLastError();
-                    MoveFileW(swap_path, (WCHAR*)new_path->data);
-                }
-            } else {
-                last_error = GetLastError();
-                DeleteFileW(swap_path);
+            return posix_errno;
+        }
+
+        status = open_name_at(old_parent, old_component, DELETE | SYNCHRONIZE,
+            EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_OPEN_REPARSE_POINT,
+            EFILE_FILE_OPEN, &handle);
+
+        if(status < 0) {
+            posix_errno = nt_status_to_posix_errno(status);
+        } else {
+            posix_errno = set_rename_information(handle, new_parent, new_component);
+            CloseHandle(handle);
+        }
+
+        if(old_owned) {
+            CloseHandle(old_parent);
+        }
+
+        if(new_owned) {
+            CloseHandle(new_parent);
+        }
+
+        return posix_errno;
+    }
+}
+
+posix_errno_t efile_make_hard_link(const efile_target_t *existing_target,
+        const efile_target_t *new_target) {
+    if(existing_target->kind == EFILE_TARGET_PATH
+       && new_target->kind == EFILE_TARGET_PATH) {
+        const efile_path_t *existing_path = &existing_target->name;
+        const efile_path_t *new_path = &new_target->name;
+
+
+        ASSERT_PATH_FORMAT(existing_path);
+        ASSERT_PATH_FORMAT(new_path);
+
+        if(!CreateHardLinkW((WCHAR*)new_path->data, (WCHAR*)existing_path->data, NULL)) {
+            return windows_to_posix_errno(GetLastError());
+        }
+
+        return 0;
+    }
+
+    {
+        const efile_target_t *old_target = existing_target;
+
+    {
+        WCHAR old_component[MAX_PATH], new_component[MAX_PATH];
+        posix_errno_t posix_errno;
+        HANDLE old_parent, new_parent, handle;
+        int old_owned, new_owned;
+        NTSTATUS status;
+
+        posix_errno = resolve_either(old_target, old_component, MAX_PATH,
+                                     &old_parent, &old_owned);
+
+        if(posix_errno != 0) {
+            return posix_errno;
+        }
+
+        posix_errno = resolve_either(new_target, new_component, MAX_PATH,
+                                     &new_parent, &new_owned);
+
+        if(posix_errno != 0) {
+            if(old_owned) {
+                CloseHandle(old_parent);
             }
 
-            enif_free(swap_path);
+            return posix_errno;
+        }
+
+        status = open_name_at(old_parent, old_component, FILE_READ_ATTRIBUTES,
+            EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_OPEN_REPARSE_POINT,
+            EFILE_FILE_OPEN, &handle);
+
+        if(status < 0) {
+            posix_errno = nt_status_to_posix_errno(status);
+        } else {
+            posix_errno = set_link_information(handle, new_parent, new_component);
+            CloseHandle(handle);
+        }
+
+        if(old_owned) {
+            CloseHandle(old_parent);
+        }
+
+        if(new_owned) {
+            CloseHandle(new_parent);
+        }
+
+        return posix_errno;
+    }
+    }
+}
+
+posix_errno_t efile_make_soft_link(const efile_path_t *existing_path,
+        const efile_target_t *new_target) {
+    if(new_target->kind == EFILE_TARGET_PATH) {
+        const efile_path_t *new_path = &new_target->name;
+
+
+        DWORD link_flags;
+
+        ASSERT_PATH_FORMAT(existing_path);
+        ASSERT_PATH_FORMAT(new_path);
+
+        if(has_file_attributes(existing_path, FILE_ATTRIBUTE_DIRECTORY)) {
+            link_flags = SYMBOLIC_LINK_FLAG_DIRECTORY;
+        } else {
+            link_flags = 0;
+        }
+
+        if(!CreateSymbolicLinkW((WCHAR*)new_path->data, (WCHAR*)existing_path->data, link_flags)) {
+            return windows_to_posix_errno(GetLastError());
+        }
+
+        return 0;
+    }
+
+    (void)existing_path;
+
+    /* CreateSymbolicLinkW needs a path for the new link, and Windows has no
+     * call that makes a link relative to a directory handle. Resolving the
+     * directory back to a path would resolve that path again, which is what
+     * this API avoids. */
+    return ENOTSUP;
+}
+
+posix_errno_t efile_make_dir(const efile_target_t *target) {
+    if(target->kind == EFILE_TARGET_PATH) {
+        const efile_path_t *path = &target->name;
+
+        ASSERT_PATH_FORMAT(&target->name);
+
+        if(!CreateDirectoryW((WCHAR*)target->name.data, NULL)) {
+            return windows_to_posix_errno(GetLastError());
+        }
+
+        return 0;
+    }
+
+    {
+    WCHAR component[MAX_PATH];
+    posix_errno_t posix_errno;
+    HANDLE parent;
+    int owned;
+
+    posix_errno = resolve_target(target, component, MAX_PATH, &parent, &owned);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+        /* NtCreateFile makes the directory when it is told to create rather
+         * than open, so there is no separate call for this. */
+        {
+            HANDLE handle;
+            NTSTATUS status;
+
+            status = open_name_at(parent, component, GENERIC_READ,
+                EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_DIRECTORY_FILE,
+                EFILE_FILE_CREATE, &handle);
+
+            if(status < 0) {
+                posix_errno = nt_status_to_posix_errno(status);
+            } else {
+                CloseHandle(handle);
+            }
+        }
+
+        if(owned) {
+            CloseHandle(parent);
+        }
+
+        return posix_errno;
+    }
+}
+
+posix_errno_t efile_del_file(const efile_target_t *target) {
+    if(target->kind == EFILE_TARGET_PATH) {
+        const efile_path_t *path = &target->name;
+
+        ASSERT_PATH_FORMAT(path);
+
+        if(!DeleteFileW((WCHAR*)path->data)) {
+            DWORD last_error = GetLastError();
+
+            switch(last_error) {
+            case ERROR_INVALID_NAME:
+                /* Attempted to delete a device or similar. */
+                return EACCES;
+            case ERROR_ACCESS_DENIED:
+                /* Windows NT reports removing a directory as EACCES instead of
+                 * EPERM. */
+                if(has_file_attributes(path, FILE_ATTRIBUTE_DIRECTORY)) {
+                    return EPERM;
+                }
+                break;
+            }
 
             return windows_to_posix_errno(last_error);
         }
 
-        return EEXIST;
+        return 0;
     }
 
-    return windows_to_posix_errno(last_error);
-}
+    {
+        const int is_dir = 0;
+    WCHAR component[MAX_PATH];
+    posix_errno_t posix_errno;
+    HANDLE parent;
+    int owned;
 
-posix_errno_t efile_make_hard_link(const efile_path_t *existing_path, const efile_path_t *new_path) {
-    ASSERT_PATH_FORMAT(existing_path);
-    ASSERT_PATH_FORMAT(new_path);
+    posix_errno = resolve_target(target, component, MAX_PATH, &parent, &owned);
 
-    if(!CreateHardLinkW((WCHAR*)new_path->data, (WCHAR*)existing_path->data, NULL)) {
-        return windows_to_posix_errno(GetLastError());
+    if(posix_errno != 0) {
+        return posix_errno;
     }
 
-    return 0;
-}
+    FILE_DISPOSITION_INFO disposition;
+    ULONG options;
+    HANDLE handle;
 
-posix_errno_t efile_make_soft_link(const efile_path_t *existing_path, const efile_path_t *new_path) {
-    DWORD link_flags;
+    /* A name is removed by opening it and marking it for deletion, because
+     * DeleteFileW and RemoveDirectoryW both need a path. The reparse point
+     * option removes a link rather than what the link points at. */
+    options = EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_OPEN_REPARSE_POINT;
 
-    ASSERT_PATH_FORMAT(existing_path);
-    ASSERT_PATH_FORMAT(new_path);
-
-    if(has_file_attributes(existing_path, FILE_ATTRIBUTE_DIRECTORY)) {
-        link_flags = SYMBOLIC_LINK_FLAG_DIRECTORY;
+    if(is_dir) {
+        options |= EFILE_FILE_DIRECTORY_FILE;
     } else {
-        link_flags = 0;
+        options |= EFILE_FILE_NON_DIRECTORY_FILE;
     }
 
-    if(!CreateSymbolicLinkW((WCHAR*)new_path->data, (WCHAR*)existing_path->data, link_flags)) {
-        return windows_to_posix_errno(GetLastError());
+    {
+        NTSTATUS status = open_name_at(parent, component, DELETE, options,
+            EFILE_FILE_OPEN, &handle);
+
+        posix_errno = (status < 0)
+            ? (status == EFILE_STATUS_NOT_A_DIRECTORY ? ENOTDIR
+               : status == EFILE_STATUS_FILE_IS_A_DIRECTORY ? EISDIR
+               : nt_status_to_posix_errno(status))
+            : 0;
     }
+
+    if(posix_errno != 0) {
+        /* The path variant reports removing a directory as a file as EPERM
+         * rather than EISDIR. */
+        if(!is_dir && posix_errno == EISDIR) {
+            return EPERM;
+        }
+
+        return posix_errno;
+    }
+
+    disposition.DeleteFile = TRUE;
+
+    if(!SetFileInformationByHandle(handle, FileDispositionInfo,
+                                   &disposition, sizeof(disposition))) {
+        posix_errno = windows_to_posix_errno(GetLastError());
+
+        /* A directory that is not empty reports as EEXIST, as it does for a
+         * path. */
+        if(is_dir && posix_errno == EACCES) {
+            posix_errno = EEXIST;
+        }
+
+        CloseHandle(handle);
+
+        return posix_errno;
+    }
+
+    CloseHandle(handle);
 
     return 0;
-}
-
-posix_errno_t efile_make_dir(const efile_path_t *path) {
-    ASSERT_PATH_FORMAT(path);
-
-    if(!CreateDirectoryW((WCHAR*)path->data, NULL)) {
-        return windows_to_posix_errno(GetLastError());
     }
-
-    return 0;
 }
 
-posix_errno_t efile_del_file(const efile_path_t *path) {
-    ASSERT_PATH_FORMAT(path);
+posix_errno_t efile_del_dir(const efile_target_t *target) {
+    if(target->kind == EFILE_TARGET_PATH) {
+        const efile_path_t *path = &target->name;
 
-    if(!DeleteFileW((WCHAR*)path->data)) {
-        DWORD last_error = GetLastError();
+        ASSERT_PATH_FORMAT(path);
 
-        switch(last_error) {
-        case ERROR_INVALID_NAME:
-            /* Attempted to delete a device or similar. */
-            return EACCES;
-        case ERROR_ACCESS_DENIED:
-            /* Windows NT reports removing a directory as EACCES instead of
-             * EPERM. */
-            if(has_file_attributes(path, FILE_ATTRIBUTE_DIRECTORY)) {
-                return EPERM;
+        if(!RemoveDirectoryW((WCHAR*)path->data)) {
+            DWORD last_error = GetLastError();
+
+            if(last_error == ERROR_DIRECTORY) {
+                return ENOTDIR;
             }
-            break;
+
+            return windows_to_posix_errno(last_error);
         }
 
-        return windows_to_posix_errno(last_error);
+        return 0;
     }
 
-    return 0;
-}
+    {
+        const int is_dir = 1;
+    WCHAR component[MAX_PATH];
+    posix_errno_t posix_errno;
+    HANDLE parent;
+    int owned;
 
-posix_errno_t efile_del_dir(const efile_path_t *path) {
-    ASSERT_PATH_FORMAT(path);
+    posix_errno = resolve_target(target, component, MAX_PATH, &parent, &owned);
 
-    if(!RemoveDirectoryW((WCHAR*)path->data)) {
-        DWORD last_error = GetLastError();
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
 
-        if(last_error == ERROR_DIRECTORY) {
-            return ENOTDIR;
+    FILE_DISPOSITION_INFO disposition;
+    ULONG options;
+    HANDLE handle;
+
+    /* A name is removed by opening it and marking it for deletion, because
+     * DeleteFileW and RemoveDirectoryW both need a path. The reparse point
+     * option removes a link rather than what the link points at. */
+    options = EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_OPEN_REPARSE_POINT;
+
+    if(is_dir) {
+        options |= EFILE_FILE_DIRECTORY_FILE;
+    } else {
+        options |= EFILE_FILE_NON_DIRECTORY_FILE;
+    }
+
+    {
+        NTSTATUS status = open_name_at(parent, component, DELETE, options,
+            EFILE_FILE_OPEN, &handle);
+
+        posix_errno = (status < 0)
+            ? (status == EFILE_STATUS_NOT_A_DIRECTORY ? ENOTDIR
+               : status == EFILE_STATUS_FILE_IS_A_DIRECTORY ? EISDIR
+               : nt_status_to_posix_errno(status))
+            : 0;
+    }
+
+    if(posix_errno != 0) {
+        /* The path variant reports removing a directory as a file as EPERM
+         * rather than EISDIR. */
+        if(!is_dir && posix_errno == EISDIR) {
+            return EPERM;
         }
 
-        return windows_to_posix_errno(last_error);
+        return posix_errno;
     }
 
+    disposition.DeleteFile = TRUE;
+
+    if(!SetFileInformationByHandle(handle, FileDispositionInfo,
+                                   &disposition, sizeof(disposition))) {
+        posix_errno = windows_to_posix_errno(GetLastError());
+
+        /* A directory that is not empty reports as EEXIST, as it does for a
+         * path. */
+        if(is_dir && posix_errno == EACCES) {
+            posix_errno = EEXIST;
+        }
+
+        CloseHandle(handle);
+
+        return posix_errno;
+    }
+
+    CloseHandle(handle);
+
     return 0;
+    }
 }
 
 posix_errno_t efile_set_cwd(const efile_path_t *path) {
