@@ -336,7 +336,7 @@ static posix_errno_t resolve_target(const efile_target_t *target, int flags,
     return resolve_name(&target->name, u->fd, flags, resolved);
 }
 
-#ifdef HAVE_RENAMEAT
+#if defined(HAVE_RENAMEAT) || defined(HAVE_LINKAT)
 /* As resolve_target, but this function answers a target that is a path with
  * the working directory and the path itself. An operation that takes two
  * names can take a path for one of them and a name in a directory for the
@@ -1642,6 +1642,42 @@ static posix_errno_t make_hard_link_path(const efile_path_t *existing_path,
     return 0;
 }
 
+static posix_errno_t make_hard_link_at(const efile_target_t *existing_target,
+        const efile_target_t *new_target) {
+#ifndef HAVE_LINKAT
+    (void)existing_target;
+    (void)new_target;
+
+    return ENOTSUP;
+#else
+    struct efile_resolved existing_resolved, new_resolved;
+    posix_errno_t posix_errno;
+
+    posix_errno = resolve_either(existing_target, 0, &existing_resolved);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    posix_errno = resolve_either(new_target, 0, &new_resolved);
+
+    if(posix_errno != 0) {
+        resolved_release(&existing_resolved);
+        return posix_errno;
+    }
+
+    if(linkat(existing_resolved.parent_fd, existing_resolved.component,
+              new_resolved.parent_fd, new_resolved.component, 0) < 0) {
+        posix_errno = errno;
+    }
+
+    resolved_release(&new_resolved);
+    resolved_release(&existing_resolved);
+
+    return posix_errno;
+#endif
+}
+
 posix_errno_t efile_make_hard_link(const efile_target_t *existing_target,
         const efile_target_t *new_target) {
     if(existing_target->kind == EFILE_TARGET_PATH
@@ -1649,7 +1685,7 @@ posix_errno_t efile_make_hard_link(const efile_target_t *existing_target,
         return make_hard_link_path(&existing_target->name, &new_target->name);
     }
 
-    return EINVAL;
+    return make_hard_link_at(existing_target, new_target);
 }
 
 static posix_errno_t make_soft_link_path(const efile_path_t *existing_path,
@@ -1661,11 +1697,43 @@ static posix_errno_t make_soft_link_path(const efile_path_t *existing_path,
     return 0;
 }
 
+/* The target of a link is stored as it is given, so only the new name is
+ * resolved against a directory. */
+static posix_errno_t make_soft_link_at(const efile_path_t *existing_path,
+        const efile_target_t *new_target) {
+#ifndef HAVE_SYMLINKAT
+    (void)existing_path;
+    (void)new_target;
+
+    return ENOTSUP;
+#else
+    struct efile_resolved new_resolved;
+    posix_errno_t posix_errno;
+
+    posix_errno = resolve_target(new_target, 0, &new_resolved);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    if(symlinkat((const char*)existing_path->data, new_resolved.parent_fd,
+                 new_resolved.component) < 0) {
+        posix_errno = errno;
+    }
+
+    resolved_release(&new_resolved);
+
+    return posix_errno;
+#endif
+}
+
 posix_errno_t efile_make_soft_link(const efile_path_t *existing_path,
         const efile_target_t *new_target) {
     switch(new_target->kind) {
     case EFILE_TARGET_PATH:
         return make_soft_link_path(existing_path, &new_target->name);
+    case EFILE_TARGET_AT:
+        return make_soft_link_at(existing_path, new_target);
     default:
         return EINVAL;
     }

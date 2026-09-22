@@ -55,6 +55,17 @@ typedef struct {
     WCHAR FileName[1];
 } EFILE_FILE_RENAME_INFORMATION_T;
 
+/* The Windows SDK has no structure for a hard link at all, so a link uses the
+ * native call in the same way. */
+#define EFILE_FILE_LINK_INFORMATION ((FILE_INFORMATION_CLASS)11)
+
+typedef struct {
+    BOOLEAN ReplaceIfExists;
+    HANDLE RootDirectory;
+    ULONG FileNameLength;
+    WCHAR FileName[1];
+} EFILE_FILE_LINK_INFORMATION_T;
+
 #define EFILE_FILE_OPEN 0x00000001
 #define EFILE_FILE_CREATE 0x00000002
 #define EFILE_FILE_OPEN_IF 0x00000003
@@ -2205,6 +2216,84 @@ static posix_errno_t make_hard_link_path(const efile_path_t *existing_path,
     return 0;
 }
 
+/* Gives an open file a second name, relative to a directory. */
+static posix_errno_t set_link_information(HANDLE handle, HANDLE new_parent,
+        const WCHAR *new_name) {
+    EFILE_FILE_LINK_INFORMATION_T *link_info;
+    IO_STATUS_BLOCK io_status_block;
+    posix_errno_t posix_errno;
+    size_t name_size, info_size;
+    NTSTATUS status;
+
+    name_size = wcslen(new_name) * sizeof(WCHAR);
+    info_size = sizeof(EFILE_FILE_LINK_INFORMATION_T) + name_size;
+
+    link_info = (EFILE_FILE_LINK_INFORMATION_T*)enif_alloc(info_size);
+
+    if(link_info == NULL) {
+        return ENOMEM;
+    }
+
+    sys_memset(link_info, 0, sizeof(EFILE_FILE_LINK_INFORMATION_T));
+    link_info->ReplaceIfExists = FALSE;
+    link_info->RootDirectory = new_parent;
+    link_info->FileNameLength = (ULONG)name_size;
+    sys_memcpy(link_info->FileName, new_name, name_size);
+
+    sys_memset(&io_status_block, 0, sizeof(io_status_block));
+
+    status = NtSetInformationFile(handle, &io_status_block, link_info,
+        (ULONG)info_size, EFILE_FILE_LINK_INFORMATION);
+
+    posix_errno = NT_SUCCESS(status) ? 0 : nt_status_to_posix_errno(status);
+
+    enif_free(link_info);
+
+    return posix_errno;
+}
+
+static posix_errno_t make_hard_link_at(const efile_target_t *existing_target,
+        const efile_target_t *new_target) {
+    struct efile_resolved existing_resolved, new_resolved;
+    posix_errno_t posix_errno;
+    HANDLE handle;
+    NTSTATUS status;
+
+    posix_errno = resolve_either(existing_target, 0, &existing_resolved);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    posix_errno = resolve_either(new_target, 0, &new_resolved);
+
+    if(posix_errno != 0) {
+        resolved_release(&existing_resolved);
+        return posix_errno;
+    }
+
+    /* The file gets its second name through a handle on it, because
+     * CreateHardLinkW takes two paths. */
+    status = open_name_at(existing_resolved.parent,
+        existing_resolved.component, FILE_READ_ATTRIBUTES,
+        EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_OPEN_REPARSE_POINT,
+        EFILE_FILE_OPEN, &handle);
+
+    if(NT_SUCCESS(status)) {
+        posix_errno = set_link_information(handle, new_resolved.parent,
+                                           new_resolved.component);
+
+        CloseHandle(handle);
+    } else {
+        posix_errno = nt_status_to_posix_errno(status);
+    }
+
+    resolved_release(&new_resolved);
+    resolved_release(&existing_resolved);
+
+    return posix_errno;
+}
+
 posix_errno_t efile_make_hard_link(const efile_target_t *existing_target,
         const efile_target_t *new_target) {
     if(existing_target->kind == EFILE_TARGET_PATH
@@ -2212,7 +2301,7 @@ posix_errno_t efile_make_hard_link(const efile_target_t *existing_target,
         return make_hard_link_path(&existing_target->name, &new_target->name);
     }
 
-    return EINVAL;
+    return make_hard_link_at(existing_target, new_target);
 }
 
 static posix_errno_t make_soft_link_path(const efile_path_t *existing_path,
@@ -2240,6 +2329,12 @@ posix_errno_t efile_make_soft_link(const efile_path_t *existing_path,
     switch(new_target->kind) {
     case EFILE_TARGET_PATH:
         return make_soft_link_path(existing_path, &new_target->name);
+    case EFILE_TARGET_AT:
+        /* CreateSymbolicLinkW takes a path for the new link, and Windows has
+         * no call that makes a link relative to a directory handle. Resolving
+         * the directory back to a path would resolve that path again, which
+         * is what a name in a directory avoids. */
+        return ENOTSUP;
     default:
         return EINVAL;
     }

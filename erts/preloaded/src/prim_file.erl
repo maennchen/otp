@@ -893,13 +893,15 @@ del_dir(Target) ->
     end.
 make_link(Existing, New) ->
     try
-        make_hard_link_nif(encode_path(Existing), encode_path(New))
+        make_hard_link_nif(encode_target(Existing), encode_target(New))
     catch
         error:badarg -> {error, badarg}
     end.
+%% Only the new name belongs to a directory. The target is stored in the link
+%% as it is given, so it is not resolved here.
 make_symlink(Existing, New) ->
     try
-        make_soft_link_nif(encode_path(Existing), encode_path(New))
+        make_soft_link_nif(encode_path(Existing), encode_target(New))
     catch
         error:badarg -> {error, badarg}
     end.

@@ -53,6 +53,7 @@
 	 list_dir/1,list_dir_error/1,list_dir_handle/1,
 	 file_write_handle_info/1,
 	 open_at/1, open_at_symlink/1, read_at/1, write_at/1,
+	 link_at/1,
 	 untranslatable_names/1, untranslatable_names_error/1,
 	 pos1/1, pos2/1, pos3/1]).
 -export([close/1, consult1/1, path_consult/1, delete/1]).
@@ -157,7 +158,8 @@ groups() ->
      {open, [],
       [open1, old_modes, new_modes, path_open, close, access,
        read_write, pread_write, append, open_errors,
-       exclusive, open_at, open_at_symlink, read_at, write_at]},
+       exclusive, open_at, open_at_symlink, read_at, write_at,
+       link_at]},
      {pos, [], [pos1, pos2, pos3]},
      {file_info, [],
       [file_info_basic_file, file_info_basic_directory,
@@ -1268,6 +1270,65 @@ write_at_across_dirs(Dir, TestDir) ->
 
     ok = ?FILE_MODULE:del_dir({Dir, "from"}),
     ok = ?FILE_MODULE:del_dir({Dir, "to"}),
+    ok.
+
+%% make_link/2 and make_symlink/2 take a {Dir, Name} tuple as well.
+link_at(Config) when is_list(Config) ->
+    RootDir = proplists:get_value(priv_dir, Config),
+    TestDir = filename:join(RootDir, ?MODULE_STRING++"_link_at"),
+    ok = ?FILE_MODULE:make_dir(TestDir),
+    ok = ?FILE_MODULE:make_dir(filename:join(TestDir, "other")),
+
+    ok = ?FILE_MODULE:write_file(filename:join(TestDir, "file"), "linked"),
+
+    {ok, Dir} = ?FILE_MODULE:open(TestDir, [raw, read, directory]),
+    {ok, Other} = ?FILE_MODULE:open(filename:join(TestDir, "other"),
+                                    [raw, read, directory]),
+
+    case ?FILE_MODULE:make_link({Dir, "file"}, {Dir, "hard"}) of
+        {error, enotsup} ->
+            ok;
+        ok ->
+            {ok, <<"linked">>} = ?FILE_MODULE:read_file({Dir, "hard"}),
+
+            %% The two names may belong to different open directories.
+            ok = ?FILE_MODULE:make_link({Dir, "file"}, {Other, "hard"}),
+            {ok, <<"linked">>} = ?FILE_MODULE:read_file({Other, "hard"}),
+
+            %% Errors match what the matching path reports.
+            {error, eexist} = ?FILE_MODULE:make_link({Dir, "file"}, {Dir, "hard"}),
+            {error, enoent} = ?FILE_MODULE:make_link({Dir, "missing"}, {Dir, "x"}),
+
+            ok = ?FILE_MODULE:delete({Other, "hard"}),
+            ok = ?FILE_MODULE:delete({Dir, "hard"}),
+            ok
+    end,
+
+    %% Only the new name of a symbolic link belongs to a directory. The target
+    %% is stored in the link as it is given.
+    case ?FILE_MODULE:make_symlink(filename:join(TestDir, "file"),
+                                   {Dir, "soft"}) of
+        {error, enotsup} ->
+            ok;
+        {error, eperm} ->
+            {win32,_} = os:type(),
+            ok;
+        ok ->
+            {ok, SoftTarget} = ?FILE_MODULE:read_link({Dir, "soft"}),
+            "file" = filename:basename(SoftTarget),
+            {ok, <<"linked">>} = ?FILE_MODULE:read_file({Dir, "soft"}),
+            ok = ?FILE_MODULE:delete({Dir, "soft"}),
+            ok
+    end,
+
+    ok = ?FILE_MODULE:close(Other),
+    ok = ?FILE_MODULE:close(Dir),
+
+    ok = ?FILE_MODULE:delete(filename:join(TestDir, "file")),
+    ok = ?FILE_MODULE:del_dir(filename:join(TestDir, "other")),
+    ok = ?FILE_MODULE:del_dir(TestDir),
+
+    [] = flush(),
     ok.
 
 untranslatable_names(Config) ->

@@ -1230,11 +1230,21 @@ Typical error reasons:
 - **`eexist`** - `New` already exists.
 
 - **`enotsup`** - Hard links are not supported on this platform.
+
+`Existing` and `New` can also be `{Dir, Name}` tuples, where `Dir` is a
+directory that was opened with the modes `raw`, `read` and `directory`. The two
+directories do not have to be the same one. See `open/2`.
+
+One of the two can be a `{Dir, Name}` tuple while the other is a path. Not all
+operating systems can do this. Windows returns `{error, enotsup}`.
 """.
 -spec make_link(Existing, New) -> ok | {error, Reason} when
-      Existing :: name_all(),
-      New :: name_all(),
+      Existing :: name_all() | {fd(), name_all()},
+      New :: name_all() | {fd(), name_all()},
       Reason :: posix() | badarg.
+
+make_link(Existing, New) when ?IS_AT_TARGET(Existing); ?IS_AT_TARGET(New) ->
+    either_call(make_link, [either_target(Existing), either_target(New)]);
 
 make_link(Old, New) ->
     check_and_call(make_link, [file_name(Old), file_name(New)]).
@@ -1260,8 +1270,13 @@ Typical error reasons:
 """.
 -spec make_symlink(Existing, New) -> ok | {error, Reason} when
       Existing :: name_all(),
-      New :: name_all(),
+      New :: name_all() | {fd(), name_all()},
       Reason :: posix() | badarg.
+
+make_symlink(Old, New) when ?IS_AT_TARGET(New) ->
+    %% The target of the link is stored as it is given, so only the new name
+    %% belongs to a directory.
+    either_call(make_symlink, [file_name(Old), at_target(New)]);
 
 make_symlink(Old, New) ->
     check_and_call(make_symlink, [file_name(Old), file_name(New)]).

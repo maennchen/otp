@@ -851,6 +851,9 @@
 /* Define to 1 if you have the <limits.h> header file. */
 #undef HAVE_LIMITS_H
 
+/* Define to 1 if you have the 'linkat' function. */
+#undef HAVE_LINKAT
+
 /* Define to 1 if you have the <linux/errqueue.h> header file. */
 #undef HAVE_LINUX_ERRQUEUE_H
 
@@ -1212,6 +1215,9 @@
 
 /* Define to 1 if 'sun_path' is a member of 'struct sockaddr_un'. */
 #undef HAVE_STRUCT_SOCKADDR_UN_SUN_PATH
+
+/* Define to 1 if you have the 'symlinkat' function. */
+#undef HAVE_SYMLINKAT
 
 /* Define to 1 if you have the <syslog.h> header file. */
 #undef HAVE_SYSLOG_H

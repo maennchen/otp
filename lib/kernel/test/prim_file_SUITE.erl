@@ -43,7 +43,7 @@
 	 list_dir/1,
 	 list_dir_handle/1]).
 
--export([open_at/1, read_at/1, write_at/1]).
+-export([open_at/1, read_at/1, write_at/1, link_at/1]).
 
 -export([file_write_handle_info/1]).
 
@@ -68,7 +68,7 @@ all() ->
     [read_write_file, {group, dirs}, {group, files},
      delete, rename, {group, errors}, {group, links},
      list_dir_limit, list_dir, list_dir_handle, adopt, open_at, read_at,
-     write_at].
+     write_at, link_at].
 
 groups() -> 
     [{dirs, [],
@@ -2185,6 +2185,75 @@ write_at_mixed(Dir, TestDir) ->
     end,
 
     ok = ?PRIM_FILE:delete({Dir, "by_name"}),
+    ok.
+
+%% Tests that make_link/2 and make_symlink/2 take a name in an open directory.
+link_at(Config) ->
+    RootDir = proplists:get_value(priv_dir, Config),
+    TestDir = filename:join(RootDir, ?MODULE_STRING++"_link_at"),
+    ok = ?PRIM_FILE:make_dir(TestDir),
+    ok = ?PRIM_FILE:make_dir(filename:join(TestDir, "other")),
+    ok = ?PRIM_FILE:write_file(filename:join(TestDir, "file"), "linked"),
+
+    {ok, Dir} = ?PRIM_FILE:open(TestDir, [read, directory]),
+    {ok, Other} = ?PRIM_FILE:open(filename:join(TestDir, "other"),
+                                  [read, directory]),
+
+    case ?PRIM_FILE:make_link({Dir, "file"}, {Dir, "hard"}) of
+        {error, enotsup} ->
+            ok;
+        ok ->
+            {ok, <<"linked">>} = ?PRIM_FILE:read_file({Dir, "hard"}),
+            {ok, #file_info{links = 2}} = ?PRIM_FILE:read_file_info({Dir, "hard"}),
+
+            %% The two names may belong to different open directories.
+            ok = ?PRIM_FILE:make_link({Dir, "file"}, {Other, "hard"}),
+            {ok, <<"linked">>} = ?PRIM_FILE:read_file({Other, "hard"}),
+
+            %% Errors match what the matching path reports.
+            {error, eexist} = ?PRIM_FILE:make_link({Dir, "file"}, {Dir, "hard"}),
+            {error, enoent} = ?PRIM_FILE:make_link({Dir, "missing"}, {Dir, "x"}),
+
+            %% One of the two names may be a path, where the operating system
+            %% can do that.
+            case ?PRIM_FILE:make_link({Dir, "file"},
+                                      filename:join(TestDir, "by_path")) of
+                ok ->
+                    {ok, <<"linked">>} =
+                        ?PRIM_FILE:read_file(filename:join(TestDir, "by_path")),
+                    ok = ?PRIM_FILE:delete({Dir, "by_path"});
+                {error, enotsup} ->
+                    {win32, _} = os:type()
+            end,
+
+            ok = ?PRIM_FILE:delete({Other, "hard"}),
+            ok = ?PRIM_FILE:delete({Dir, "hard"}),
+            ok
+    end,
+
+    %% Only the new name of a symbolic link belongs to a directory. The target
+    %% is stored in the link as it is given.
+    case ?PRIM_FILE:make_symlink("file", {Dir, "soft"}) of
+        {error, enotsup} ->
+            ok;
+        {error, eperm} ->
+            {win32,_} = os:type(),
+            ok;
+        ok ->
+            {ok, "file"} = ?PRIM_FILE:read_link({Dir, "soft"}),
+            {ok, <<"linked">>} = ?PRIM_FILE:read_file({Dir, "soft"}),
+            {ok, #file_info{type = symlink}} =
+                ?PRIM_FILE:read_link_info({Dir, "soft"}),
+            ok = ?PRIM_FILE:delete({Dir, "soft"}),
+            ok
+    end,
+
+    ok = ?PRIM_FILE:close(Other),
+    ok = ?PRIM_FILE:close(Dir),
+
+    ok = ?PRIM_FILE:delete(filename:join(TestDir, "file")),
+    ok = ?PRIM_FILE:del_dir(filename:join(TestDir, "other")),
+    ok = ?PRIM_FILE:del_dir(TestDir),
     ok.
 
 %%%
