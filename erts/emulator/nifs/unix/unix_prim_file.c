@@ -602,8 +602,8 @@ static posix_errno_t resolve_in_root(efile_data_t *root,
     posix_errno_t posix_errno;
     struct root_walk walk;
     char name[PATH_MAX];
-    const char *last;
-    size_t last_length;
+    const char *last = NULL;
+    size_t last_length = 0;
 
     if(path->size > sizeof(name)) {
         return ENAMETOOLONG;
