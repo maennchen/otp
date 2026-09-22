@@ -441,8 +441,9 @@ static int is_path_root(const efile_path_t *path) {
     return path_iterator >= path_end && !IS_SLASH(path_start[length - 1]);
 }
 
-posix_errno_t efile_open(const efile_path_t *path, enum efile_modes_t modes,
-        ErlNifResourceType *nif_type, efile_data_t **d) {
+static posix_errno_t open_path(const efile_path_t *path,
+        enum efile_modes_t modes, ErlNifResourceType *nif_type,
+        efile_data_t **d) {
 
     DWORD attributes, access_flags, open_mode;
     HANDLE handle;
@@ -527,6 +528,17 @@ static void tmp_nop_invalid_parameter_handler(const wchar_t* expression,
     (void)file;
     (void)line;
     (void)pReserved;
+}
+
+posix_errno_t efile_open(const efile_target_t *target, enum efile_modes_t modes,
+        ErlNifResourceType *nif_type, efile_data_t **d) {
+    switch(target->kind) {
+    case EFILE_TARGET_PATH:
+        return open_path(&target->name, modes, nif_type, d);
+    default:
+        (*d) = NULL;
+        return EINVAL;
+    }
 }
 
 posix_errno_t efile_from_fd(int fd,
@@ -926,7 +938,8 @@ static void build_file_info_times(BY_HANDLE_FILE_INFORMATION *native_file_info, 
     }
 }
 
-posix_errno_t efile_read_info(const efile_path_t *path, int follow_links, efile_fileinfo_t *result) {
+static posix_errno_t read_info_path(const efile_path_t *path, int follow_links,
+        efile_fileinfo_t *result) {
     BY_HANDLE_FILE_INFORMATION native_file_info;
     DWORD attributes;
     int is_link;
@@ -982,7 +995,7 @@ posix_errno_t efile_read_info(const efile_path_t *path, int follow_links, efile_
             CloseHandle(handle);
 
             if(posix_errno == 0) {
-                posix_errno = efile_read_info(&resolved_path, 0, result);
+                posix_errno = read_info_path(&resolved_path, 0, result);
                 enif_release_binary(&resolved_path);
             }
 
@@ -998,6 +1011,16 @@ posix_errno_t efile_read_info(const efile_path_t *path, int follow_links, efile_
     build_file_info(&native_file_info, path, is_link, result);
 
     return 0;
+}
+
+posix_errno_t efile_read_info(const efile_target_t *target, int follow_links,
+        efile_fileinfo_t *result) {
+    switch(target->kind) {
+    case EFILE_TARGET_PATH:
+        return read_info_path(&target->name, follow_links, result);
+    default:
+        return EINVAL;
+    }
 }
 
 posix_errno_t efile_read_handle_info(efile_data_t *d, efile_fileinfo_t *result) {
@@ -1022,8 +1045,8 @@ posix_errno_t efile_read_handle_info(efile_data_t *d, efile_fileinfo_t *result) 
         posix_errno = 0;
     } else if(is_path_root(&path)) {
         /* GetFileInformationByHandle is not supported on path roots, so
-         * fall back to efile_read_info. */
-        posix_errno = efile_read_info(&path, 0, result);
+         * fall back to read_info_path. */
+        posix_errno = read_info_path(&path, 0, result);
     } else {
         posix_errno = windows_to_posix_errno(GetLastError());
     }
@@ -1066,7 +1089,8 @@ static posix_errno_t set_handle_permissions(HANDLE handle, Uint32 permissions) {
     return 0;
 }
 
-posix_errno_t efile_set_permissions(const efile_path_t *path, Uint32 permissions) {
+static posix_errno_t set_permissions_path(const efile_path_t *path,
+        Uint32 permissions) {
     DWORD attributes = GetFileAttributesW((WCHAR*)path->data);
 
     if(attributes == INVALID_FILE_ATTRIBUTES) {
@@ -1086,18 +1110,37 @@ posix_errno_t efile_set_permissions(const efile_path_t *path, Uint32 permissions
     return windows_to_posix_errno(GetLastError());
 }
 
+posix_errno_t efile_set_permissions(const efile_target_t *target, Uint32 permissions) {
+    switch(target->kind) {
+    case EFILE_TARGET_PATH:
+        return set_permissions_path(&target->name, permissions);
+    default:
+        return EINVAL;
+    }
+}
+
 posix_errno_t efile_set_handle_permissions(efile_data_t *d, Uint32 permissions) {
     efile_win_t *w = (efile_win_t*)d;
 
     return set_handle_permissions(w->handle, permissions);
 }
 
-posix_errno_t efile_set_owner(const efile_path_t *path, Sint32 owner, Sint32 group) {
+static posix_errno_t set_owner_path(const efile_path_t *path, Sint32 owner,
+        Sint32 group) {
     (void)path;
     (void)owner;
     (void)group;
 
     return 0;
+}
+
+posix_errno_t efile_set_owner(const efile_target_t *target, Sint32 owner, Sint32 group) {
+    switch(target->kind) {
+    case EFILE_TARGET_PATH:
+        return set_owner_path(&target->name, owner, group);
+    default:
+        return EINVAL;
+    }
 }
 
 posix_errno_t efile_set_handle_owner(efile_data_t *d, Sint32 owner, Sint32 group) {
@@ -1126,7 +1169,8 @@ static posix_errno_t set_handle_time(HANDLE handle, Sint64 a_time,
     return 0;
 }
 
-posix_errno_t efile_set_time(const efile_path_t *path, Sint64 a_time, Sint64 m_time, Sint64 c_time) {
+static posix_errno_t set_time_path(const efile_path_t *path, Sint64 a_time,
+        Sint64 m_time, Sint64 c_time) {
     FILETIME accessed, modified, created;
     DWORD last_error, attributes;
     HANDLE handle;
@@ -1172,6 +1216,16 @@ posix_errno_t efile_set_time(const efile_path_t *path, Sint64 a_time, Sint64 m_t
     return windows_to_posix_errno(last_error);
 }
 
+posix_errno_t efile_set_time(const efile_target_t *target, Sint64 a_time,
+        Sint64 m_time, Sint64 c_time) {
+    switch(target->kind) {
+    case EFILE_TARGET_PATH:
+        return set_time_path(&target->name, a_time, m_time, c_time);
+    default:
+        return EINVAL;
+    }
+}
+
 posix_errno_t efile_set_handle_time(efile_data_t *d, Sint64 a_time, Sint64 m_time,
         Sint64 c_time) {
     efile_win_t *w = (efile_win_t*)d;
@@ -1213,7 +1267,8 @@ static posix_errno_t internal_read_link(HANDLE link_handle, efile_path_t *result
     return 0;
 }
 
-posix_errno_t efile_read_link(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_TERM *result) {
+static posix_errno_t read_link_path(ErlNifEnv *env, const efile_path_t *path,
+        ERL_NIF_TERM *result) {
     posix_errno_t posix_errno;
     ErlNifBinary result_bin;
     DWORD attributes;
@@ -1258,7 +1313,18 @@ posix_errno_t efile_read_link(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_
     return posix_errno;
 }
 
-posix_errno_t efile_list_dir(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_TERM *result) {
+posix_errno_t efile_read_link(ErlNifEnv *env, const efile_target_t *target,
+        ERL_NIF_TERM *result) {
+    switch(target->kind) {
+    case EFILE_TARGET_PATH:
+        return read_link_path(env, &target->name, result);
+    default:
+        return EINVAL;
+    }
+}
+
+static posix_errno_t list_dir_path(ErlNifEnv *env, const efile_path_t *path,
+        ERL_NIF_TERM *result) {
     ERL_NIF_TERM list_head;
     WIN32_FIND_DATAW data;
     HANDLE search_handle;
@@ -1327,7 +1393,7 @@ static posix_errno_t list_handle_dir(ErlNifEnv *env, HANDLE handle,
         return posix_errno;
     }
 
-    posix_errno = efile_list_dir(env, &path, result);
+    posix_errno = list_dir_path(env, &path, result);
 
     enif_release_binary(&path);
 
@@ -1340,7 +1406,18 @@ posix_errno_t efile_list_handle_dir(ErlNifEnv *env, efile_data_t *d, ERL_NIF_TER
     return list_handle_dir(env, w->handle, result);
 }
 
-posix_errno_t efile_rename(const efile_path_t *old_path, const efile_path_t *new_path) {
+posix_errno_t efile_list_dir(ErlNifEnv *env, const efile_target_t *target,
+        ERL_NIF_TERM *result) {
+    switch(target->kind) {
+    case EFILE_TARGET_PATH:
+        return list_dir_path(env, &target->name, result);
+    default:
+        return EINVAL;
+    }
+}
+
+static posix_errno_t rename_path(const efile_path_t *old_path,
+        const efile_path_t *new_path) {
     BOOL old_is_directory, new_is_directory;
     DWORD move_flags, last_error;
 
@@ -1396,7 +1473,7 @@ posix_errno_t efile_rename(const efile_path_t *old_path, const efile_path_t *new
         } else if(old_is_directory && new_is_directory) {
             /* This will fail if the destination isn't empty. */
             if(RemoveDirectoryW((WCHAR*)new_path->data)) {
-                return efile_rename(old_path, new_path);
+                return rename_path(old_path, new_path);
             }
 
             return EEXIST;
@@ -1469,7 +1546,18 @@ posix_errno_t efile_rename(const efile_path_t *old_path, const efile_path_t *new
     return windows_to_posix_errno(last_error);
 }
 
-posix_errno_t efile_make_hard_link(const efile_path_t *existing_path, const efile_path_t *new_path) {
+posix_errno_t efile_rename(const efile_target_t *old_target,
+        const efile_target_t *new_target) {
+    if(old_target->kind == EFILE_TARGET_PATH
+       && new_target->kind == EFILE_TARGET_PATH) {
+        return rename_path(&old_target->name, &new_target->name);
+    }
+
+    return EINVAL;
+}
+
+static posix_errno_t make_hard_link_path(const efile_path_t *existing_path,
+        const efile_path_t *new_path) {
     ASSERT_PATH_FORMAT(existing_path);
     ASSERT_PATH_FORMAT(new_path);
 
@@ -1480,7 +1568,18 @@ posix_errno_t efile_make_hard_link(const efile_path_t *existing_path, const efil
     return 0;
 }
 
-posix_errno_t efile_make_soft_link(const efile_path_t *existing_path, const efile_path_t *new_path) {
+posix_errno_t efile_make_hard_link(const efile_target_t *existing_target,
+        const efile_target_t *new_target) {
+    if(existing_target->kind == EFILE_TARGET_PATH
+       && new_target->kind == EFILE_TARGET_PATH) {
+        return make_hard_link_path(&existing_target->name, &new_target->name);
+    }
+
+    return EINVAL;
+}
+
+static posix_errno_t make_soft_link_path(const efile_path_t *existing_path,
+        const efile_path_t *new_path) {
     DWORD link_flags;
 
     ASSERT_PATH_FORMAT(existing_path);
@@ -1499,7 +1598,17 @@ posix_errno_t efile_make_soft_link(const efile_path_t *existing_path, const efil
     return 0;
 }
 
-posix_errno_t efile_make_dir(const efile_path_t *path) {
+posix_errno_t efile_make_soft_link(const efile_path_t *existing_path,
+        const efile_target_t *new_target) {
+    switch(new_target->kind) {
+    case EFILE_TARGET_PATH:
+        return make_soft_link_path(existing_path, &new_target->name);
+    default:
+        return EINVAL;
+    }
+}
+
+static posix_errno_t make_dir_path(const efile_path_t *path) {
     ASSERT_PATH_FORMAT(path);
 
     if(!CreateDirectoryW((WCHAR*)path->data, NULL)) {
@@ -1509,7 +1618,16 @@ posix_errno_t efile_make_dir(const efile_path_t *path) {
     return 0;
 }
 
-posix_errno_t efile_del_file(const efile_path_t *path) {
+posix_errno_t efile_make_dir(const efile_target_t *target) {
+    switch(target->kind) {
+    case EFILE_TARGET_PATH:
+        return make_dir_path(&target->name);
+    default:
+        return EINVAL;
+    }
+}
+
+static posix_errno_t del_file_path(const efile_path_t *path) {
     ASSERT_PATH_FORMAT(path);
 
     if(!DeleteFileW((WCHAR*)path->data)) {
@@ -1534,7 +1652,16 @@ posix_errno_t efile_del_file(const efile_path_t *path) {
     return 0;
 }
 
-posix_errno_t efile_del_dir(const efile_path_t *path) {
+posix_errno_t efile_del_file(const efile_target_t *target) {
+    switch(target->kind) {
+    case EFILE_TARGET_PATH:
+        return del_file_path(&target->name);
+    default:
+        return EINVAL;
+    }
+}
+
+static posix_errno_t del_dir_path(const efile_path_t *path) {
     ASSERT_PATH_FORMAT(path);
 
     if(!RemoveDirectoryW((WCHAR*)path->data)) {
@@ -1548,6 +1675,15 @@ posix_errno_t efile_del_dir(const efile_path_t *path) {
     }
 
     return 0;
+}
+
+posix_errno_t efile_del_dir(const efile_target_t *target) {
+    switch(target->kind) {
+    case EFILE_TARGET_PATH:
+        return del_dir_path(&target->name);
+    default:
+        return EINVAL;
+    }
 }
 
 posix_errno_t efile_set_cwd(const efile_path_t *path) {

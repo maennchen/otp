@@ -170,8 +170,9 @@ static int get_flags(enum efile_modes_t modes) {
     return flags;
 }
 
-posix_errno_t efile_open(const efile_path_t *path, enum efile_modes_t modes,
-        ErlNifResourceType *nif_type, efile_data_t **d) {
+static posix_errno_t open_path(const efile_path_t *path,
+        enum efile_modes_t modes, ErlNifResourceType *nif_type,
+        efile_data_t **d) {
 
     int mode, flags, fd;
 
@@ -223,6 +224,17 @@ posix_errno_t efile_open(const efile_path_t *path, enum efile_modes_t modes,
 
     (*d) = NULL;
     return errno;
+}
+
+posix_errno_t efile_open(const efile_target_t *target, enum efile_modes_t modes,
+        ErlNifResourceType *nif_type, efile_data_t **d) {
+    switch(target->kind) {
+    case EFILE_TARGET_PATH:
+        return open_path(&target->name, modes, nif_type, d);
+    default:
+        (*d) = NULL;
+        return EINVAL;
+    }
 }
 
 posix_errno_t efile_from_fd(int fd,
@@ -736,7 +748,8 @@ static void build_file_info(struct stat *data, efile_fileinfo_t *result) {
     result->gid = data->st_gid;
 }
 
-posix_errno_t efile_read_info(const efile_path_t *path, int follow_links, efile_fileinfo_t *result) {
+static posix_errno_t read_info_path(const efile_path_t *path, int follow_links,
+        efile_fileinfo_t *result) {
     struct stat data;
 
     if(follow_links) {
@@ -800,6 +813,16 @@ static int check_access(struct stat *st) {
     return ret;
 }
 
+posix_errno_t efile_read_info(const efile_target_t *target, int follow_links,
+        efile_fileinfo_t *result) {
+    switch(target->kind) {
+    case EFILE_TARGET_PATH:
+        return read_info_path(&target->name, follow_links, result);
+    default:
+        return EINVAL;
+    }
+}
+
 posix_errno_t efile_read_handle_info(efile_data_t *d, efile_fileinfo_t *result) {
     struct stat data;
     efile_unix_t *u = (efile_unix_t*)d;
@@ -821,7 +844,8 @@ posix_errno_t efile_read_handle_info(efile_data_t *d, efile_fileinfo_t *result) 
 #define EFILE_MUTABLE_MODES \
     (S_ISUID | S_ISGID | S_IRWXU | S_IRWXG | S_IRWXO)
 
-posix_errno_t efile_set_permissions(const efile_path_t *path, Uint32 permissions) {
+static posix_errno_t set_permissions_path(const efile_path_t *path,
+        Uint32 permissions) {
     mode_t new_modes = permissions & EFILE_MUTABLE_MODES;
 
     if(chmod((const char*)path->data, new_modes) < 0) {
@@ -833,6 +857,15 @@ posix_errno_t efile_set_permissions(const efile_path_t *path, Uint32 permissions
     }
 
     return 0;
+}
+
+posix_errno_t efile_set_permissions(const efile_target_t *target, Uint32 permissions) {
+    switch(target->kind) {
+    case EFILE_TARGET_PATH:
+        return set_permissions_path(&target->name, permissions);
+    default:
+        return EINVAL;
+    }
 }
 
 posix_errno_t efile_set_handle_permissions(efile_data_t *d, Uint32 permissions) {
@@ -852,12 +885,22 @@ posix_errno_t efile_set_handle_permissions(efile_data_t *d, Uint32 permissions) 
     return 0;
 }
 
-posix_errno_t efile_set_owner(const efile_path_t *path, Sint32 owner, Sint32 group) {
+static posix_errno_t set_owner_path(const efile_path_t *path, Sint32 owner,
+        Sint32 group) {
     if(chown((const char*)path->data, owner, group) < 0) {
         return errno;
     }
 
     return 0;
+}
+
+posix_errno_t efile_set_owner(const efile_target_t *target, Sint32 owner, Sint32 group) {
+    switch(target->kind) {
+    case EFILE_TARGET_PATH:
+        return set_owner_path(&target->name, owner, group);
+    default:
+        return EINVAL;
+    }
 }
 
 posix_errno_t efile_set_handle_owner(efile_data_t *d, Sint32 owner, Sint32 group) {
@@ -870,7 +913,8 @@ posix_errno_t efile_set_handle_owner(efile_data_t *d, Sint32 owner, Sint32 group
     return 0;
 }
 
-posix_errno_t efile_set_time(const efile_path_t *path, Sint64 a_time, Sint64 m_time, Sint64 c_time) {
+static posix_errno_t set_time_path(const efile_path_t *path, Sint64 a_time,
+        Sint64 m_time, Sint64 c_time) {
     struct utimbuf tval;
 
     tval.actime = (time_t)a_time;
@@ -883,6 +927,16 @@ posix_errno_t efile_set_time(const efile_path_t *path, Sint64 a_time, Sint64 m_t
     }
 
     return 0;
+}
+
+posix_errno_t efile_set_time(const efile_target_t *target, Sint64 a_time,
+        Sint64 m_time, Sint64 c_time) {
+    switch(target->kind) {
+    case EFILE_TARGET_PATH:
+        return set_time_path(&target->name, a_time, m_time, c_time);
+    default:
+        return EINVAL;
+    }
 }
 
 posix_errno_t efile_set_handle_time(efile_data_t *d, Sint64 a_time, Sint64 m_time,
@@ -932,7 +986,8 @@ posix_errno_t efile_set_handle_time(efile_data_t *d, Sint64 a_time, Sint64 m_tim
 #endif
 }
 
-posix_errno_t efile_read_link(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_TERM *result) {
+static posix_errno_t read_link_path(ErlNifEnv *env, const efile_path_t *path,
+        ERL_NIF_TERM *result) {
     ErlNifBinary result_bin;
 
     if(!enif_alloc_binary(256, &result_bin)) {
@@ -967,6 +1022,16 @@ posix_errno_t efile_read_link(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_
             enif_release_binary(&result_bin);
             return ENOMEM;
         }
+    }
+}
+
+posix_errno_t efile_read_link(ErlNifEnv *env, const efile_target_t *target,
+        ERL_NIF_TERM *result) {
+    switch(target->kind) {
+    case EFILE_TARGET_PATH:
+        return read_link_path(env, &target->name, result);
+    default:
+        return EINVAL;
     }
 }
 
@@ -1011,7 +1076,8 @@ static posix_errno_t list_dir_stream(ErlNifEnv *env, DIR *dir_stream, ERL_NIF_TE
     return 0;
 }
 
-posix_errno_t efile_list_dir(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_TERM *result) {
+static posix_errno_t list_dir_path(ErlNifEnv *env, const efile_path_t *path,
+        ERL_NIF_TERM *result) {
     DIR *dir_stream;
 
     dir_stream = opendir((const char*)path->data);
@@ -1022,6 +1088,16 @@ posix_errno_t efile_list_dir(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_T
     }
 
     return list_dir_stream(env, dir_stream, result);
+}
+
+posix_errno_t efile_list_dir(ErlNifEnv *env, const efile_target_t *target,
+        ERL_NIF_TERM *result) {
+    switch(target->kind) {
+    case EFILE_TARGET_PATH:
+        return list_dir_path(env, &target->name, result);
+    default:
+        return EINVAL;
+    }
 }
 
 posix_errno_t efile_list_handle_dir(ErlNifEnv *env, efile_data_t *d, ERL_NIF_TERM *result) {
@@ -1061,7 +1137,8 @@ posix_errno_t efile_list_handle_dir(ErlNifEnv *env, efile_data_t *d, ERL_NIF_TER
 #endif
 }
 
-posix_errno_t efile_rename(const efile_path_t *old_path, const efile_path_t *new_path) {
+static posix_errno_t rename_path(const efile_path_t *old_path,
+        const efile_path_t *new_path) {
     if(rename((const char*)old_path->data, (const char*)new_path->data) < 0) {
         if(errno == ENOTEMPTY) {
             return EEXIST;
@@ -1079,7 +1156,18 @@ posix_errno_t efile_rename(const efile_path_t *old_path, const efile_path_t *new
     return 0;
 }
 
-posix_errno_t efile_make_hard_link(const efile_path_t *existing_path, const efile_path_t *new_path) {
+posix_errno_t efile_rename(const efile_target_t *old_target,
+        const efile_target_t *new_target) {
+    if(old_target->kind == EFILE_TARGET_PATH
+       && new_target->kind == EFILE_TARGET_PATH) {
+        return rename_path(&old_target->name, &new_target->name);
+    }
+
+    return EINVAL;
+}
+
+static posix_errno_t make_hard_link_path(const efile_path_t *existing_path,
+        const efile_path_t *new_path) {
     if(link((const char*)existing_path->data, (const char*)new_path->data) < 0) {
         return errno;
     }
@@ -1087,7 +1175,18 @@ posix_errno_t efile_make_hard_link(const efile_path_t *existing_path, const efil
     return 0;
 }
 
-posix_errno_t efile_make_soft_link(const efile_path_t *existing_path, const efile_path_t *new_path) {
+posix_errno_t efile_make_hard_link(const efile_target_t *existing_target,
+        const efile_target_t *new_target) {
+    if(existing_target->kind == EFILE_TARGET_PATH
+       && new_target->kind == EFILE_TARGET_PATH) {
+        return make_hard_link_path(&existing_target->name, &new_target->name);
+    }
+
+    return EINVAL;
+}
+
+static posix_errno_t make_soft_link_path(const efile_path_t *existing_path,
+        const efile_path_t *new_path) {
     if(symlink((const char*)existing_path->data, (const char*)new_path->data) < 0) {
         return errno;
     }
@@ -1095,7 +1194,17 @@ posix_errno_t efile_make_soft_link(const efile_path_t *existing_path, const efil
     return 0;
 }
 
-posix_errno_t efile_make_dir(const efile_path_t *path) {
+posix_errno_t efile_make_soft_link(const efile_path_t *existing_path,
+        const efile_target_t *new_target) {
+    switch(new_target->kind) {
+    case EFILE_TARGET_PATH:
+        return make_soft_link_path(existing_path, &new_target->name);
+    default:
+        return EINVAL;
+    }
+}
+
+static posix_errno_t make_dir_path(const efile_path_t *path) {
 #ifdef NO_MKDIR_MODE
     if(mkdir((const char*)path->data) < 0) {
 #else
@@ -1107,7 +1216,16 @@ posix_errno_t efile_make_dir(const efile_path_t *path) {
     return 0;
 }
 
-posix_errno_t efile_del_file(const efile_path_t *path) {
+posix_errno_t efile_make_dir(const efile_target_t *target) {
+    switch(target->kind) {
+    case EFILE_TARGET_PATH:
+        return make_dir_path(&target->name);
+    default:
+        return EINVAL;
+    }
+}
+
+static posix_errno_t del_file_path(const efile_path_t *path) {
     if(unlink((const char*)path->data) < 0) {
         /* Linux sets the wrong error code. */
         if(errno == EISDIR) {
@@ -1120,7 +1238,16 @@ posix_errno_t efile_del_file(const efile_path_t *path) {
     return 0;
 }
 
-posix_errno_t efile_del_dir(const efile_path_t *path) {
+posix_errno_t efile_del_file(const efile_target_t *target) {
+    switch(target->kind) {
+    case EFILE_TARGET_PATH:
+        return del_file_path(&target->name);
+    default:
+        return EINVAL;
+    }
+}
+
+static posix_errno_t del_dir_path(const efile_path_t *path) {
     if(rmdir((const char*)path->data) < 0) {
         posix_errno_t saved_errno = errno;
 
@@ -1148,6 +1275,15 @@ posix_errno_t efile_del_dir(const efile_path_t *path) {
     }
 
     return 0;
+}
+
+posix_errno_t efile_del_dir(const efile_target_t *target) {
+    switch(target->kind) {
+    case EFILE_TARGET_PATH:
+        return del_dir_path(&target->name);
+    default:
+        return EINVAL;
+    }
 }
 
 posix_errno_t efile_set_cwd(const efile_path_t *path) {

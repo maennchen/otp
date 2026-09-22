@@ -122,6 +122,20 @@ typedef struct {
 
 typedef ErlNifBinary efile_path_t;
 
+/* What a file operation acts on. The kind says how the name is resolved. An
+ * operation gives EINVAL for a kind it does not take.
+ *
+ * EFILE_TARGET_PATH: the name is a path, which the operating system resolves
+ * as it always has. */
+enum efile_target_kind_t {
+    EFILE_TARGET_PATH
+};
+
+typedef struct {
+    enum efile_target_kind_t kind;
+    efile_path_t name;
+} efile_target_t;
+
 /** @brief Translates the given "raw name" into the format expected by the APIs
  * used by the underlying implementation. The result is transient and does not
  * need to be released.
@@ -173,7 +187,7 @@ int efile_advise(efile_data_t *d, Sint64 offset, Sint64 length, enum efile_advis
 int efile_allocate(efile_data_t *d, Sint64 offset, Sint64 length);
 int efile_truncate(efile_data_t *d);
 
-posix_errno_t efile_open(const efile_path_t *path, enum efile_modes_t modes,
+posix_errno_t efile_open(const efile_target_t *target, enum efile_modes_t modes,
         ErlNifResourceType *nif_type, efile_data_t **d);
 
 posix_errno_t efile_from_fd(int fd,
@@ -189,12 +203,14 @@ int efile_close(efile_data_t *d, posix_errno_t *error);
 
 /* **** **** **** **** **** **** **** **** **** **** **** **** **** **** **** */
 
-posix_errno_t efile_read_info(const efile_path_t *path, int follow_link, efile_fileinfo_t *result);
+posix_errno_t efile_read_info(const efile_target_t *target, int follow_link,
+        efile_fileinfo_t *result);
 posix_errno_t efile_read_handle_info(efile_data_t *d, efile_fileinfo_t *result);
 
 /** @brief Sets the file times to the given values. Refer to efile_fileinfo_t
  * for a description of each. */
-posix_errno_t efile_set_time(const efile_path_t *path, Sint64 a_time, Sint64 m_time, Sint64 c_time);
+posix_errno_t efile_set_time(const efile_target_t *target, Sint64 a_time,
+        Sint64 m_time, Sint64 c_time);
 
 /** @brief As \c efile_set_time, but on a file that is already open.
  *
@@ -205,7 +221,7 @@ posix_errno_t efile_set_handle_time(efile_data_t *d, Sint64 a_time, Sint64 m_tim
 /** @brief On Unix, this sets the file permissions according to the docs for
  * file:write_file_info/2. On Windows it uses the "owner write permission" flag
  * to toggle whether the file is read-only or not. */
-posix_errno_t efile_set_permissions(const efile_path_t *path, Uint32 permissions);
+posix_errno_t efile_set_permissions(const efile_target_t *target, Uint32 permissions);
 
 /** @brief As \c efile_set_permissions, but on a file that is already open.
  *
@@ -215,7 +231,7 @@ posix_errno_t efile_set_handle_permissions(efile_data_t *d, Uint32 permissions);
 
 /** @brief On Unix, this will set the owner/group to the given values. It will
  * do nothing on other platforms. */
-posix_errno_t efile_set_owner(const efile_path_t *path, Sint32 owner, Sint32 group);
+posix_errno_t efile_set_owner(const efile_target_t *target, Sint32 owner, Sint32 group);
 
 /** @brief As \c efile_set_owner, but on a file that is already open.
  *
@@ -224,12 +240,14 @@ posix_errno_t efile_set_owner(const efile_path_t *path, Sint32 owner, Sint32 gro
 posix_errno_t efile_set_handle_owner(efile_data_t *d, Sint32 owner, Sint32 group);
 
 /** @brief Resolves the final path of the given link. */
-posix_errno_t efile_read_link(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_TERM *result);
+posix_errno_t efile_read_link(ErlNifEnv *env, const efile_target_t *target,
+        ERL_NIF_TERM *result);
 
 /** @brief Lists the contents of the given directory.
  * @param result [out] A list of all the directory/file names contained in the
  * given directory. */
-posix_errno_t efile_list_dir(ErlNifEnv *env, const efile_path_t *path, ERL_NIF_TERM *result);
+posix_errno_t efile_list_dir(ErlNifEnv *env, const efile_target_t *target,
+        ERL_NIF_TERM *result);
 
 /** @brief Lists the contents of a directory that has already been opened with
  * EFILE_MODE_DIRECTORY.
@@ -269,14 +287,17 @@ posix_errno_t efile_list_handle_dir(ErlNifEnv *env, efile_data_t *d, ERL_NIF_TER
  * The implementation of rename may allow cross-filesystem renames,
  * but the caller should be prepared to emulate it with copy and
  * delete if errno is EXDEV. */
-posix_errno_t efile_rename(const efile_path_t *old_path, const efile_path_t *new_path);
+posix_errno_t efile_rename(const efile_target_t *old_target,
+        const efile_target_t *new_target);
 
-posix_errno_t efile_make_hard_link(const efile_path_t *existing_path, const efile_path_t *new_path);
-posix_errno_t efile_make_soft_link(const efile_path_t *existing_path, const efile_path_t *new_path);
-posix_errno_t efile_make_dir(const efile_path_t *path);
+posix_errno_t efile_make_hard_link(const efile_target_t *existing_target,
+        const efile_target_t *new_target);
+posix_errno_t efile_make_soft_link(const efile_path_t *existing_path,
+        const efile_target_t *new_target);
+posix_errno_t efile_make_dir(const efile_target_t *target);
 
-posix_errno_t efile_del_file(const efile_path_t *path);
-posix_errno_t efile_del_dir(const efile_path_t *path);
+posix_errno_t efile_del_file(const efile_target_t *target);
+posix_errno_t efile_del_dir(const efile_target_t *target);
 
 posix_errno_t efile_get_cwd(ErlNifEnv *env, ERL_NIF_TERM *result);
 posix_errno_t efile_set_cwd(const efile_path_t *path);
