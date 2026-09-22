@@ -169,6 +169,7 @@ do_open(State) when is_record(State, state) ->
 	{ok, Fd} ->
 	    {ok, State#state.options, State#state{fd = Fd}};
 	{error, Reason} when is_atom(Reason) ->
+	    close_root(State#state.filename),
 	    {error, file_error(Reason)}
     end.
 	
@@ -186,6 +187,7 @@ file_error(Reason) when is_atom(Reason) ->
 	eacces -> {Reason, Details};
 	eperm  -> {eacces, Details};
 	enospc -> {Reason, Details};
+	exdev  -> {badop, "Filename out of bounds"};
 	_      -> {undef,  Details ++ " (" ++ atom_to_list(Reason) ++ ")"}
     end.
 
@@ -215,12 +217,14 @@ read(#state{access = read} = State) ->
 	    {more, Bin, State#state{count = Count}};
 	{ok, Bin} when is_binary(Bin), byte_size(Bin) < BlkSize ->
 	    _ = file:close(State#state.fd),
+	    close_root(State#state.filename),
 	    Count = State#state.count + byte_size(Bin),
 	    {last, Bin, Count};
 	eof ->
 	    {last, <<>>, State#state.count};
 	{error, Reason} ->
 	    _ = file:close(State#state.fd),
+	    close_root(State#state.filename),
 	    {error, file_error(Reason)}
     end;
 read(State) ->
@@ -255,11 +259,13 @@ write(Bin, #state{access = write} = State) when is_binary(Bin) ->
 	    {more, State#state{count = Count}};
 	ok when Size < BlkSize->
 	    _ = file:close(State#state.fd),
+	    close_root(State#state.filename),
 	    Count = State#state.count + Size,
 	    {last, Count};
 	{error, Reason}  ->
 	    _ = file:close(State#state.fd),
 	    _ = file:delete(State#state.filename),
+	    close_root(State#state.filename),
 	    {error, file_error(Reason)}
     end;
 write(Bin, State) ->
@@ -281,12 +287,15 @@ write(Bin, State) ->
 
 abort(_Code, _Text, #state{fd = Fd, access = Access} = State) ->
     _ = file:close(Fd),
-    case Access of
-	write ->
-	    ok = file:delete(State#state.filename);
-	read ->
-	    ok
-    end.
+    Deleted =
+        case Access of
+            write ->
+                file:delete(State#state.filename);
+            read ->
+                ok
+        end,
+    close_root(State#state.filename),
+    ok = Deleted.
 
 %%-------------------------------------------------------------------
 %% Process options
@@ -333,20 +342,25 @@ get_initial_opts([Opt | Initial], Opts) ->
 safe_filename(Filename, RootDir) ->
     absolute =:= filename:pathtype(RootDir) orelse
         throw({badop, "Internal error. root_dir is not absolute"}),
-    filelib:is_dir(RootDir) orelse
-        throw({badop, "Internal error. root_dir not a directory"}),
     RelFilename =
         case filename:pathtype(Filename) of
             absolute ->
                 filename:join(tl(filename:split(Filename)));
             _ -> Filename
         end,
-    case filelib:safe_relative_path(RelFilename, RootDir) of
-        unsafe ->
-            throw({badop, "Internal error. Filename out of bounds"});
-        SafeFilename ->
-            filename:join(RootDir, SafeFilename)
+    case file:open_root(RootDir) of
+        {ok, Root} ->
+            {Root, RelFilename};
+        {error, Reason} ->
+            throw({badop, "Internal error. root_dir " ++
+                       file:format_error(Reason)})
     end.
+
+close_root({Root, _Filename}) ->
+    _ = file:close(Root),
+    ok;
+close_root(_Filename) ->
+    ok.
 
 
 do_handle_options(Access, Filename, [{Key, Val} | T]) ->
