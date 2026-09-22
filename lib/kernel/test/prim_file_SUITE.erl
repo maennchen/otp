@@ -43,7 +43,7 @@
 	 list_dir/1,
 	 list_dir_handle/1]).
 
--export([open_at/1, read_at/1]).
+-export([open_at/1, read_at/1, write_at/1]).
 
 -export([file_write_handle_info/1]).
 
@@ -67,7 +67,8 @@ suite() -> [].
 all() -> 
     [read_write_file, {group, dirs}, {group, files},
      delete, rename, {group, errors}, {group, links},
-     list_dir_limit, list_dir, list_dir_handle, adopt, open_at, read_at].
+     list_dir_limit, list_dir, list_dir_handle, adopt, open_at, read_at,
+     write_at].
 
 groups() -> 
     [{dirs, [],
@@ -2068,6 +2069,123 @@ read_at_symlink(Dir, TestDir) ->
             ok = ?PRIM_FILE:delete(Link),
             ok
     end.
+
+%% Tests that the operations that change the file system take a name in an
+%% open directory, and report what the matching path reports.
+write_at(Config) ->
+    RootDir = proplists:get_value(priv_dir, Config),
+    TestDir = filename:join(RootDir, ?MODULE_STRING++"_write_at"),
+    ok = ?PRIM_FILE:make_dir(TestDir),
+
+    {ok, Dir} = ?PRIM_FILE:open(TestDir, [read, directory]),
+
+    %% Making and removing a directory.
+    ok = ?PRIM_FILE:make_dir({Dir, "sub"}),
+    {ok, #file_info{type = directory}} =
+        ?PRIM_FILE:read_file_info(filename:join(TestDir, "sub")),
+    {error, eexist} = ?PRIM_FILE:make_dir({Dir, "sub"}),
+    ok = ?PRIM_FILE:write_file(filename:join([TestDir, "sub", "f"]), "x"),
+    {error, eexist} = ?PRIM_FILE:del_dir({Dir, "sub"}),
+    ok = ?PRIM_FILE:delete({Dir, "sub/f"}),
+    ok = ?PRIM_FILE:del_dir({Dir, "sub"}),
+    {error, enoent} = ?PRIM_FILE:read_file_info(filename:join(TestDir, "sub")),
+
+    %% Renaming inside one directory, and over an existing name.
+    ok = ?PRIM_FILE:write_file(filename:join(TestDir, "before"), "moved"),
+    ok = ?PRIM_FILE:write_file(filename:join(TestDir, "after"), "old"),
+    ok = ?PRIM_FILE:rename({Dir, "before"}, {Dir, "after"}),
+    {ok, <<"moved">>} = ?PRIM_FILE:read_file(filename:join(TestDir, "after")),
+    {error, enoent} = ?PRIM_FILE:read_file_info({Dir, "before"}),
+
+    %% Changing the permissions and the times of a name. The path and the
+    %% name report the same values afterwards.
+    {ok, Info} = ?PRIM_FILE:read_file_info({Dir, "after"}),
+    ok = ?PRIM_FILE:write_file_info({Dir, "after"}, Info#file_info{mode = 8#600}),
+    {ok, Info1} = ?PRIM_FILE:read_file_info(filename:join(TestDir, "after")),
+    {ok, Info1} = ?PRIM_FILE:read_file_info({Dir, "after"}),
+
+    Time = {{2001, 2, 3}, {4, 5, 6}},
+    ok = ?PRIM_FILE:write_file_info({Dir, "after"},
+                                    Info1#file_info{mtime = Time, atime = Time}),
+    {ok, #file_info{mtime = Time}} = ?PRIM_FILE:read_file_info({Dir, "after"}),
+    {ok, #file_info{mtime = Time}} =
+        ?PRIM_FILE:read_file_info(filename:join(TestDir, "after")),
+
+    {ok, InfoPosix} = ?PRIM_FILE:read_file_info({Dir, "after"}, [{time, posix}]),
+    ok = ?PRIM_FILE:write_file_info({Dir, "after"},
+                                    InfoPosix#file_info{mtime = 1000000},
+                                    [{time, posix}]),
+    {ok, #file_info{mtime = 1000000}} =
+        ?PRIM_FILE:read_file_info({Dir, "after"}, [{time, posix}]),
+
+    ok = ?PRIM_FILE:write_file_info({Dir, "after"}, Info#file_info{mode = 8#644}),
+
+    %% Removing a name.
+    ok = ?PRIM_FILE:delete({Dir, "after"}),
+    {error, enoent} = ?PRIM_FILE:read_file_info(filename:join(TestDir, "after")),
+
+    %% Errors match what the matching path reports.
+    {error, enoent} = ?PRIM_FILE:delete({Dir, "missing"}),
+    {error, enoent} = ?PRIM_FILE:del_dir({Dir, "missing"}),
+    {error, enoent} = ?PRIM_FILE:rename({Dir, "missing"}, {Dir, "other"}),
+    {error, enoent} = ?PRIM_FILE:write_file_info({Dir, "missing"}, Info),
+
+    ok = ?PRIM_FILE:write_file(filename:join(TestDir, "plain"), "x"),
+    {error, enotdir} = ?PRIM_FILE:del_dir({Dir, "plain"}),
+    ok = ?PRIM_FILE:make_dir({Dir, "adir"}),
+    {error, eperm} = ?PRIM_FILE:delete({Dir, "adir"}),
+    ok = ?PRIM_FILE:del_dir({Dir, "adir"}),
+    ok = ?PRIM_FILE:delete({Dir, "plain"}),
+
+    write_at_across_dirs(Dir, TestDir),
+    write_at_mixed(Dir, TestDir),
+
+    ok = ?PRIM_FILE:close(Dir),
+    ok = ?PRIM_FILE:del_dir(TestDir),
+    ok.
+
+%% The two names of a rename may belong to different open directories.
+write_at_across_dirs(Dir, TestDir) ->
+    ok = ?PRIM_FILE:make_dir({Dir, "from"}),
+    ok = ?PRIM_FILE:make_dir({Dir, "to"}),
+
+    {ok, From} = ?PRIM_FILE:open(filename:join(TestDir, "from"),
+                                 [read, directory]),
+    {ok, To} = ?PRIM_FILE:open(filename:join(TestDir, "to"),
+                               [read, directory]),
+
+    ok = ?PRIM_FILE:write_file(filename:join([TestDir, "from", "f"]), "across"),
+    ok = ?PRIM_FILE:rename({From, "f"}, {To, "f"}),
+
+    {ok, <<"across">>} =
+        ?PRIM_FILE:read_file(filename:join([TestDir, "to", "f"])),
+    {error, enoent} = ?PRIM_FILE:read_file_info({From, "f"}),
+
+    ok = ?PRIM_FILE:delete({To, "f"}),
+    ok = ?PRIM_FILE:close(From),
+    ok = ?PRIM_FILE:close(To),
+
+    ok = ?PRIM_FILE:del_dir({Dir, "from"}),
+    ok = ?PRIM_FILE:del_dir({Dir, "to"}),
+    ok.
+
+%% One of the two names of a rename may be a path. Windows has no directory
+%% that means the working directory, so it refuses the pair.
+write_at_mixed(Dir, TestDir) ->
+    Path = filename:join(TestDir, "by_path"),
+    ok = ?PRIM_FILE:write_file(filename:join(TestDir, "by_name"), "mixed"),
+
+    case ?PRIM_FILE:rename({Dir, "by_name"}, Path) of
+        ok ->
+            {ok, <<"mixed">>} = ?PRIM_FILE:read_file(Path),
+            ok = ?PRIM_FILE:rename(Path, {Dir, "by_name"}),
+            {ok, <<"mixed">>} = ?PRIM_FILE:read_file({Dir, "by_name"});
+        {error, enotsup} ->
+            {win32, _} = os:type()
+    end,
+
+    ok = ?PRIM_FILE:delete({Dir, "by_name"}),
+    ok.
 
 %%%
 %%% Support for testing large files.

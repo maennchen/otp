@@ -336,6 +336,21 @@ static posix_errno_t resolve_target(const efile_target_t *target, int flags,
     return resolve_name(&target->name, u->fd, flags, resolved);
 }
 
+#ifdef HAVE_RENAMEAT
+/* As resolve_target, but this function answers a target that is a path with
+ * the working directory and the path itself. An operation that takes two
+ * names can take a path for one of them and a name in a directory for the
+ * other. */
+static posix_errno_t resolve_either(const efile_target_t *target, int flags,
+        struct efile_resolved *resolved) {
+    if(target->kind == EFILE_TARGET_PATH) {
+        return resolve_name(&target->name, AT_FDCWD, flags, resolved);
+    }
+
+    return resolve_target(target, flags, resolved);
+}
+#endif
+
 posix_errno_t efile_open(const efile_target_t *target, enum efile_modes_t modes,
         ErlNifResourceType *nif_type, efile_data_t **d) {
     switch(target->kind) {
@@ -1037,10 +1052,52 @@ static posix_errno_t set_permissions_path(const efile_path_t *path,
     return 0;
 }
 
+static posix_errno_t set_permissions_at(const efile_target_t *target,
+        Uint32 permissions) {
+#ifndef HAVE_FCHMODAT
+    (void)target;
+    (void)permissions;
+
+    return ENOTSUP;
+#else
+    struct efile_resolved resolved;
+    mode_t new_modes = permissions & EFILE_MUTABLE_MODES;
+    posix_errno_t posix_errno;
+    int flags;
+
+    posix_errno = resolve_target(target,
+        EFILE_RESOLVE_FOLLOW_LAST | EFILE_RESOLVE_SELF_OK, &resolved);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    flags = resolved.follow_last ? 0 : AT_SYMLINK_NOFOLLOW;
+
+    /* Some file systems refuse the set-user-ID and set-group-ID bits.
+     * set_permissions_path drops those bits and makes the call again, and so
+     * does this. */
+    if(fchmodat(resolved.parent_fd, resolved.component, new_modes, flags) < 0) {
+        new_modes &= ~(S_ISUID | S_ISGID);
+
+        if(fchmodat(resolved.parent_fd, resolved.component, new_modes,
+                    flags) < 0) {
+            posix_errno = errno;
+        }
+    }
+
+    resolved_release(&resolved);
+
+    return posix_errno;
+#endif
+}
+
 posix_errno_t efile_set_permissions(const efile_target_t *target, Uint32 permissions) {
     switch(target->kind) {
     case EFILE_TARGET_PATH:
         return set_permissions_path(&target->name, permissions);
+    case EFILE_TARGET_AT:
+        return set_permissions_at(target, permissions);
     default:
         return EINVAL;
     }
@@ -1072,10 +1129,45 @@ static posix_errno_t set_owner_path(const efile_path_t *path, Sint32 owner,
     return 0;
 }
 
+static posix_errno_t set_owner_at(const efile_target_t *target, Sint32 owner,
+        Sint32 group) {
+#ifndef HAVE_FCHOWNAT
+    (void)target;
+    (void)owner;
+    (void)group;
+
+    return ENOTSUP;
+#else
+    struct efile_resolved resolved;
+    posix_errno_t posix_errno;
+    int flags;
+
+    posix_errno = resolve_target(target,
+        EFILE_RESOLVE_FOLLOW_LAST | EFILE_RESOLVE_SELF_OK, &resolved);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    flags = resolved.follow_last ? 0 : AT_SYMLINK_NOFOLLOW;
+
+    if(fchownat(resolved.parent_fd, resolved.component, owner, group,
+                flags) < 0) {
+        posix_errno = errno;
+    }
+
+    resolved_release(&resolved);
+
+    return posix_errno;
+#endif
+}
+
 posix_errno_t efile_set_owner(const efile_target_t *target, Sint32 owner, Sint32 group) {
     switch(target->kind) {
     case EFILE_TARGET_PATH:
         return set_owner_path(&target->name, owner, group);
+    case EFILE_TARGET_AT:
+        return set_owner_at(target, owner, group);
     default:
         return EINVAL;
     }
@@ -1107,11 +1199,55 @@ static posix_errno_t set_time_path(const efile_path_t *path, Sint64 a_time,
     return 0;
 }
 
+static posix_errno_t set_time_at(const efile_target_t *target, Sint64 a_time,
+        Sint64 m_time, Sint64 c_time) {
+#ifndef HAVE_UTIMENSAT
+    (void)target;
+    (void)a_time;
+    (void)m_time;
+    (void)c_time;
+
+    return ENOTSUP;
+#else
+    struct efile_resolved resolved;
+    struct timespec times[2];
+    posix_errno_t posix_errno;
+    int flags;
+
+    /* Unix cannot set the creation time, and set_time_path ignores it too. */
+    (void)c_time;
+
+    posix_errno = resolve_target(target,
+        EFILE_RESOLVE_FOLLOW_LAST | EFILE_RESOLVE_SELF_OK, &resolved);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    times[0].tv_sec = (time_t)a_time;
+    times[0].tv_nsec = 0;
+    times[1].tv_sec = (time_t)m_time;
+    times[1].tv_nsec = 0;
+
+    flags = resolved.follow_last ? 0 : AT_SYMLINK_NOFOLLOW;
+
+    if(utimensat(resolved.parent_fd, resolved.component, times, flags) < 0) {
+        posix_errno = errno;
+    }
+
+    resolved_release(&resolved);
+
+    return posix_errno;
+#endif
+}
+
 posix_errno_t efile_set_time(const efile_target_t *target, Sint64 a_time,
         Sint64 m_time, Sint64 c_time) {
     switch(target->kind) {
     case EFILE_TARGET_PATH:
         return set_time_path(&target->name, a_time, m_time, c_time);
+    case EFILE_TARGET_AT:
+        return set_time_at(target, a_time, m_time, c_time);
     default:
         return EINVAL;
     }
@@ -1447,6 +1583,46 @@ static posix_errno_t rename_path(const efile_path_t *old_path,
     return 0;
 }
 
+static posix_errno_t rename_at(const efile_target_t *old_target,
+        const efile_target_t *new_target) {
+#ifndef HAVE_RENAMEAT
+    (void)old_target;
+    (void)new_target;
+
+    return ENOTSUP;
+#else
+    struct efile_resolved old_resolved, new_resolved;
+    posix_errno_t posix_errno;
+
+    posix_errno = resolve_either(old_target, 0, &old_resolved);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    posix_errno = resolve_either(new_target, 0, &new_resolved);
+
+    if(posix_errno != 0) {
+        resolved_release(&old_resolved);
+        return posix_errno;
+    }
+
+    if(renameat(old_resolved.parent_fd, old_resolved.component,
+                new_resolved.parent_fd, new_resolved.component) < 0) {
+        posix_errno = errno;
+
+        if(posix_errno == ENOTEMPTY) {
+            posix_errno = EEXIST;
+        }
+    }
+
+    resolved_release(&new_resolved);
+    resolved_release(&old_resolved);
+
+    return posix_errno;
+#endif
+}
+
 posix_errno_t efile_rename(const efile_target_t *old_target,
         const efile_target_t *new_target) {
     if(old_target->kind == EFILE_TARGET_PATH
@@ -1454,7 +1630,7 @@ posix_errno_t efile_rename(const efile_target_t *old_target,
         return rename_path(&old_target->name, &new_target->name);
     }
 
-    return EINVAL;
+    return rename_at(old_target, new_target);
 }
 
 static posix_errno_t make_hard_link_path(const efile_path_t *existing_path,
@@ -1507,10 +1683,37 @@ static posix_errno_t make_dir_path(const efile_path_t *path) {
     return 0;
 }
 
+static posix_errno_t make_dir_at(const efile_target_t *target) {
+#ifndef HAVE_MKDIRAT
+    (void)target;
+
+    return ENOTSUP;
+#else
+    struct efile_resolved resolved;
+    posix_errno_t posix_errno;
+
+    posix_errno = resolve_target(target, 0, &resolved);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    if(mkdirat(resolved.parent_fd, resolved.component, DIR_MODE) < 0) {
+        posix_errno = errno;
+    }
+
+    resolved_release(&resolved);
+
+    return posix_errno;
+#endif
+}
+
 posix_errno_t efile_make_dir(const efile_target_t *target) {
     switch(target->kind) {
     case EFILE_TARGET_PATH:
         return make_dir_path(&target->name);
+    case EFILE_TARGET_AT:
+        return make_dir_at(target);
     default:
         return EINVAL;
     }
@@ -1529,10 +1732,42 @@ static posix_errno_t del_file_path(const efile_path_t *path) {
     return 0;
 }
 
+static posix_errno_t del_file_at(const efile_target_t *target) {
+#ifndef HAVE_UNLINKAT
+    (void)target;
+
+    return ENOTSUP;
+#else
+    struct efile_resolved resolved;
+    posix_errno_t posix_errno;
+
+    posix_errno = resolve_target(target, 0, &resolved);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    if(unlinkat(resolved.parent_fd, resolved.component, 0) < 0) {
+        posix_errno = errno;
+
+        /* Linux sets the wrong error code. */
+        if(posix_errno == EISDIR) {
+            posix_errno = EPERM;
+        }
+    }
+
+    resolved_release(&resolved);
+
+    return posix_errno;
+#endif
+}
+
 posix_errno_t efile_del_file(const efile_target_t *target) {
     switch(target->kind) {
     case EFILE_TARGET_PATH:
         return del_file_path(&target->name);
+    case EFILE_TARGET_AT:
+        return del_file_at(target);
     default:
         return EINVAL;
     }
@@ -1568,10 +1803,41 @@ static posix_errno_t del_dir_path(const efile_path_t *path) {
     return 0;
 }
 
+static posix_errno_t del_dir_at(const efile_target_t *target) {
+#ifndef HAVE_UNLINKAT
+    (void)target;
+
+    return ENOTSUP;
+#else
+    struct efile_resolved resolved;
+    posix_errno_t posix_errno;
+
+    posix_errno = resolve_target(target, 0, &resolved);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    if(unlinkat(resolved.parent_fd, resolved.component, AT_REMOVEDIR) < 0) {
+        posix_errno = errno;
+
+        if(posix_errno == ENOTEMPTY) {
+            posix_errno = EEXIST;
+        }
+    }
+
+    resolved_release(&resolved);
+
+    return posix_errno;
+#endif
+}
+
 posix_errno_t efile_del_dir(const efile_target_t *target) {
     switch(target->kind) {
     case EFILE_TARGET_PATH:
         return del_dir_path(&target->name);
+    case EFILE_TARGET_AT:
+        return del_dir_at(target);
     default:
         return EINVAL;
     }

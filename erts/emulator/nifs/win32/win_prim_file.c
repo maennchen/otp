@@ -37,6 +37,24 @@
  * and the types they need. The emulator links against ntdll for them. */
 #include <winternl.h>
 
+/* winternl.h does not declare NtSetInformationFile, so it is declared here. */
+NTSYSAPI NTSTATUS NTAPI NtSetInformationFile(HANDLE FileHandle,
+    IO_STATUS_BLOCK *IoStatusBlock, PVOID FileInformation, ULONG Length,
+    FILE_INFORMATION_CLASS FileInformationClass);
+
+/* SetFileInformationByHandle ignores the directory in FILE_RENAME_INFO, so a
+ * rename that names a directory uses the native call and the structure that
+ * call expects. winternl.h declares FILE_INFORMATION_CLASS with one member,
+ * so the value is given here as well. */
+#define EFILE_FILE_RENAME_INFORMATION ((FILE_INFORMATION_CLASS)10)
+
+typedef struct {
+    BOOLEAN ReplaceIfExists;
+    HANDLE RootDirectory;
+    ULONG FileNameLength;
+    WCHAR FileName[1];
+} EFILE_FILE_RENAME_INFORMATION_T;
+
 #define EFILE_FILE_OPEN 0x00000001
 #define EFILE_FILE_CREATE 0x00000002
 #define EFILE_FILE_OPEN_IF 0x00000003
@@ -57,6 +75,10 @@
  * matched on directly, because the error it maps to is not the one a path
  * reports. */
 #define EFILE_STATUS_NOT_A_DIRECTORY ((NTSTATUS)0xC0000103L)
+
+/* The status for a name that is a directory where a file is asked for. It is
+ * matched on directly for the same reason. */
+#define EFILE_STATUS_FILE_IS_A_DIRECTORY ((NTSTATUS)0xC00000BAL)
 
 #define IS_SLASH(a)  ((a) == L'\\' || (a) == L'/')
 
@@ -617,6 +639,10 @@ static posix_errno_t nt_status_to_posix_errno(NTSTATUS status) {
         return ENOTDIR;
     }
 
+    if(status == EFILE_STATUS_FILE_IS_A_DIRECTORY) {
+        return EISDIR;
+    }
+
     return windows_to_posix_errno(RtlNtStatusToDosError(status));
 }
 
@@ -782,6 +808,18 @@ static posix_errno_t resolve_target(const efile_target_t *target, int flags,
     resolved->follow_last = !!(flags & EFILE_RESOLVE_FOLLOW_LAST);
 
     return 0;
+}
+
+/* As resolve_target, but for an operation that takes two names. Windows has no
+ * directory that means "the working directory", so a name that is a path
+ * cannot be mixed with one in a directory. */
+static posix_errno_t resolve_either(const efile_target_t *target, int flags,
+        struct efile_resolved *resolved) {
+    if(target->kind == EFILE_TARGET_PATH) {
+        return ENOTSUP;
+    }
+
+    return resolve_target(target, flags, resolved);
 }
 
 static void tmp_nop_invalid_parameter_handler(const wchar_t* expression,
@@ -1444,10 +1482,50 @@ static posix_errno_t set_permissions_path(const efile_path_t *path,
     return windows_to_posix_errno(GetLastError());
 }
 
+static posix_errno_t set_permissions_at(const efile_target_t *target,
+        Uint32 permissions) {
+    struct efile_resolved resolved;
+    posix_errno_t posix_errno;
+    NTSTATUS status;
+    HANDLE handle;
+    ULONG options;
+
+    posix_errno = resolve_target(target,
+        EFILE_RESOLVE_FOLLOW_LAST | EFILE_RESOLVE_SELF_OK, &resolved);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    options = EFILE_FILE_OPEN_FOR_BACKUP_INTENT;
+
+    if(!resolved.follow_last) {
+        options |= EFILE_FILE_OPEN_REPARSE_POINT;
+    }
+
+    status = open_name_at(resolved.parent, resolved.component,
+        FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, options, EFILE_FILE_OPEN,
+        &handle);
+
+    resolved_release(&resolved);
+
+    if(!NT_SUCCESS(status)) {
+        return nt_status_to_posix_errno(status);
+    }
+
+    posix_errno = set_handle_permissions(handle, permissions);
+
+    CloseHandle(handle);
+
+    return posix_errno;
+}
+
 posix_errno_t efile_set_permissions(const efile_target_t *target, Uint32 permissions) {
     switch(target->kind) {
     case EFILE_TARGET_PATH:
         return set_permissions_path(&target->name, permissions);
+    case EFILE_TARGET_AT:
+        return set_permissions_at(target, permissions);
     default:
         return EINVAL;
     }
@@ -1472,6 +1550,10 @@ posix_errno_t efile_set_owner(const efile_target_t *target, Sint32 owner, Sint32
     switch(target->kind) {
     case EFILE_TARGET_PATH:
         return set_owner_path(&target->name, owner, group);
+    case EFILE_TARGET_AT:
+        /* There is no owner to set on this platform, as set_owner_path
+         * shows. */
+        return 0;
     default:
         return EINVAL;
     }
@@ -1550,11 +1632,50 @@ static posix_errno_t set_time_path(const efile_path_t *path, Sint64 a_time,
     return windows_to_posix_errno(last_error);
 }
 
+static posix_errno_t set_time_at(const efile_target_t *target, Sint64 a_time,
+        Sint64 m_time, Sint64 c_time) {
+    struct efile_resolved resolved;
+    posix_errno_t posix_errno;
+    NTSTATUS status;
+    HANDLE handle;
+    ULONG options;
+
+    posix_errno = resolve_target(target,
+        EFILE_RESOLVE_FOLLOW_LAST | EFILE_RESOLVE_SELF_OK, &resolved);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    options = EFILE_FILE_OPEN_FOR_BACKUP_INTENT;
+
+    if(!resolved.follow_last) {
+        options |= EFILE_FILE_OPEN_REPARSE_POINT;
+    }
+
+    status = open_name_at(resolved.parent, resolved.component,
+        FILE_WRITE_ATTRIBUTES, options, EFILE_FILE_OPEN, &handle);
+
+    resolved_release(&resolved);
+
+    if(!NT_SUCCESS(status)) {
+        return nt_status_to_posix_errno(status);
+    }
+
+    posix_errno = set_handle_time(handle, a_time, m_time, c_time);
+
+    CloseHandle(handle);
+
+    return posix_errno;
+}
+
 posix_errno_t efile_set_time(const efile_target_t *target, Sint64 a_time,
         Sint64 m_time, Sint64 c_time) {
     switch(target->kind) {
     case EFILE_TARGET_PATH:
         return set_time_path(&target->name, a_time, m_time, c_time);
+    case EFILE_TARGET_AT:
+        return set_time_at(target, a_time, m_time, c_time);
     default:
         return EINVAL;
     }
@@ -1984,6 +2105,84 @@ static posix_errno_t rename_path(const efile_path_t *old_path,
     return windows_to_posix_errno(last_error);
 }
 
+/* Gives an open file a new name, relative to a directory. */
+static posix_errno_t set_rename_information(HANDLE handle, HANDLE new_parent,
+        const WCHAR *new_name) {
+    EFILE_FILE_RENAME_INFORMATION_T *rename_info;
+    IO_STATUS_BLOCK io_status_block;
+    posix_errno_t posix_errno;
+    size_t name_size, info_size;
+    NTSTATUS status;
+
+    name_size = wcslen(new_name) * sizeof(WCHAR);
+    info_size = sizeof(EFILE_FILE_RENAME_INFORMATION_T) + name_size;
+
+    rename_info = (EFILE_FILE_RENAME_INFORMATION_T*)enif_alloc(info_size);
+
+    if(rename_info == NULL) {
+        return ENOMEM;
+    }
+
+    sys_memset(rename_info, 0, sizeof(EFILE_FILE_RENAME_INFORMATION_T));
+    rename_info->ReplaceIfExists = TRUE;
+    rename_info->RootDirectory = new_parent;
+    rename_info->FileNameLength = (ULONG)name_size;
+    sys_memcpy(rename_info->FileName, new_name, name_size);
+
+    sys_memset(&io_status_block, 0, sizeof(io_status_block));
+
+    status = NtSetInformationFile(handle, &io_status_block, rename_info,
+        (ULONG)info_size, EFILE_FILE_RENAME_INFORMATION);
+
+    posix_errno = NT_SUCCESS(status) ? 0 : nt_status_to_posix_errno(status);
+
+    enif_free(rename_info);
+
+    return posix_errno;
+}
+
+static posix_errno_t rename_at(const efile_target_t *old_target,
+        const efile_target_t *new_target) {
+    struct efile_resolved old_resolved, new_resolved;
+    posix_errno_t posix_errno;
+    HANDLE handle;
+    NTSTATUS status;
+
+    posix_errno = resolve_either(old_target, 0, &old_resolved);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    posix_errno = resolve_either(new_target, 0, &new_resolved);
+
+    if(posix_errno != 0) {
+        resolved_release(&old_resolved);
+        return posix_errno;
+    }
+
+    /* The file is renamed through a handle on it, because MoveFileExW takes
+     * two paths. The reparse point option renames a link rather than what the
+     * link points at. */
+    status = open_name_at(old_resolved.parent, old_resolved.component, DELETE,
+        EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_OPEN_REPARSE_POINT,
+        EFILE_FILE_OPEN, &handle);
+
+    if(NT_SUCCESS(status)) {
+        posix_errno = set_rename_information(handle, new_resolved.parent,
+                                             new_resolved.component);
+
+        CloseHandle(handle);
+    } else {
+        posix_errno = nt_status_to_posix_errno(status);
+    }
+
+    resolved_release(&new_resolved);
+    resolved_release(&old_resolved);
+
+    return posix_errno;
+}
+
 posix_errno_t efile_rename(const efile_target_t *old_target,
         const efile_target_t *new_target) {
     if(old_target->kind == EFILE_TARGET_PATH
@@ -1991,7 +2190,7 @@ posix_errno_t efile_rename(const efile_target_t *old_target,
         return rename_path(&old_target->name, &new_target->name);
     }
 
-    return EINVAL;
+    return rename_at(old_target, new_target);
 }
 
 static posix_errno_t make_hard_link_path(const efile_path_t *existing_path,
@@ -2056,10 +2255,41 @@ static posix_errno_t make_dir_path(const efile_path_t *path) {
     return 0;
 }
 
+static posix_errno_t make_dir_at(const efile_target_t *target) {
+    struct efile_resolved resolved;
+    posix_errno_t posix_errno;
+    NTSTATUS status;
+    HANDLE handle;
+
+    posix_errno = resolve_target(target, 0, &resolved);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    /* NtCreateFile makes the directory when it is told to create rather than
+     * open, so there is no separate call for this. */
+    status = open_name_at(resolved.parent, resolved.component, GENERIC_READ,
+        EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_DIRECTORY_FILE,
+        EFILE_FILE_CREATE, &handle);
+
+    resolved_release(&resolved);
+
+    if(!NT_SUCCESS(status)) {
+        return nt_status_to_posix_errno(status);
+    }
+
+    CloseHandle(handle);
+
+    return 0;
+}
+
 posix_errno_t efile_make_dir(const efile_target_t *target) {
     switch(target->kind) {
     case EFILE_TARGET_PATH:
         return make_dir_path(&target->name);
+    case EFILE_TARGET_AT:
+        return make_dir_at(target);
     default:
         return EINVAL;
     }
@@ -2090,10 +2320,74 @@ static posix_errno_t del_file_path(const efile_path_t *path) {
     return 0;
 }
 
+/* Removes a name by opening it and marking the open file for deletion,
+ * because DeleteFileW and RemoveDirectoryW both take a path. The reparse point
+ * option removes a link rather than what the link points at. */
+static posix_errno_t delete_name_at(const efile_target_t *target, int is_dir) {
+    struct efile_resolved resolved;
+    FILE_DISPOSITION_INFO disposition;
+    posix_errno_t posix_errno;
+    NTSTATUS status;
+    HANDLE handle;
+    ULONG options;
+
+    posix_errno = resolve_target(target, 0, &resolved);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    options = EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_OPEN_REPARSE_POINT;
+
+    if(is_dir) {
+        options |= EFILE_FILE_DIRECTORY_FILE;
+    } else {
+        options |= EFILE_FILE_NON_DIRECTORY_FILE;
+    }
+
+    status = open_name_at(resolved.parent, resolved.component, DELETE, options,
+        EFILE_FILE_OPEN, &handle);
+
+    resolved_release(&resolved);
+
+    if(!NT_SUCCESS(status)) {
+        posix_errno = nt_status_to_posix_errno(status);
+
+        /* del_file_path reports removing a directory as a file as EPERM
+         * rather than EISDIR. */
+        if(!is_dir && posix_errno == EISDIR) {
+            return EPERM;
+        }
+
+        return posix_errno;
+    }
+
+    disposition.DeleteFile = TRUE;
+
+    posix_errno = 0;
+
+    if(!SetFileInformationByHandle(handle, FileDispositionInfo,
+                                   &disposition, sizeof(disposition))) {
+        posix_errno = windows_to_posix_errno(GetLastError());
+
+        /* A directory that is not empty reports as EEXIST, as it does for
+         * del_dir_path. */
+        if(is_dir && posix_errno == EACCES) {
+            posix_errno = EEXIST;
+        }
+    }
+
+    CloseHandle(handle);
+
+    return posix_errno;
+}
+
 posix_errno_t efile_del_file(const efile_target_t *target) {
     switch(target->kind) {
     case EFILE_TARGET_PATH:
         return del_file_path(&target->name);
+    case EFILE_TARGET_AT:
+        return delete_name_at(target, 0);
     default:
         return EINVAL;
     }
@@ -2119,6 +2413,8 @@ posix_errno_t efile_del_dir(const efile_target_t *target) {
     switch(target->kind) {
     case EFILE_TARGET_PATH:
         return del_dir_path(&target->name);
+    case EFILE_TARGET_AT:
+        return delete_name_at(target, 1);
     default:
         return EINVAL;
     }

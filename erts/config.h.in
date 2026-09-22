@@ -678,6 +678,12 @@
 /* Define if you have a working fallocate() */
 #undef HAVE_FALLOCATE
 
+/* Define to 1 if you have the 'fchmodat' function. */
+#undef HAVE_FCHMODAT
+
+/* Define to 1 if you have the 'fchownat' function. */
+#undef HAVE_FCHOWNAT
+
 /* Define to 1 if you have the <fcntl.h> header file. */
 #undef HAVE_FCNTL_H
 
@@ -893,6 +899,9 @@
 /* Define if the pthread.h header file is in pthread/mit directory. */
 #undef HAVE_MIT_PTHREAD_H
 
+/* Define to 1 if you have the 'mkdirat' function. */
+#undef HAVE_MKDIRAT
+
 /* Define to 1 if you have the 'mlockall' function. */
 #undef HAVE_MLOCKALL
 
@@ -988,6 +997,9 @@
 
 /* Define to 1 if you have the 'recvmmsg' function. */
 #undef HAVE_RECVMMSG
+
+/* Define to 1 if you have the 'renameat' function. */
+#undef HAVE_RENAMEAT
 
 /* Define to 1 if you have the 'res_gethostbyname' function. */
 #undef HAVE_RES_GETHOSTBYNAME
@@ -1290,8 +1302,14 @@
 /* Define to 1 if you have the <unistd.h> header file. */
 #undef HAVE_UNISTD_H
 
+/* Define to 1 if you have the 'unlinkat' function. */
+#undef HAVE_UNLINKAT
+
 /* Define to 1 if you have the <util.h> header file. */
 #undef HAVE_UTIL_H
+
+/* Define to 1 if you have the 'utimensat' function. */
+#undef HAVE_UTIMENSAT
 
 /* Define to 1 if you have the <utmp.h> header file. */
 #undef HAVE_UTMP_H

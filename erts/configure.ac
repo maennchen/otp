@@ -2367,6 +2367,7 @@ AC_CHECK_FUNCS([ieee_handler fpsetmask finite isnan isinf res_gethostbyname dlop
 		gethrtime localtime_r gmtime_r mprotect madvise posix_madvise \
 		mmap mremap memcpy memrchr mallopt sbrk _sbrk __sbrk brk _brk __brk \
 		flockfile fstat fdopendir futimens futimes openat fstatat faccessat readlinkat \
+		mkdirat unlinkat renameat fchmodat fchownat utimensat \
 		strlcpy strlcat setsid posix2time time2posix \
 		setlocale nl_langinfo poll mlockall ppoll vsyslog])
 

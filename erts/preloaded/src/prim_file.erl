@@ -746,9 +746,9 @@ write_file_info_1(#file_descriptor{module = ?MODULE} = Fd, Info, TimeType) ->
         throw:Reason -> {error, Reason};
         error:_ -> {error, badarg}
     end;
-write_file_info_1(Filename, Info, TimeType) ->
+write_file_info_1(Target, Info, TimeType) ->
     try
-        write_file_info_2({name, encode_path(Filename)}, Info, TimeType)
+        write_file_info_2({name, encode_target(Target)}, Info, TimeType)
     catch
         throw:Reason -> {error, Reason};
         error:_ -> {error, badarg}
@@ -783,7 +783,7 @@ set_owner({name, EncodedName}, Uid, Gid) ->
     set_owner_nif(EncodedName, Uid, Gid);
 set_owner({handle, FRef}, Uid, Gid) ->
     set_handle_owner_nif(FRef, Uid, Gid).
-set_owner_nif(_Path, _Uid, _Gid) ->
+set_owner_nif(_Target, _Uid, _Gid) ->
     erlang:nif_error(undef).
 set_handle_owner_nif(_FileRef, _Uid, _Gid) ->
     erlang:nif_error(undef).
@@ -794,7 +794,7 @@ set_permissions({name, EncodedName}, Permissions) ->
     set_permissions_nif(EncodedName, Permissions);
 set_permissions({handle, FRef}, Permissions) ->
     set_handle_permissions_nif(FRef, Permissions).
-set_permissions_nif(_Path, _Permissions) ->
+set_permissions_nif(_Target, _Permissions) ->
     erlang:nif_error(undef).
 set_handle_permissions_nif(_FileRef, _Permissions) ->
     erlang:nif_error(undef).
@@ -803,7 +803,7 @@ set_time({name, EncodedName}, ATime, MTime, CTime) ->
     set_time_nif(EncodedName, ATime, MTime, CTime);
 set_time({handle, FRef}, ATime, MTime, CTime) ->
     set_handle_time_nif(FRef, ATime, MTime, CTime).
-set_time_nif(_Path, _ATime, _MTime, _CTime) ->
+set_time_nif(_Target, _ATime, _MTime, _CTime) ->
     erlang:nif_error(undef).
 set_handle_time_nif(_FileRef, _ATime, _MTime, _CTime) ->
     erlang:nif_error(undef).
@@ -866,28 +866,28 @@ set_cwd(Path) ->
         error:badarg -> {error, badarg}
     end.
 
-delete(Path) ->
+delete(Target) ->
     try
-        del_file_nif(encode_path(Path))
+        del_file_nif(encode_target(Target))
     catch
         error:badarg -> {error, badarg}
     end.
 
 rename(Source, Destination) ->
     try
-        rename_nif(encode_path(Source), encode_path(Destination))
+        rename_nif(encode_target(Source), encode_target(Destination))
     catch
         error:badarg -> {error, badarg}
     end.
-make_dir(Path) ->
+make_dir(Target) ->
     try
-        make_dir_nif(encode_path(Path))
+        make_dir_nif(encode_target(Target))
     catch
         error:badarg -> {error, badarg}
     end.
-del_dir(Path) ->
+del_dir(Target) ->
     try
-        del_dir_nif(encode_path(Path))
+        del_dir_nif(encode_target(Target))
     catch
         error:badarg -> {error, badarg}
     end.
@@ -926,11 +926,11 @@ make_soft_link_nif(_Existing, _New) ->
     erlang:nif_error(undef).
 rename_nif(_Source, _Destination) ->
     erlang:nif_error(undef).
-make_dir_nif(_Path) ->
+make_dir_nif(_Target) ->
     erlang:nif_error(undef).
-del_file_nif(_Path) ->
+del_file_nif(_Target) ->
     erlang:nif_error(undef).
-del_dir_nif(_Path) ->
+del_dir_nif(_Target) ->
     erlang:nif_error(undef).
 get_device_cwd_nif(_DevicePath) ->
     erlang:nif_error(undef).

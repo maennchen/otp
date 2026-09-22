@@ -479,8 +479,11 @@ set_cwd(Dirname) ->
 
 -doc(#{equiv => delete(Filename, [])}).
 -spec delete(Filename) -> ok | {error, Reason} when
-      Filename :: name_all(),
+      Filename :: name_all() | {fd(), name_all()},
       Reason :: posix() | badarg.
+
+delete(Target) when ?IS_AT_TARGET(Target) ->
+    at_call(delete, Target, []);
 
 delete(Name) ->
     check_and_call(delete, [file_name(Name)]).
@@ -562,11 +565,21 @@ Typical error reasons:
 - **`enotdir`** - `Source` is a directory, but `Destination` is not.
 
 - **`exdev`** - `Source` and `Destination` are on different file systems.
+
+`Source` and `Destination` can also be `{Dir, Name}` tuples, where `Dir` is a
+directory that was opened with the modes `raw`, `read` and `directory`. The two
+directories do not have to be the same one. See `open/2`.
+
+One of the two can be a `{Dir, Name}` tuple while the other is a path. Not all
+operating systems can do this. Windows returns `{error, enotsup}`.
 """.
 -spec rename(Source, Destination) -> ok | {error, Reason} when
-      Source :: name_all(),
-      Destination :: name_all(),
+      Source :: name_all() | {fd(), name_all()},
+      Destination :: name_all() | {fd(), name_all()},
       Reason :: posix() | badarg.
+
+rename(Source, Dest) when ?IS_AT_TARGET(Source); ?IS_AT_TARGET(Dest) ->
+    either_call(rename, [either_target(Source), either_target(Dest)]);
 
 rename(From, To) ->
     check_and_call(rename, [file_name(From), file_name(To)]).
@@ -590,8 +603,11 @@ Typical error reasons:
   `enoent` is returned instead.
 """.
 -spec make_dir(Dir) -> ok | {error, Reason} when
-      Dir :: name_all(),
+      Dir :: name_all() | {fd(), name_all()},
       Reason :: posix() | badarg.
+
+make_dir(Target) when ?IS_AT_TARGET(Target) ->
+    at_call(make_dir, Target, []);
 
 make_dir(Name) ->
     check_and_call(make_dir, [file_name(Name)]).
@@ -616,8 +632,11 @@ Typical error reasons:
   `eacces` is returned instead.
 """.
 -spec del_dir(Dir) -> ok | {error, Reason} when
-      Dir :: name_all(),
+      Dir :: name_all() | {fd(), name_all()},
       Reason :: posix() | badarg.
+
+del_dir(Target) when ?IS_AT_TARGET(Target) ->
+    at_call(del_dir, Target, []);
 
 del_dir(Name) ->
     check_and_call(del_dir, [file_name(Name)]).
@@ -931,12 +950,15 @@ read_link_all(Name) ->
 
 -doc(#{equiv => write_file_info(Filename, FileInfo, [])}).
 -spec write_file_info(Filename, FileInfo) -> ok | {error, Reason} when
-      Filename :: name_all() | fd(),
+      Filename :: name_all() | fd() | {fd(), name_all()},
       FileInfo :: file_info(),
       Reason :: posix() | badarg.
 
 write_file_info(#file_descriptor{module = Module} = Handle, Info = #file_info{}) ->
     Module:write_file_info(Handle, Info);
+
+write_file_info(Target, Info = #file_info{}) when ?IS_AT_TARGET(Target) ->
+    at_call(write_file_info, Target, [Info]);
 
 write_file_info(Name, Info = #file_info{}) ->
     check_and_call(write_file_info, [file_name(Name), Info]).
@@ -1031,7 +1053,7 @@ process replaces the path.
 """.
 -doc(#{since => <<"OTP R15B">>}).
 -spec write_file_info(Filename, FileInfo, Opts) -> ok | {error, Reason} when
-      Filename :: name_all() | fd(),
+      Filename :: name_all() | fd() | {fd(), name_all()},
       Opts :: [file_info_option()],
       FileInfo :: file_info(),
       Reason :: posix() | badarg.
@@ -1039,6 +1061,10 @@ process replaces the path.
 write_file_info(#file_descriptor{module = Module} = Handle, Info = #file_info{}, Opts)
   when is_list(Opts) ->
     Module:write_file_info(Handle, Info, Opts);
+
+write_file_info(Target, Info = #file_info{}, Opts)
+  when ?IS_AT_TARGET(Target), is_list(Opts) ->
+    at_call(write_file_info, Target, [Info, Opts]);
 
 write_file_info(Name, Info = #file_info{}, Opts) when is_list(Opts) ->
     Args = [file_name(Name), Info, Opts],
@@ -1635,6 +1661,25 @@ at_call(Function, Target0, Args) ->
             Error;
         Target ->
             apply(?PRIM_FILE, Function, [Target | Args])
+    end.
+
+%% An operation that takes two names can take a name in an open directory for
+%% one of them and a plain path for the other. The operating system decides
+%% whether it can do this. Windows has no directory that means "the working
+%% directory", so it answers enotsup.
+either_target(Target) when ?IS_AT_TARGET(Target) ->
+    at_target(Target);
+either_target(Name) ->
+    file_name(Name).
+
+%% Calls prim_file with names that were each converted already, unless the
+%% conversion of one of them failed.
+either_call(Function, Args) ->
+    case lists:keyfind(error, 1, Args) of
+        {error, _} = Error ->
+            Error;
+        false ->
+            apply(?PRIM_FILE, Function, Args)
     end.
 
 %% A directory that file:open/2 returned is wrapped in the layers that were
