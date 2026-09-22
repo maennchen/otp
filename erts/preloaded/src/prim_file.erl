@@ -134,9 +134,9 @@ copy(#file_descriptor{module = ?MODULE} = Source,
 %% Opens a name against an open directory. The operating system resolves the
 %% name against the directory the caller holds, so another process cannot
 %% replace a directory in the path and make the caller open a different file.
-%% The name itself is not checked. On Unix a name that contains ".." or starts
-%% with a separator still reaches a file outside the directory. Windows refuses
-%% such a name.
+%% The name itself is not checked. A name that contains ".." still reaches a
+%% file outside the directory, and on Unix so does a name that starts with a
+%% separator. Windows refuses such a name.
 %%
 %% A name in a root, given as {Root, Name} with a root from open_root/1 or as
 %% {root, Root, Name}, is resolved one component at a time against that root,

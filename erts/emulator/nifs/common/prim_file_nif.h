@@ -129,9 +129,9 @@ typedef ErlNifBinary efile_path_t;
  * as it always has.
  *
  * EFILE_TARGET_AT: the name is resolved against dir, so the path of dir is not
- * resolved again. The name itself is not checked. On Unix a name that holds
- * ".." or starts with a separator still reaches a file outside the directory.
- * Windows refuses such a name.
+ * resolved again. The name itself is not checked. A name that holds ".."
+ * still reaches a file outside the directory, and on Unix so does a name that
+ * starts with a separator. Windows refuses such a name.
  *
  * EFILE_TARGET_ROOT: the name is resolved against dir one component at a
  * time, so it cannot reach a file outside dir. */

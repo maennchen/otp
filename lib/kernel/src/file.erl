@@ -121,9 +121,10 @@ A `{Dir, Name}` tuple, where `Dir` is a directory opened with the modes `raw`,
 The path of `Dir` is not resolved again, so a replaced directory in that path
 cannot change which file the call reaches. See `open/2`.
 
-`Name` itself is not checked in a directory. On Unix a `..` or a leading
-separator still reaches a file outside it. A root from `open_root/1` also
-keeps `Name` inside: a name that would leave the root gives `{error, exdev}`.
+`Name` itself is not checked in a directory. A `..` still reaches a file
+outside it, and on Unix so does a leading separator. A root from `open_root/1`
+also keeps `Name` inside: a name that would leave the root gives
+`{error, exdev}`.
 A symbolic link with an absolute target is followed under the root on Unix
 and refused on Windows, where a link always stores a full path.
 
@@ -1639,10 +1640,10 @@ resolve the path of the directory again, so another process cannot replace a
 directory in that path and make this function open a different file. The file
 stays open after the directory is closed.
 
-`Name` itself is not checked. On Unix a name that contains `..` or that starts
-with a separator still reaches a file outside the directory. Windows refuses
-such a name. A root from `open_root/1` in place of `Dir` checks the name, see
-that function.
+`Name` itself is not checked. A name that contains `..` still reaches a file
+outside the directory, and so does a name that starts with a separator on
+Unix. Windows refuses such a name. A root from `open_root/1` in place of `Dir`
+checks the name, see that function.
 
 ```erlang
 {ok, Dir} = file:open("/tmp/example", [raw, read, directory]),

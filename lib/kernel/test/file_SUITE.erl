@@ -1138,6 +1138,17 @@ read_at(Config) when is_list(Config) ->
     {ok, <<"contents">>} = ?FILE_MODULE:read_file({Dir, "file"}, []),
     {ok, <<"contents">>} = ?FILE_MODULE:read_file({Dir, "file"}, [raw]),
 
+    %% A name is resolved as a path is, so "." and ".." lead where they do
+    %% in a path, also out of the directory.
+    {ok, <<"contents">>} = ?FILE_MODULE:read_file({Dir, "./file"}),
+    {ok, <<"inner">>} = ?FILE_MODULE:read_file({Dir, "sub/./inner"}),
+    {ok, <<"contents">>} = ?FILE_MODULE:read_file({Dir, "sub/../file"}),
+    {ok, ["inner"]} = ?FILE_MODULE:list_dir({Dir, "sub/../sub"}),
+    {ok, <<"contents">>} =
+        ?FILE_MODULE:read_file({Dir, filename:join(["..", filename:basename(TestDir), "file"])}),
+    {ok, #file_info{type = directory}} = ?FILE_MODULE:read_file_info({Dir, "."}),
+    {ok, #file_info{type = directory}} = ?FILE_MODULE:read_file_info({Dir, "sub/.."}),
+
     %% The time option reaches the same code as it does for a path.
     {ok, #file_info{mtime = MTime}} =
         ?FILE_MODULE:read_file_info({Dir, "file"}, [{time, posix}]),
