@@ -352,7 +352,29 @@ do_extract(Handle, Opts) when is_list(Opts) ->
                       infinity -> Acc0;
                       _ -> {size_tracked, 0, Acc0}
                   end,
-            foldl_read(Handle2, fun extract1/4, Acc, Opts3)
+            extract_in_root(Handle2, Acc, Opts3)
+    end.
+
+%% Every name is resolved against cwd opened as a root, so no name in the
+%% archive reaches a file outside cwd.
+extract_in_root(Handle, Acc, #read_opts{output=memory}=Opts) ->
+    foldl_read(Handle, fun extract1/4, Acc, Opts);
+extract_in_root(Handle, Acc, #read_opts{cwd=Cwd}=Opts) ->
+    case open_root(Cwd) of
+        {ok, Root} ->
+            try
+                foldl_read(Handle, fun extract1/4, Acc, Opts#read_opts{root=Root})
+            after
+                file:close(Root)
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+open_root(Cwd) ->
+    case filelib:ensure_path(Cwd) of
+        ok -> file:open_root(Cwd);
+        Error -> Error
     end.
 
 maybe_inflate_with_limit({binary, Bin}, #read_opts{max_size=MaxSize}=Opts)
@@ -463,14 +485,16 @@ extract_to_file(#tar_header{name=Name0}=Header, Reader0, Opts) ->
     case typeflag(Header#tar_header.typeflag) of
         regular ->
             Name1 = make_safe_path(Name0, Opts),
-            case stream_to_file(Name1, Reader0, Opts) of
-                {ok, Reader1} ->
-                    read_verbose(Opts, "x ~ts~n", [Name0]),
-                    _ = set_extracted_file_info(Name1, Header),
-                    Reader1;
-                {error, _} = Err ->
-                    throw(Err)
-            end;
+            unsafe_path_on_exdev(Name0, fun() ->
+                case stream_to_file(Name1, Reader0, Opts) of
+                    {ok, Reader1} ->
+                        read_verbose(Opts, "x ~ts~n", [Name0]),
+                        _ = set_extracted_file_info(Name1, Header),
+                        Reader1;
+                    {error, _} = Err ->
+                        throw(Err)
+                end
+            end);
         _ ->
             Reader1 = skip_file(Reader0),
             _ = write_extracted_element(Header, <<>>, Opts),
@@ -509,8 +533,10 @@ open_output_file(Name) ->
         {ok, _} = Ok ->
             Ok;
         {error, enoent} ->
-            ok = make_dirs(Name, file),
-            file:open(Name, [write, raw, binary]);
+            case make_dirs(Name, file) of
+                ok -> file:open(Name, [write, raw, binary]);
+                {error, _} = Err -> Err
+            end;
         {error, _} = Err ->
             Err
     end.
@@ -2136,6 +2162,11 @@ write_extracted_element(#tar_header{name=Name,typeflag=Type},
     end;
 write_extracted_element(#tar_header{name=Name0}=Header, Bin, Opts) ->
     Name1 = make_safe_path(Name0, Opts),
+    unsafe_path_on_exdev(Name0, fun() ->
+        write_extracted_element(Header, Name1, Bin, Opts)
+    end).
+
+write_extracted_element(#tar_header{name=Name0}=Header, Name1, Bin, Opts) ->
     Created =
         case typeflag(Header#tar_header.typeflag) of
             regular ->
@@ -2166,16 +2197,23 @@ write_extracted_element(#tar_header{name=Name0}=Header, Bin, Opts) ->
 
 make_safe_path([$/|Path], Opts) ->
     make_safe_path(Path, Opts);
-make_safe_path(Path0, #read_opts{cwd=Cwd}) ->
-    case filelib:safe_relative_path(Path0, Cwd) of
-        unsafe -> throw({error,{Path0,unsafe_path}});
-        Path -> filename:absname(Path, Cwd)
+make_safe_path([], #read_opts{root=Root}) ->
+    {Root, "."};
+make_safe_path(Path, #read_opts{root=Root}) ->
+    {Root, Path}.
+
+%% The root refuses a name that leaves it with exdev.
+unsafe_path_on_exdev(Name, Fun) ->
+    try
+        Fun()
+    catch
+        throw:{error, exdev} -> throw({error, {Name, unsafe_path}})
     end.
 
-safe_link_name(#tar_header{name=Name,linkname=Path0},#read_opts{cwd=Cwd} ) ->
+safe_link_name(#tar_header{name=Name,linkname=Path0},#read_opts{root=Root}) ->
     ParentDir = filename:dirname(Name),
     ResolvedTarget = filename:join(ParentDir, Path0),
-    case filelib:safe_relative_path(ResolvedTarget, Cwd) of
+    case filelib:safe_relative_path(ResolvedTarget, Root) of
         unsafe -> throw({error,{Path0,unsafe_symlink}});
         _Path -> Path0
     end.
@@ -2195,6 +2233,7 @@ create_extracted_dir(Name, _Opts) ->
         ok -> ok;
         {error,enotsup} -> not_written;
         {error,eexist} -> not_written;
+        {error,eisdir} -> not_written;
         {error,enoent} -> make_dirs(Name, dir);
         {error,Reason} -> throw({error, Reason})
     end.
@@ -2203,9 +2242,17 @@ create_symlink(Name, Linkname, Opts) ->
     case file:make_symlink(Linkname, Name) of
         ok -> ok;
         {error,enoent} ->
-            ok = make_dirs(Name, file),
-            create_symlink(Name, Linkname, Opts);
+            case make_dirs(Name, file) of
+                ok -> create_symlink(Name, Linkname, Opts);
+                {error,Reason} -> throw({error, Reason})
+            end;
         {error,eexist} -> not_written;
+        {error,enotsup} when is_tuple(Name) ->
+            %% The platform makes no link in a directory. The name was
+            %% checked, so the link is made by path.
+            {_Root, Path} = Name,
+            create_symlink(filename:absname(Path, Opts#read_opts.cwd),
+                           Linkname, Opts);
         {error,enotsup} ->
             read_verbose(Opts, "x ~ts - symbolic links not supported~n", [Name]),
             not_written;
@@ -2269,7 +2316,7 @@ set_device_info(Name, #tar_header{}=Header) ->
 make_dirs(Name, file) ->
     filelib:ensure_dir(Name);
 make_dirs(Name, dir) ->
-    filelib:ensure_dir(filename:join(Name,"*")).
+    filelib:ensure_path(Name).
 
 %% Prints the message on if the verbose option is given (for reading).
 read_verbose(#read_opts{verbose=true}, Format, Args) ->

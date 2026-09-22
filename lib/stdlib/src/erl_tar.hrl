@@ -35,6 +35,7 @@
 %% Options used when reading a tar archive.
 -record(read_opts, {
           cwd                    :: string(),  %% Current working directory.
+          root                   :: file:fd() | undefined, %% cwd opened as a root.
           keep_old_files = false :: boolean(), %% Owerwrite or not.
           files = all,                         %% Set of files to extract (or all)
           output = file :: 'file' | 'memory',

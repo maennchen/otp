@@ -29,7 +29,7 @@
 	 extract_from_binary_compressed/1, extract_filtered/1,
 	 extract_from_open_file/1, symlinks/1, open_add_close/1, cooked_compressed/1,
 	 memory/1,unicode/1,read_other_implementations/1,bsdtgz/1,
-         sparse/1, init/1, leading_slash/1, dotdot/1,
+         sparse/1, init/1, leading_slash/1, dotdot/1, dot/1,
          roundtrip_metadata/1, apply_file_info_opts/1,
          incompatible_options/1, table_absolute_names/1,
          streamed_extract/1, symlink_parent_dir/1,
@@ -47,7 +47,7 @@ all() ->
      extract_filtered,
      symlinks, open_add_close, cooked_compressed, memory, unicode,
      read_other_implementations, bsdtgz,
-     sparse,init,leading_slash,dotdot,roundtrip_metadata,
+     sparse,init,leading_slash,dotdot,dot,roundtrip_metadata,
      apply_file_info_opts,incompatible_options, table_absolute_names,
      streamed_extract, symlink_parent_dir,
      max_size].
@@ -1074,6 +1074,28 @@ dotdot(Config) ->
     false = filelib:is_regular(filename:join(PrivDir, "some_file")),
     io:format("~s\n", [erl_tar:format_error(Error)]),
 
+    ok.
+
+%% An archive made from "." has an entry for the directory itself.
+dot(Config) ->
+    PrivDir = proplists:get_value(priv_dir, Config),
+    Dir = filename:join(PrivDir, ?FUNCTION_NAME),
+    Empty = filename:join(Dir, "empty"),
+    Sub = filename:join(Dir, "sub"),
+    Out = filename:join(Dir, "out"),
+    ok = filelib:ensure_path(Empty),
+    ok = filelib:ensure_path(Sub),
+    ok = file:make_dir(Out),
+    ok = file:write_file(filename:join(Sub, "f"), <<"f\n">>),
+    Tar = filename:join(Dir, "dot.tar"),
+    {ok,Fd} = erl_tar:open(Tar, [write]),
+    ok = erl_tar:add(Fd, Empty, "./", []),
+    ok = erl_tar:add(Fd, Sub, "./sub", []),
+    ok = erl_tar:close(Fd),
+    {ok, [".", "./sub/f"]} = erl_tar:table(Tar),
+
+    ok = erl_tar:extract(Tar, [{cwd,Out}]),
+    {ok, <<"f\n">>} = file:read_file(filename:join(Out, "sub/f")),
     ok.
 
 roundtrip_metadata(Config) ->
