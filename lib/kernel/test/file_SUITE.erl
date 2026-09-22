@@ -53,7 +53,7 @@
 	 list_dir/1,list_dir_error/1,list_dir_handle/1,
 	 file_write_handle_info/1,
 	 open_at/1, open_at_symlink/1, read_at/1, write_at/1,
-	 link_at/1, copy_at/1,
+	 link_at/1, copy_at/1, open_root/1,
 	 untranslatable_names/1, untranslatable_names_error/1,
 	 pos1/1, pos2/1, pos3/1]).
 -export([close/1, consult1/1, path_consult/1, delete/1]).
@@ -159,7 +159,7 @@ groups() ->
       [open1, old_modes, new_modes, path_open, close, access,
        read_write, pread_write, append, open_errors,
        exclusive, open_at, open_at_symlink, read_at, write_at,
-       link_at, copy_at]},
+       link_at, copy_at, open_root]},
      {pos, [], [pos1, pos2, pos3]},
      {file_info, [],
       [file_info_basic_file, file_info_basic_directory,
@@ -1394,6 +1394,59 @@ copy_at(Config) when is_list(Config) ->
     ok = ?FILE_MODULE:close(To),
     ok = ?FILE_MODULE:close(From),
     ok = ?FILE_MODULE:del_dir(filename:join(TestDir, "to")),
+    ok = ?FILE_MODULE:del_dir(TestDir),
+
+    [] = flush(),
+    ok.
+
+%% A root from open_root/1 keeps every name inside it.
+open_root(Config) when is_list(Config) ->
+    RootDir = proplists:get_value(priv_dir, Config),
+    TestDir = filename:join(RootDir, ?MODULE_STRING++"_open_root"),
+    ok = ?FILE_MODULE:make_dir(TestDir),
+    ok = ?FILE_MODULE:write_file(filename:join(TestDir, "secret"), "SECRET"),
+    Root = filename:join(TestDir, "root"),
+    ok = ?FILE_MODULE:make_dir(Root),
+    ok = ?FILE_MODULE:write_file(filename:join(Root, "inside"), "INSIDE"),
+
+    {ok, R} = ?FILE_MODULE:open_root(Root),
+
+    {ok, <<"INSIDE">>} = ?FILE_MODULE:read_file({R, "inside"}),
+    {ok, <<"INSIDE">>} = ?FILE_MODULE:read_file({R, "/inside"}),
+    {ok, #file_info{type = regular}} = ?FILE_MODULE:read_file_info({R, "inside"}),
+    {ok, ["inside"]} = ?FILE_MODULE:list_dir({R, "."}),
+
+    {error, exdev} = ?FILE_MODULE:read_file({R, "../secret"}),
+    {error, exdev} = ?FILE_MODULE:open({R, "../secret"}, [read]),
+    {error, exdev} = ?FILE_MODULE:open({R, "../secret"}, [raw, read]),
+    {error, exdev} = ?FILE_MODULE:read_file_info({R, "../secret"}),
+    {error, exdev} = ?FILE_MODULE:make_dir({R, "../dir"}),
+    {error, exdev} = ?FILE_MODULE:delete({R, "../secret"}),
+    {error, exdev} = ?FILE_MODULE:rename({R, "inside"}, {R, "../moved"}),
+
+    %% A file made through the root lands inside it.
+    ok = ?FILE_MODULE:make_dir({R, "sub"}),
+    {ok, Fd} = ?FILE_MODULE:open({R, "sub/../new"}, [write]),
+    ok = ?FILE_MODULE:write(Fd, "NEW"),
+    ok = ?FILE_MODULE:close(Fd),
+    {ok, <<"NEW">>} = ?FILE_MODULE:read_file(filename:join(Root, "new")),
+    ok = ?FILE_MODULE:delete({R, "new"}),
+    ok = ?FILE_MODULE:del_dir({R, "sub"}),
+
+    %% A root can be opened in an open directory.
+    {ok, Dir} = ?FILE_MODULE:open(TestDir, [raw, read, directory]),
+    {ok, R2} = ?FILE_MODULE:open_root({Dir, "root"}),
+    {error, exdev} = ?FILE_MODULE:read_file({R2, "../secret"}),
+    ok = ?FILE_MODULE:close(R2),
+    ok = ?FILE_MODULE:close(Dir),
+
+    {error, enoent} = ?FILE_MODULE:open_root(filename:join(TestDir, "missing")),
+
+    ok = ?FILE_MODULE:close(R),
+
+    ok = ?FILE_MODULE:delete(filename:join(Root, "inside")),
+    ok = ?FILE_MODULE:del_dir(Root),
+    ok = ?FILE_MODULE:delete(filename:join(TestDir, "secret")),
     ok = ?FILE_MODULE:del_dir(TestDir),
 
     [] = flush(),

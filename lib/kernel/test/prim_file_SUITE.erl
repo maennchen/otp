@@ -44,7 +44,7 @@
 	 list_dir_handle/1]).
 
 -export([open_at/1, read_at/1, write_at/1, link_at/1, open_in_root/1,
-         resolve_in_root/1]).
+         resolve_in_root/1, open_root/1]).
 
 -export([file_write_handle_info/1]).
 
@@ -69,7 +69,7 @@ all() ->
     [read_write_file, {group, dirs}, {group, files},
      delete, rename, {group, errors}, {group, links},
      list_dir_limit, list_dir, list_dir_handle, adopt, open_at, read_at,
-     write_at, link_at, open_in_root, resolve_in_root].
+     write_at, link_at, open_in_root, resolve_in_root, open_root].
 
 groups() -> 
     [{dirs, [],
@@ -2519,6 +2519,45 @@ resolve_in_root(Config) ->
 
 sorted({ok, Names}) -> {ok, lists:sort(Names)};
 sorted(Other) -> Other.
+
+%% A root from open_root/1 makes {Root, Name} resolve as {root, Root, Name}.
+open_root(Config) ->
+    RootDir = proplists:get_value(priv_dir, Config),
+    TestDir = filename:join(RootDir, ?MODULE_STRING++"_open_root"),
+    ok = ?PRIM_FILE:make_dir(TestDir),
+    ok = ?PRIM_FILE:write_file(filename:join(TestDir, "secret"), "SECRET"),
+    Root = filename:join(TestDir, "root"),
+    ok = ?PRIM_FILE:make_dir(Root),
+    ok = ?PRIM_FILE:write_file(filename:join(Root, "inside"), "INSIDE"),
+
+    {ok, R} = ?PRIM_FILE:open_root(Root),
+    {ok, <<"INSIDE">>} = ?PRIM_FILE:read_file({R, "inside"}),
+    {ok, <<"INSIDE">>} = ?PRIM_FILE:read_file({R, "/inside"}),
+    {error, exdev} = ?PRIM_FILE:read_file({R, "../secret"}),
+    {error, exdev} = ?PRIM_FILE:open({R, "../secret"}, [read]),
+    {error, exdev} = ?PRIM_FILE:make_dir({R, "../dir"}),
+    {ok, ["inside"]} = ?PRIM_FILE:list_dir({R, "."}),
+    {ok, ["inside"]} = ?PRIM_FILE:list_dir(R),
+
+    %% A root opened in a directory or in another root is a root as well.
+    {ok, D} = ?PRIM_FILE:open(TestDir, [read, directory]),
+    {ok, R2} = ?PRIM_FILE:open_root({D, "root"}),
+    {error, exdev} = ?PRIM_FILE:read_file({R2, "../secret"}),
+    {ok, R3} = ?PRIM_FILE:open_root({R, "."}),
+    {error, exdev} = ?PRIM_FILE:read_file({R3, "../secret"}),
+    {error, exdev} = ?PRIM_FILE:open_root({R, ".."}),
+    {error, enotdir} = ?PRIM_FILE:open_root({R, "inside"}),
+
+    ok = ?PRIM_FILE:close(R3),
+    ok = ?PRIM_FILE:close(R2),
+    ok = ?PRIM_FILE:close(D),
+    ok = ?PRIM_FILE:close(R),
+
+    ok = ?PRIM_FILE:delete(filename:join(Root, "inside")),
+    ok = ?PRIM_FILE:del_dir(Root),
+    ok = ?PRIM_FILE:delete(filename:join(TestDir, "secret")),
+    ok = ?PRIM_FILE:del_dir(TestDir),
+    ok.
 
 %% An operation that acts on a link itself is given the link. An operation
 %% that would follow the link has the walk follow it, so the link cannot lead

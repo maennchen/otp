@@ -213,7 +213,7 @@ operating system kernel.
 %% Specialized
 -export([ipread_s32bu_p32bu/3]).
 %% Generic file contents.
--export([open/2, close/1, advise/4, allocate/3,
+-export([open/2, open_root/1, close/1, advise/4, allocate/3,
 	 read/2, write/2, 
 	 pread/2, pread/3, pwrite/2, pwrite/3,
 	 read_line/1,
@@ -1606,7 +1606,8 @@ stays open after the directory is closed.
 
 `Name` itself is not checked. On Unix a name that contains `..` or that starts
 with a separator still reaches a file outside the directory. Windows refuses
-such a name.
+such a name. A root from `open_root/1` in place of `Dir` checks the name, see
+that function.
 
 ```erlang
 {ok, Dir} = file:open("/tmp/example", [raw, read, directory]),
@@ -1659,6 +1660,46 @@ open(Item, ModeList) when is_list(ModeList) ->
 %% Old obsolete mode specification in atom or 2-tuple format
 open(Item, Mode) ->
     open(Item, mode_list(Mode)).
+
+-doc """
+Opens the directory `Dir` as a root, and returns a handle that every function
+taking a `{Dir, Name}` tuple accepts in place of `Dir`.
+
+A name resolved against a root cannot reach a file outside it. The name is
+resolved one component at a time against the root. A `..` that would leave the
+root gives `{error, exdev}`, and so does a symbolic link whose target leads
+outside. A name or a link target that starts with a separator starts again at
+the root. A symbolic link with an absolute target is followed on Unix, where
+its target is read as a name under the root, and refused with `{error, exdev}`
+on Windows.
+
+`Dir` can itself be a `{Dir, Name}` tuple, so a root can be opened in an open
+directory or in another root. The root is always a raw file, and it belongs to
+the process that opened it.
+
+```erlang
+{ok, Root} = file:open_root("/srv/uploads"),
+{error, exdev} = file:read_file({Root, "../etc/passwd"}),
+{ok, Data} = file:read_file({Root, "user/report.txt"}),
+ok = file:close(Root).
+```
+""".
+-doc(#{since => <<"OTP 30.0">>}).
+-spec open_root(Dir) -> {ok, Root} | {error, Reason} when
+      Dir :: name_all() | {fd(), name_all()},
+      Root :: fd(),
+      Reason :: posix() | badarg | system_limit.
+
+open_root(Target) when ?IS_AT_TARGET(Target) ->
+    at_call(open_root, Target, []);
+
+open_root(Dir) ->
+    case file_name(Dir) of
+        {error, _} = Error ->
+            Error;
+        Name ->
+            ?PRIM_FILE:open_root(Name)
+    end.
 
 %% Builds the target that prim_file expects. This unwraps the directory and
 %% encodes the name the same way as a path.

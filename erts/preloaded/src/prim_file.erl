@@ -24,7 +24,7 @@
 
 -export([on_load/0]).
 
--export([open/2, close/1,
+-export([open/2, open_root/1, close/1,
          sync/1, datasync/1, truncate/1, advise/4, allocate/3,
          read_line/1, read/2, write/2, position/2,
          pread/2, pread/3, pwrite/2, pwrite/3]).
@@ -138,8 +138,9 @@ copy(#file_descriptor{module = ?MODULE} = Source,
 %% with a separator still reaches a file outside the directory. Windows refuses
 %% such a name.
 %%
-%% A name in a root, given as {root, Root, Name}, is resolved one component at
-%% a time against that root, so it cannot reach a file outside the root.
+%% A name in a root, given as {Root, Name} with a root from open_root/1 or as
+%% {root, Root, Name}, is resolved one component at a time against that root,
+%% so it cannot reach a file outside the root.
 open(Target, Modes) ->
     %% The try/catch pattern seen here is used throughout the file to adhere to
     %% the public file interface, which has leaked through for ages because of
@@ -149,6 +150,16 @@ open(Target, Modes) ->
         {error, Reason} -> {error, Reason}
     catch
         error:badarg -> {error, badarg}
+    end.
+
+%% Opens a directory as a root. A name resolved against it cannot reach a file
+%% outside it.
+open_root(Target) ->
+    case open(Target, [read, directory]) of
+        {ok, #file_descriptor{data = Data} = Fd} ->
+            {ok, Fd#file_descriptor{data = Data#{root => true}}};
+        {error, Reason} ->
+            {error, Reason}
     end.
 
 file_desc_to_ref(FileDescriptorId, Modes) ->
@@ -969,8 +980,12 @@ proplist_get_value(Key, [_Other | Rest], Default) ->
 %% A name in a root carries the root, and its tag says that the name may not
 %% leave it.
 encode_target({#file_descriptor{module = ?MODULE} = Dir, Name}) ->
-    #{ handle := DirRef } = get_fd_data(Dir),
-    {dir, DirRef, encode_path(Name)};
+    case get_fd_data(Dir) of
+        #{ root := true, handle := RootRef } ->
+            {root, RootRef, encode_path(Name)};
+        #{ handle := DirRef } ->
+            {dir, DirRef, encode_path(Name)}
+    end;
 encode_target({root, #file_descriptor{module = ?MODULE} = Root, Name}) ->
     #{ handle := RootRef } = get_fd_data(Root),
     {root, RootRef, encode_path(Name)};
