@@ -978,6 +978,11 @@ The path is considered unsafe in the following circumstances:
 - A ".." component would climb up above the root of the relative path.
 - A symbolic link in the path points above the root of the relative path.
 
+The check reads the file system once, when it is made. Another process can
+change a directory or a link afterwards. To keep a name inside a directory
+when the file is used, open the directory with `file:open_root/1` and give the
+name as `{Root, Name}`.
+
 _Examples:_
 
 ```erlang

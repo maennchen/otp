@@ -107,7 +107,25 @@ in the STDLIB User's Guide.
 - `espipe` \- Invalid seek
 - `esrch` \- No such process
 - `estale` \- Stale remote file handle
-- `exdev` \- Cross-device link
+- `exdev` \- Cross-device link, or a name that leaves a root (see
+  `open_root/1`)
+
+## Names in open directories and roots
+
+A function that takes a file name resolves every component of that name on
+each call. Another process can replace a directory in the path between two
+calls, so two calls with the same name can reach different files.
+
+A `{Dir, Name}` tuple, where `Dir` is a directory opened with the modes `raw`,
+`read` and `directory`, resolves `Name` against the open directory instead.
+The path of `Dir` is not resolved again, so a replaced directory in that path
+cannot change which file the call reaches. See `open/2`.
+
+`Name` itself is not checked in a directory. On Unix a `..` or a leading
+separator still reaches a file outside it. A root from `open_root/1` also
+keeps `Name` inside: a name that would leave the root gives `{error, exdev}`.
+A symbolic link with an absolute target is followed under the root on Unix
+and refused on Windows, where a link always stores a full path.
 
 ## Performance
 
