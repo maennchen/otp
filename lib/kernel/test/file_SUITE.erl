@@ -53,7 +53,7 @@
 	 list_dir/1,list_dir_error/1,list_dir_handle/1,
 	 file_write_handle_info/1,
 	 open_at/1, open_at_symlink/1, read_at/1, write_at/1,
-	 link_at/1,
+	 link_at/1, copy_at/1,
 	 untranslatable_names/1, untranslatable_names_error/1,
 	 pos1/1, pos2/1, pos3/1]).
 -export([close/1, consult1/1, path_consult/1, delete/1]).
@@ -159,7 +159,7 @@ groups() ->
       [open1, old_modes, new_modes, path_open, close, access,
        read_write, pread_write, append, open_errors,
        exclusive, open_at, open_at_symlink, read_at, write_at,
-       link_at]},
+       link_at, copy_at]},
      {pos, [], [pos1, pos2, pos3]},
      {file_info, [],
       [file_info_basic_file, file_info_basic_directory,
@@ -1326,6 +1326,67 @@ link_at(Config) when is_list(Config) ->
 
     ok = ?FILE_MODULE:delete(filename:join(TestDir, "file")),
     ok = ?FILE_MODULE:del_dir(filename:join(TestDir, "other")),
+    ok = ?FILE_MODULE:del_dir(TestDir),
+
+    [] = flush(),
+    ok.
+
+%% copy/2,3 reaches a name in an open directory when the name is given with its
+%% mode list, so it is not read as a filename and a mode list of its own.
+copy_at(Config) when is_list(Config) ->
+    RootDir = proplists:get_value(priv_dir, Config),
+    TestDir = filename:join(RootDir, ?MODULE_STRING++"_copy_at"),
+    ok = ?FILE_MODULE:make_dir(TestDir),
+    ok = ?FILE_MODULE:make_dir(filename:join(TestDir, "to")),
+
+    Source = filename:join(TestDir, "source"),
+    ok = ?FILE_MODULE:write_file(Source, "copied"),
+
+    {ok, From} = ?FILE_MODULE:open(TestDir, [raw, read, directory]),
+    {ok, To} = ?FILE_MODULE:open(filename:join(TestDir, "to"),
+                                 [raw, read, directory]),
+
+    %% Both names in an open directory.
+    {ok, 6} = ?FILE_MODULE:copy({{From, "source"}, []}, {{To, "a"}, []}),
+    {ok, <<"copied">>} = ?FILE_MODULE:read_file({To, "a"}),
+
+    %% One name in an open directory, the other a path.
+    {ok, 6} = ?FILE_MODULE:copy({{From, "source"}, []},
+                                {filename:join(TestDir, "b"), []}),
+    {ok, <<"copied">>} = ?FILE_MODULE:read_file(filename:join(TestDir, "b")),
+
+    {ok, 6} = ?FILE_MODULE:copy({Source, []}, {{To, "c"}, []}),
+    {ok, <<"copied">>} = ?FILE_MODULE:read_file({To, "c"}),
+
+    %% A byte count is honoured as it is for a path.
+    {ok, 3} = ?FILE_MODULE:copy({{From, "source"}, []}, {{To, "d"}, []}, 3),
+    {ok, <<"cop">>} = ?FILE_MODULE:read_file({To, "d"}),
+
+    %% Without its mode list the tuple is not a name in a directory.
+    {error, badarg} = ?FILE_MODULE:copy({From, "source"},
+                                        filename:join(TestDir, "e")),
+
+    {error, enoent} = ?FILE_MODULE:copy({{From, "missing"}, []}, {{To, "f"}, []}),
+
+    %% A name in an open directory is copied to and from an open file as well.
+    {ok, Out} = ?FILE_MODULE:open(filename:join(TestDir, "g"),
+                                  [raw, write, binary]),
+    {ok, 6} = ?FILE_MODULE:copy({{From, "source"}, []}, Out),
+    ok = ?FILE_MODULE:close(Out),
+    {ok, <<"copied">>} = ?FILE_MODULE:read_file(filename:join(TestDir, "g")),
+
+    {ok, In} = ?FILE_MODULE:open(Source, [raw, read, binary]),
+    {ok, 6} = ?FILE_MODULE:copy(In, {{To, "h"}, []}),
+    ok = ?FILE_MODULE:close(In),
+    {ok, <<"copied">>} = ?FILE_MODULE:read_file({To, "h"}),
+
+    [ok = ?FILE_MODULE:delete({To, N}) || N <- ["a", "c", "d", "h"]],
+    ok = ?FILE_MODULE:delete(filename:join(TestDir, "g")),
+    ok = ?FILE_MODULE:delete(filename:join(TestDir, "b")),
+    ok = ?FILE_MODULE:delete(Source),
+    ok = ?FILE_MODULE:close(To),
+    ok = ?FILE_MODULE:close(From),
+    ok = ?FILE_MODULE:del_dir(filename:join(TestDir, "to")),
     ok = ?FILE_MODULE:del_dir(TestDir),
 
     [] = flush(),
