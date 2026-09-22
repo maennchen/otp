@@ -177,6 +177,7 @@ WRAP_FILE_HANDLE_EXPORT(list_handle_dir_nif)
 WRAP_FILE_HANDLE_EXPORT(set_handle_permissions_nif)
 WRAP_FILE_HANDLE_EXPORT(set_handle_owner_nif)
 WRAP_FILE_HANDLE_EXPORT(set_handle_time_nif)
+WRAP_FILE_HANDLE_EXPORT(set_controlling_process_nif)
 
 static ErlNifFunc nif_funcs[] = {
     /* File handle ops */
@@ -196,6 +197,7 @@ static ErlNifFunc nif_funcs[] = {
     {"set_handle_permissions_nif", 2, set_handle_permissions_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"set_handle_owner_nif", 3, set_handle_owner_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"set_handle_time_nif", 4, set_handle_time_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"set_controlling_process_nif", 2, set_controlling_process_nif},
 
     /* Filesystem ops */
     {"make_hard_link_nif", 2, make_hard_link_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
@@ -583,6 +585,30 @@ static ERL_NIF_TERM create_ref_or_error_tuple(ErlNifEnv *env, efile_data_t *d) {
     result = enif_make_resource(env, d);
 
     return enif_make_tuple2(env, am_ok, result);
+}
+
+/* Moves a file to another process. The new owner is monitored before the old
+ * monitor is removed, so the file is never left without one. The file is busy
+ * while this runs, so no operation on it can race the change. */
+static ERL_NIF_TERM set_controlling_process_nif_impl(efile_data_t *d, ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    ErlNifPid new_owner;
+    ErlNifMonitor monitor;
+
+    ASSERT(argc == 1);
+
+    if(!enif_get_local_pid(env, argv[0], &new_owner)) {
+        return enif_make_badarg(env);
+    }
+
+    if(enif_monitor_process(env, d, &new_owner, &monitor)) {
+        /* The new owner is already dead. */
+        return posix_error_to_tuple(env, ESRCH);
+    }
+
+    enif_demonitor_process(env, d, &d->monitor);
+    d->monitor = monitor;
+
+    return am_ok;
 }
 
 static ERL_NIF_TERM open_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
