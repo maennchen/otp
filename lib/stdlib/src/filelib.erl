@@ -377,12 +377,18 @@ Ensures that all parent directories for the specified file or directory name
 
 Returns `ok` if all parent directories already exist or can be created. Returns
 `{error, Reason}` if some parent directory does not exist and cannot be created.
+
+`Name` can also be a `{Dir, Name}` tuple, where `Dir` is a directory that was
+opened with the modes `raw`, `read` and `directory`. Every directory is then
+made through `Dir`. See `file:open/2`.
 """.
 -spec ensure_dir(Name) -> 'ok' | {'error', Reason} when
-      Name :: filename_all() | dirname_all(),
+      Name :: filename_all() | dirname_all() | {file:fd(), filename_all()},
       Reason :: file:posix().
 ensure_dir("/") ->
     ok;
+ensure_dir({Dir, F}) ->
+    ensure_path({Dir, filename:dirname(F)});
 ensure_dir(F) ->
     Dir = filename:dirname(F),
     ensure_path(Dir).
@@ -396,13 +402,20 @@ a directory, including the last segment.
 
 Returns `ok` if all parent directories already exist or can be created. Returns
 `{error, Reason}` if some parent directory does not exist and cannot be created.
+
+`Path` can also be a `{Dir, Name}` tuple, where `Dir` is a directory that was
+opened with the modes `raw`, `read` and `directory`. Every directory is then
+made through `Dir`. See `file:open/2`.
 """.
 -doc(#{since => <<"OTP 25.0">>}).
 -spec ensure_path(Path) -> 'ok' | {'error', Reason} when
-      Path :: dirname_all(),
+      Path :: dirname_all() | {file:fd(), dirname_all()},
       Reason :: file:posix().
 ensure_path("/") ->
     ok;
+ensure_path({Dir, Path}) ->
+    Components = [C || C <- filename:split(Path), not string:equal(C, ".")],
+    ensure_path_in(Dir, Components, []);
 
 ensure_path(Path) -> 
     case do_is_dir(Path, file) of
@@ -425,6 +438,21 @@ ensure_path(Path) ->
                         Other ->
                             Other
                     end
+            end
+    end.
+
+ensure_path_in(_Dir, [], _Made) ->
+    ok;
+ensure_path_in(Dir, [Component | Rest], Made0) ->
+    Made = [Component | Made0],
+    Path = filename:join(lists:reverse(Made)),
+    case file:make_dir({Dir, Path}) of
+        ok ->
+            ensure_path_in(Dir, Rest, Made);
+        {error, _} = Error ->
+            case do_is_dir({Dir, Path}, file) of
+                true -> ensure_path_in(Dir, Rest, Made);
+                false -> Error
             end
     end.
 
