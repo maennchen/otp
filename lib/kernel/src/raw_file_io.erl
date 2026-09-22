@@ -24,8 +24,6 @@
 
 -export([open/2]).
 
--include("file_int.hrl").
-
 open(Filename, Modes) ->
     %% Layers are applied in this order, and the listed modules will call this
     %% function again as necessary. eg. a raw compressed delayed file in list
@@ -34,8 +32,6 @@ open(Filename, Modes) ->
                    {raw_file_io_compressed, fun match_compressed/1},
                    {raw_file_io_delayed, fun match_delayed/1}],
     open_1(ModuleOrder, Filename, add_implicit_modes(Modes)).
-open_1([], #file_descriptor{module = prim_file} = Fd, _Modes) ->
-    prim_file:adopt(Fd);
 open_1([], Filename, Modes) ->
     prim_file:open(Filename, Modes);
 open_1([{Module, Match} | Rest], Filename, Modes) ->

@@ -48,7 +48,6 @@
 
 -export([file_write_handle_info/1]).
 
--export([adopt/1]).
 
 -export([advise/1]).
 -export([large_write/1]).
@@ -68,7 +67,7 @@ suite() -> [].
 all() -> 
     [read_write_file, {group, dirs}, {group, files},
      delete, rename, {group, errors}, {group, links},
-     list_dir_limit, list_dir, list_dir_handle, adopt, open_at, read_at,
+     list_dir_limit, list_dir, list_dir_handle, open_at, read_at,
      write_at, link_at, open_in_root, resolve_in_root, open_root, dup].
 
 groups() -> 
@@ -1868,69 +1867,6 @@ file_write_handle_info(Config) ->
     ok = ?PRIM_FILE:delete(Name),
     ok = ?PRIM_FILE:del_dir(TestDir),
     ok.
-
-%% Tests that a raw file can change owner. The emulator closes a file when the
-%% process that owns it dies, so the file has to follow its new owner.
-adopt(Config) ->
-    RootDir = proplists:get_value(priv_dir, Config),
-    TestDir = filename:join(RootDir, ?MODULE_STRING++"_adopt"),
-    ok = ?PRIM_FILE:make_dir(TestDir),
-    Name = filename:join(TestDir, "file"),
-    ok = ?PRIM_FILE:write_file(Name, "contents"),
-    Parent = self(),
-
-    %% A file that another process opened stays open after that process dies,
-    %% because this process adopted it.
-    Opener = spawn(fun() ->
-                           {ok, Fd} = ?PRIM_FILE:open(Name, [read]),
-                           Parent ! {self(), Fd},
-                           receive done -> ok end
-                   end),
-    Fd = receive {Opener, F} -> F end,
-    {ok, Adopted} = ?PRIM_FILE:adopt(Fd),
-    ok = stop_and_wait(Opener),
-    {ok, <<"contents">>} = ?PRIM_FILE:read(Adopted, 100),
-    ok = ?PRIM_FILE:close(Adopted),
-
-    %% A file that this process opened is closed when the process that adopted
-    %% it dies.
-    {ok, Fd2} = ?PRIM_FILE:open(Name, [read]),
-    Taker = spawn(fun() ->
-                          {ok, _} = ?PRIM_FILE:adopt(Fd2),
-                          Parent ! {self(), adopted},
-                          receive done -> ok end
-                  end),
-    receive {Taker, adopted} -> ok end,
-    ok = stop_and_wait(Taker),
-    ok = wait_until_closed(Fd2),
-
-    %% A closed file cannot be adopted.
-    {error, einval} = ?PRIM_FILE:adopt(Fd2),
-
-    ok = ?PRIM_FILE:delete(Name),
-    ok = ?PRIM_FILE:del_dir(TestDir),
-    ok.
-
-stop_and_wait(Pid) ->
-    Ref = monitor(process, Pid),
-    Pid ! done,
-    receive {'DOWN', Ref, process, Pid, _} -> ok end.
-
-%% The emulator closes a file some time after its owner is reported down.
-wait_until_closed(Fd) ->
-    wait_until_closed(Fd, 100).
-
-wait_until_closed(Fd, N) ->
-    case ?PRIM_FILE:read(Fd, 1) of
-        {error, einval} ->
-            ok;
-        Other when N > 0 ->
-            io:format("still open: ~p~n", [Other]),
-            timer:sleep(10),
-            wait_until_closed(Fd, N - 1);
-        Other ->
-            ct:fail({still_open, Other})
-    end.
 
 %% Tests that a name is opened against an open directory, so the path of the
 %% directory is not resolved a second time.

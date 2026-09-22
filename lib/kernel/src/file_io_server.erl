@@ -54,11 +54,11 @@ format_error(ErrorId) ->
     erl_posix_msg:message(ErrorId).
 
 start(Owner, FileName, ModeList) 
-  when is_pid(Owner), (is_list(FileName) orelse is_binary(FileName)), is_list(ModeList) ->
+  when is_pid(Owner), (is_list(FileName) orelse is_binary(FileName) orelse is_tuple(FileName)), is_list(ModeList) ->
     do_start(spawn, Owner, FileName, ModeList).
 
 start_link(Owner, FileName, ModeList) 
-  when is_pid(Owner), (is_list(FileName) orelse is_binary(FileName)), is_list(ModeList) ->
+  when is_pid(Owner), (is_list(FileName) orelse is_binary(FileName) orelse is_tuple(FileName)), is_list(ModeList) ->
     do_start(spawn_link, Owner, FileName, ModeList).
 
 start_handle(Owner, OpenFun, ModeList)
@@ -73,7 +73,10 @@ start_link_handle(Owner, OpenFun, ModeList)
 %%% Server starter, dispatcher and helpers
 
 do_start(Spawn, Owner, FileName, ModeList) ->
-    OpenFun = fun(_ReadMode, Opts) -> raw_file_io:open(FileName, [raw | Opts]) end,
+    OpenFun = fun(ReadMode, Opts0) ->
+                      Opts = maybe_add_read_ahead(ReadMode, Opts0),
+                      raw_file_io:open(FileName, [raw | Opts])
+              end,
     do_start_handle(Spawn, Owner, OpenFun, ModeList).
 
 do_start_handle(Spawn, Owner, OpenFun, ModeList) ->
@@ -86,7 +89,7 @@ do_start_handle(Spawn, Owner, OpenFun, ModeList) ->
 		  erlang:dt_restore_tag(Utag),
 		  case parse_options(ModeList) of
                       {ReadMode, UnicodeMode, Opts} ->
-                          case OpenFun(ReadMode, maybe_add_read_ahead(ReadMode, Opts)) of
+                          case OpenFun(ReadMode, Opts) of
 			      {ok, Handle} ->
 				  M = erlang:monitor(process, Owner),
 				  Self ! {Ref, ok},

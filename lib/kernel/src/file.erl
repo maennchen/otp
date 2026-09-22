@@ -1826,10 +1826,6 @@ unwrap_fd(#file_descriptor{data = #file_descriptor{} = Inner}) ->
 unwrap_fd(Fd) ->
     Fd.
 
-%% The directory belongs to the calling process, so the file is opened here
-%% even when the caller asked for an io server. The io server then adopts the
-%% open file instead of opening a name in its own process, and the file is
-%% closed when the io server dies rather than when the caller does.
 open_at(Target0, ModeList) ->
     case at_target(Target0) of
         {error, _} = Error ->
@@ -1838,56 +1834,19 @@ open_at(Target0, ModeList) ->
             open_at_1(Target, ModeList)
     end.
 
-open_at_1(Target, ModeList) ->
+open_at_1({_Dir, Name} = Target, ModeList) ->
     case {lists:member(raw, ModeList), lists:member(ram, ModeList)} of
         {_, true} ->
             {error, badarg};
         {true, false} ->
-            open_at_raw(Target, ModeList);
+            raw_file_io:open(Target, ModeList);
         {false, false} ->
-            open_at_io_server(Target, ModeList)
-    end.
-
-%% The directory belongs to the calling process, so the file is opened here
-%% and the raw layers take it over.
-open_at_raw(Target, ModeList) ->
-    case ?PRIM_FILE:open(Target, ModeList) of
-        {ok, Fd} ->
-            case raw_file_io:open(Fd, ModeList) of
-                {ok, _} = Result ->
-                    Result;
-                Error ->
-                    _ = ?PRIM_FILE:close(Fd),
-                    Error
-            end;
-        Error ->
-            Error
-    end.
-
-open_at_io_server({_Dir, Name} = Target, ModeList) ->
-    case check_args([Name | ModeList]) of
-        ok ->
-            case ?PRIM_FILE:open(Target, ModeList) of
-                {ok, Fd} ->
-                    start_io_server_for(Fd, ModeList);
+            case check_args([Name | ModeList]) of
+                ok ->
+                    file_io_server:start(self(), Target, ModeList);
                 Error ->
                     Error
-            end;
-        Error ->
-            Error
-    end.
-
-start_io_server_for(Fd, ModeList) ->
-    OpenFun = fun(_ReadMode, Opts) -> raw_file_io:open(Fd, [raw | Opts]) end,
-
-    case file_io_server:start_handle(self(), OpenFun, ModeList) of
-        {ok, _Pid} = Result ->
-            Result;
-        Error ->
-            %% The io server never took the file, so it is still ours to
-            %% close.
-            _ = ?PRIM_FILE:close(Fd),
-            Error
+            end
     end.
 
 %%%-----------------------------------------------------------------

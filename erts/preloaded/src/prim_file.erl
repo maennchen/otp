@@ -31,7 +31,7 @@
 
 %% OTP internal.
 
--export([file_desc_to_ref/2, adopt/1]).
+-export([file_desc_to_ref/2]).
 
 -export([ipread_s32bu_p32bu/3, sendfile/8, internal_get_nif_resource/1,
          altname/1, get_handle/1]).
@@ -71,7 +71,7 @@
        pwrite_nif/3, seek_nif/3, sync_nif/2, truncate_nif/1, allocate_nif/3,
        advise_nif/4, read_handle_info_nif/1, list_handle_dir_nif/1,
        set_handle_permissions_nif/2, set_handle_owner_nif/3,
-       set_handle_time_nif/4, set_controlling_process_nif/2,
+       set_handle_time_nif/4,
        make_hard_link_nif/2, make_soft_link_nif/2, rename_nif/2,
        read_info_nif/2, set_permissions_nif/2, set_owner_nif/3, set_time_nif/4,
        read_link_nif/1, list_dir_nif/1, make_dir_nif/1, del_file_nif/1,
@@ -141,6 +141,17 @@ copy(#file_descriptor{module = ?MODULE} = Source,
 %% A name in a root, given as {Root, Name} with a root from open_root/1 or as
 %% {root, Root, Name}, is resolved one component at a time against that root,
 %% so it cannot reach a file outside the root.
+open({#file_descriptor{module = ?MODULE, data = #{ owner := Owner }} = Dir,
+      Name}, Modes) when Owner =/= self() ->
+    %% A directory that another process owns is copied for this open.
+    case dup(Dir) of
+        {ok, Copy} ->
+            Result = open({Copy, Name}, Modes),
+            _ = close(Copy),
+            Result;
+        {error, Reason} ->
+            {error, Reason}
+    end;
 open(Target, Modes) ->
     %% The try/catch pattern seen here is used throughout the file to adhere to
     %% the public file interface, which has leaked through for ages because of
@@ -577,25 +588,6 @@ dup(#file_descriptor{module = ?MODULE, data = #{ handle := FRef } = Data}) ->
 dup_nif(_FileRef) ->
     erlang:nif_error(undef).
 
-%% Takes over a file that another process opened. A file is closed when the
-%% process that owns it dies, so a file that changes hands has to change the
-%% process it is monitored on as well.
-%%
-%% The caller becomes the owner. This does not check who owns the file now,
-%% because the point of the call is to take it from that process.
-adopt(#file_descriptor{module = ?MODULE, data = Data} = Fd) ->
-    try
-        #{ handle := FRef } = Data,
-        case set_controlling_process_nif(FRef, self()) of
-            ok -> {ok, Fd#file_descriptor{ data = Data#{ owner := self() } }};
-            {error, Reason} -> {error, Reason}
-        end
-    catch
-        error:badarg -> {error, badarg}
-    end.
-
-set_controlling_process_nif(_FileRef, _Pid) ->
-    erlang:nif_error(undef).
 file_desc_to_ref_nif(_FD) ->
     erlang:nif_error(undef).
 close_nif(_FileRef) ->
