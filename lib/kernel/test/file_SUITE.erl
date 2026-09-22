@@ -1433,6 +1433,17 @@ open_root(Config) when is_list(Config) ->
     ok = ?FILE_MODULE:delete({R, "new"}),
     ok = ?FILE_MODULE:del_dir({R, "sub"}),
 
+    ok = ?FILE_MODULE:make_dir({R, "tree"}),
+    ok = ?FILE_MODULE:make_dir({R, "tree/sub"}),
+    ok = ?FILE_MODULE:write_file({R, "tree/sub/leaf"}, "LEAF"),
+    ok = ?FILE_MODULE:write_file({R, "tree/sub/leaf2"}, "LEAF", []),
+    {ok, <<"LEAF">>} = ?FILE_MODULE:read_file({R, "tree/sub/leaf2"}),
+    {error, exdev} = ?FILE_MODULE:write_file({R, "../leak"}, "LEAK"),
+    {error, exdev} = ?FILE_MODULE:del_dir_r({R, "tree/../../secret"}),
+    ok = ?FILE_MODULE:del_dir_r({R, "tree"}),
+    {error, enoent} = ?FILE_MODULE:read_file_info({R, "tree"}),
+    {ok, <<"SECRET">>} = ?FILE_MODULE:read_file(filename:join(TestDir, "secret")),
+
     %% A root can be opened in an open directory.
     {ok, Dir} = ?FILE_MODULE:open(TestDir, [raw, read, directory]),
     {ok, R2} = ?FILE_MODULE:open_root({Dir, "root"}),

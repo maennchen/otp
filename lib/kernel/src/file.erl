@@ -668,10 +668,14 @@ first recursively deleted. Returns:
 - **`{error, posix()}`** - An error occurred when accessing or deleting `File`.
   If some file or directory under `File` could not be deleted, `File` cannot be
   deleted as it is non-empty, and `{error, eexist}` is returned.
+
+`File` can also be a `{Dir, Name}` tuple. `Dir` is a directory that was opened
+with the modes `raw`, `read` and `directory`. The operating system resolves
+`Name` and every name under it against that open directory. See `open/2`.
 """.
 -doc(#{since => <<"OTP 23.0">>}).
 -spec del_dir_r(File) -> ok | {error, Reason} when
-      File :: name_all(),
+      File :: name_all() | {fd(), name_all()},
       Reason :: posix() | badarg.
 
 del_dir_r(File) -> % rm -rf File
@@ -680,7 +684,7 @@ del_dir_r(File) -> % rm -rf File
 	    case list_dir_all(File) of
 		{ok, Names} ->
 		    lists:foreach(fun(Name) ->
-				      del_dir_r(filename:join(File, Name))
+				      del_dir_r(join(File, Name))
 				  end, Names);
 		{error, _Reason} -> ok
 	    end,
@@ -688,6 +692,11 @@ del_dir_r(File) -> % rm -rf File
 	{ok, _FileInfo} -> delete(File);
 	{error, _Reason} = Error -> Error
     end.
+
+join({Dir, Path}, Name) ->
+    {Dir, filename:join(Path, Name)};
+join(Path, Name) ->
+    filename:join(Path, Name).
 
 -doc(#{equiv => read_file_info(File, [])}).
 -spec read_file_info(File) -> {ok, FileInfo} | {error, Reason} when
@@ -1318,11 +1327,19 @@ Typical error reasons:
   parent directories.
 
 - **`eisdir`** - The named file is a directory.
+
+`Filename` can also be a `{Dir, Name}` tuple. `Dir` is a directory that was
+opened with the modes `raw`, `read` and `directory`. The operating system
+resolves `Name` against that open directory. The file server is not called
+for such a tuple, whether or not `raw` is set. See `open/2`.
 """.
 -spec write_file(Filename, Bytes) -> ok | {error, Reason} when
-      Filename :: name_all(),
+      Filename :: name_all() | {fd(), name_all()},
       Bytes :: iodata(),
       Reason :: posix() | badarg | terminated | system_limit.
+
+write_file(Target, Bin) when ?IS_AT_TARGET(Target) ->
+    write_file(Target, Bin, [raw]);
 
 write_file(Name, Bin) ->
     check_and_call(write_file, [file_name(Name), make_binary(Bin)]).
@@ -1337,7 +1354,7 @@ list of possible modes, see `open/2`. The mode flags `binary` and `write` are
 implicit, so they are not to be used.
 """.
 -spec write_file(Filename, Bytes, Modes) -> ok | {error, Reason} when
-      Filename :: name_all(),
+      Filename :: name_all() | {fd(), name_all()},
       Bytes :: iodata(),
       Modes :: [mode()],
       Reason :: posix() | badarg | terminated | system_limit.
