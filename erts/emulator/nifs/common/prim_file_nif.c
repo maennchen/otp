@@ -50,6 +50,9 @@ static ERL_NIF_TERM am_continue;
 
 static ERL_NIF_TERM am_file_info;
 
+/* The tag of a name in an open directory. */
+static ERL_NIF_TERM am_dir;
+
 /* File modes */
 static ERL_NIF_TERM am_read;
 static ERL_NIF_TERM am_write;
@@ -276,6 +279,8 @@ static int load(ErlNifEnv *env, void** priv_data, ERL_NIF_TERM prim_file_pid)
 
     am_file_info = enif_make_atom(env, "file_info");
 
+    am_dir = enif_make_atom(env, "dir");
+
     am_bof = enif_make_atom(env, "bof");
     am_cur = enif_make_atom(env, "cur");
     am_eof = enif_make_atom(env, "eof");
@@ -322,12 +327,128 @@ static int get_file_data(ErlNifEnv *env, ERL_NIF_TERM opaque, efile_data_t **d) 
     return enif_get_resource(env, opaque, efile_resource_type, (void **)d);
 }
 
-/* Turns a term into the file an operation acts on. */
+/* Takes a file for an operation, and answers the state the file was in. The
+ * operation may go ahead when that state is idle. */
+static enum efile_state_t acquire_file_data(efile_data_t *d) {
+    return erts_atomic32_cmpxchg_acqb(&d->state,
+        EFILE_STATE_BUSY, EFILE_STATE_IDLE);
+}
+
+/* Gives a file back after an operation, and closes it when a close was asked
+ * for while the operation ran. */
+static void release_file_data(efile_data_t *d) {
+    enum efile_state_t previous_state;
+
+    previous_state = erts_atomic32_cmpxchg_relb(&d->state,
+        EFILE_STATE_IDLE, EFILE_STATE_BUSY);
+
+    ASSERT(previous_state != EFILE_STATE_IDLE);
+
+    if(previous_state == EFILE_STATE_CLOSE_PENDING) {
+        /* Here and in dyncall_dup are the only points
+         * where a change from CLOSE_PENDING is possible,
+         * and we're running synchronously, so we can't race with
+         * anything else here. */
+        posix_errno_t ignored;
+
+        erts_atomic32_set_acqb(&d->state, EFILE_STATE_CLOSED);
+        efile_close(d, &ignored);
+    }
+}
+
+/* Turns a term into the file an operation acts on.
+ *
+ * A {dir, Ref, Name} tuple names a file in an open directory. The name is
+ * kept as it is given, because expanding it into a path, as a path is
+ * expanded on Windows, would name a file somewhere else. The directory is
+ * only looked up here. The operation takes it with acquire_target before it
+ * acts. */
 static posix_errno_t marshal_target(ErlNifEnv *env, ERL_NIF_TERM term,
         efile_target_t *target) {
-    target->kind = EFILE_TARGET_PATH;
+    const ERL_NIF_TERM *elements;
+    int arity;
 
-    return efile_marshal_path(env, term, &target->name);
+    if(!enif_get_tuple(env, term, &arity, &elements)) {
+        target->kind = EFILE_TARGET_PATH;
+        target->dir = NULL;
+
+        return efile_marshal_path(env, term, &target->name);
+    }
+
+    if(arity != 3 || !enif_is_identical(elements[0], am_dir)) {
+        return EINVAL;
+    }
+
+    target->kind = EFILE_TARGET_AT;
+
+    if(!get_file_data(env, elements[1], &target->dir)) {
+        return EINVAL;
+    }
+
+    if(!(target->dir->modes & EFILE_MODE_DIRECTORY)) {
+        return ENOTDIR;
+    }
+
+    return efile_marshal_name(env, elements[2], &target->name);
+}
+
+/* Takes the directory of a target for the operation, as file_handle_wrapper
+ * takes an open file, so a close cannot take the directory away under the
+ * operation. A path has no directory to take. The operation gives the
+ * directory back with release_target when it is done. */
+static posix_errno_t acquire_target(efile_target_t *target) {
+    target->holds_dir = 0;
+
+    if(target->kind == EFILE_TARGET_PATH) {
+        return 0;
+    }
+
+    if(acquire_file_data(target->dir) != EFILE_STATE_IDLE) {
+        return EINVAL;
+    }
+
+    target->holds_dir = 1;
+
+    return 0;
+}
+
+static void release_target(efile_target_t *target) {
+    if(target->holds_dir) {
+        release_file_data(target->dir);
+        target->holds_dir = 0;
+    }
+}
+
+/* As acquire_target, for an operation that takes two targets. Two names in
+ * the same directory take it once. */
+static posix_errno_t acquire_targets(efile_target_t *first,
+        efile_target_t *second) {
+    posix_errno_t posix_errno;
+
+    posix_errno = acquire_target(first);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    if(second->kind != EFILE_TARGET_PATH && second->dir == first->dir) {
+        second->holds_dir = 0;
+
+        return 0;
+    }
+
+    posix_errno = acquire_target(second);
+
+    if(posix_errno != 0) {
+        release_target(first);
+    }
+
+    return posix_errno;
+}
+
+static void release_targets(efile_target_t *first, efile_target_t *second) {
+    release_target(second);
+    release_target(first);
 }
 
 static ERL_NIF_TERM file_handle_wrapper(file_op_impl_t operation, ErlNifEnv *env,
@@ -342,27 +463,12 @@ static ERL_NIF_TERM file_handle_wrapper(file_op_impl_t operation, ErlNifEnv *env
         return enif_make_badarg(env);
     }
 
-    previous_state = erts_atomic32_cmpxchg_acqb(&d->state,
-        EFILE_STATE_BUSY, EFILE_STATE_IDLE);
+    previous_state = acquire_file_data(d);
 
     if(previous_state == EFILE_STATE_IDLE) {
         result = operation(d, env, argc - 1, &argv[1]);
 
-        previous_state = erts_atomic32_cmpxchg_relb(&d->state,
-            EFILE_STATE_IDLE, EFILE_STATE_BUSY);
-
-        ASSERT(previous_state != EFILE_STATE_IDLE);
-
-        if(previous_state == EFILE_STATE_CLOSE_PENDING) {
-            /* Here and in dyncall_dup are the only points
-             * where a change from CLOSE_PENDING is possible,
-             * and we're running synchronously, so we can't race with
-             * anything else here. */
-            posix_errno_t ignored;
-
-            erts_atomic32_set_acqb(&d->state, EFILE_STATE_CLOSED);
-            efile_close(d, &ignored);
-        }
+        release_file_data(d);
     } else {
         /* CLOSE_PENDING should be impossible at this point since it requires
          * a transition from BUSY; the only valid state here is CLOSED. */
@@ -629,7 +735,12 @@ static ERL_NIF_TERM open_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
         return posix_error_to_tuple(env, posix_errno);
     }
 
+    if((posix_errno = acquire_target(&target))) {
+        return posix_error_to_tuple(env, posix_errno);
+    }
+
     posix_errno = efile_open(&target, modes, efile_resource_type, &d);
+    release_target(&target);
 
     if(posix_errno != 0) {
         return posix_error_to_tuple(env, posix_errno);
@@ -1078,7 +1189,12 @@ static ERL_NIF_TERM read_info_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
         return posix_error_to_tuple(env, posix_errno);
     }
 
+    if((posix_errno = acquire_target(&target))) {
+        return posix_error_to_tuple(env, posix_errno);
+    }
+
     posix_errno = efile_read_info(&target, follow_links, &info);
+    release_target(&target);
 
     if(posix_errno != 0) {
         return posix_error_to_tuple(env, posix_errno);
@@ -1115,7 +1231,12 @@ static ERL_NIF_TERM set_permissions_nif(ErlNifEnv *env, int argc, const ERL_NIF_
         return posix_error_to_tuple(env, posix_errno);
     }
 
+    if((posix_errno = acquire_target(&target))) {
+        return posix_error_to_tuple(env, posix_errno);
+    }
+
     posix_errno = efile_set_permissions(&target, permissions);
+    release_target(&target);
 
     if(posix_errno != 0) {
         return posix_error_to_tuple(env, posix_errno);
@@ -1155,7 +1276,12 @@ static ERL_NIF_TERM set_owner_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
         return posix_error_to_tuple(env, posix_errno);
     }
 
+    if((posix_errno = acquire_target(&target))) {
+        return posix_error_to_tuple(env, posix_errno);
+    }
+
     posix_errno = efile_set_owner(&target, uid, gid);
+    release_target(&target);
 
     if(posix_errno != 0) {
         return posix_error_to_tuple(env, posix_errno);
@@ -1197,7 +1323,12 @@ static ERL_NIF_TERM set_time_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
         return posix_error_to_tuple(env, posix_errno);
     }
 
+    if((posix_errno = acquire_target(&target))) {
+        return posix_error_to_tuple(env, posix_errno);
+    }
+
     posix_errno = efile_set_time(&target, accessed, modified, created);
+    release_target(&target);
 
     if(posix_errno != 0) {
         return posix_error_to_tuple(env, posix_errno);
@@ -1236,7 +1367,12 @@ static ERL_NIF_TERM read_link_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
         return posix_error_to_tuple(env, posix_errno);
     }
 
+    if((posix_errno = acquire_target(&target))) {
+        return posix_error_to_tuple(env, posix_errno);
+    }
+
     posix_errno = efile_read_link(env, &target, &result);
+    release_target(&target);
 
     if(posix_errno != 0) {
         return posix_error_to_tuple(env, posix_errno);
@@ -1257,7 +1393,12 @@ static ERL_NIF_TERM list_dir_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
         return posix_error_to_tuple(env, posix_errno);
     }
 
+    if((posix_errno = acquire_target(&target))) {
+        return posix_error_to_tuple(env, posix_errno);
+    }
+
     posix_errno = efile_list_dir(env, &target, &result);
+    release_target(&target);
 
     if(posix_errno != 0) {
         return posix_error_to_tuple(env, posix_errno);
@@ -1298,7 +1439,12 @@ static ERL_NIF_TERM rename_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
         return posix_error_to_tuple(env, posix_errno);
     }
 
+    if((posix_errno = acquire_targets(&existing_target, &new_target))) {
+        return posix_error_to_tuple(env, posix_errno);
+    }
+
     posix_errno = efile_rename(&existing_target, &new_target);
+    release_targets(&existing_target, &new_target);
 
     if(posix_errno != 0) {
         return posix_error_to_tuple(env, posix_errno);
@@ -1322,7 +1468,12 @@ static ERL_NIF_TERM make_hard_link_nif(ErlNifEnv *env, int argc, const ERL_NIF_T
         return posix_error_to_tuple(env, posix_errno);
     }
 
+    if((posix_errno = acquire_targets(&existing_target, &new_target))) {
+        return posix_error_to_tuple(env, posix_errno);
+    }
+
     posix_errno = efile_make_hard_link(&existing_target, &new_target);
+    release_targets(&existing_target, &new_target);
 
     if(posix_errno != 0) {
         return posix_error_to_tuple(env, posix_errno);
@@ -1347,7 +1498,12 @@ static ERL_NIF_TERM make_soft_link_nif(ErlNifEnv *env, int argc, const ERL_NIF_T
         return posix_error_to_tuple(env, posix_errno);
     }
 
+    if((posix_errno = acquire_target(&new_target))) {
+        return posix_error_to_tuple(env, posix_errno);
+    }
+
     posix_errno = efile_make_soft_link(&existing_path, &new_target);
+    release_target(&new_target);
 
     if(posix_errno != 0) {
         return posix_error_to_tuple(env, posix_errno);
@@ -1367,7 +1523,12 @@ static ERL_NIF_TERM make_dir_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
         return posix_error_to_tuple(env, posix_errno);
     }
 
+    if((posix_errno = acquire_target(&target))) {
+        return posix_error_to_tuple(env, posix_errno);
+    }
+
     posix_errno = efile_make_dir(&target);
+    release_target(&target);
 
     if(posix_errno != 0) {
         return posix_error_to_tuple(env, posix_errno);
@@ -1387,7 +1548,12 @@ static ERL_NIF_TERM del_file_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
         return posix_error_to_tuple(env, posix_errno);
     }
 
+    if((posix_errno = acquire_target(&target))) {
+        return posix_error_to_tuple(env, posix_errno);
+    }
+
     posix_errno = efile_del_file(&target);
+    release_target(&target);
 
     if(posix_errno != 0) {
         return posix_error_to_tuple(env, posix_errno);
@@ -1407,7 +1573,12 @@ static ERL_NIF_TERM del_dir_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
         return posix_error_to_tuple(env, posix_errno);
     }
 
+    if((posix_errno = acquire_target(&target))) {
+        return posix_error_to_tuple(env, posix_errno);
+    }
+
     posix_errno = efile_del_dir(&target);
+    release_target(&target);
 
     if(posix_errno != 0) {
         return posix_error_to_tuple(env, posix_errno);
@@ -1534,7 +1705,12 @@ static ERL_NIF_TERM read_file_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
         return posix_error_to_tuple(env, posix_errno);
     }
 
+    if((posix_errno = acquire_target(&target))) {
+        return posix_error_to_tuple(env, posix_errno);
+    }
+
     posix_errno = efile_open(&target, EFILE_MODE_READ, efile_resource_type, &d);
+    release_target(&target);
 
     if(posix_errno != 0) {
         return posix_error_to_tuple(env, posix_errno);

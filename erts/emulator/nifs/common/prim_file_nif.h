@@ -126,14 +126,27 @@ typedef ErlNifBinary efile_path_t;
  * operation gives EINVAL for a kind it does not take.
  *
  * EFILE_TARGET_PATH: the name is a path, which the operating system resolves
- * as it always has. */
+ * as it always has.
+ *
+ * EFILE_TARGET_AT: the name is resolved against dir, so the path of dir is not
+ * resolved again. The name itself is not checked. On Unix a name that holds
+ * ".." or starts with a separator still reaches a file outside the directory.
+ * Windows refuses such a name. */
 enum efile_target_kind_t {
-    EFILE_TARGET_PATH
+    EFILE_TARGET_PATH,
+    EFILE_TARGET_AT
 };
 
 typedef struct {
     enum efile_target_kind_t kind;
     efile_path_t name;
+
+    /* The directory the name is resolved against. NULL for a path. */
+    efile_data_t *dir;
+
+    /* Whether the operation holds the directory busy. acquire_target sets it
+     * and release_target clears it. */
+    int holds_dir;
 } efile_target_t;
 
 /** @brief Translates the given "raw name" into the format expected by the APIs
@@ -146,6 +159,17 @@ typedef struct {
  * @param path The term to translate; it must have been encoded with
  * prim_file:internal_native2name for compatibility reasons. */
 posix_errno_t efile_marshal_path(ErlNifEnv *env, ERL_NIF_TERM path, efile_path_t *result);
+
+/** @brief Translates a name that is resolved against an open directory.
+ *
+ * Unlike \c efile_marshal_path this does not expand the name into a full
+ * path. The operating system resolves the name against the directory the
+ * caller holds, so a full path would name a file somewhere else. Windows
+ * refuses one outright.
+ *
+ * @param name The term to translate; it must have been encoded with
+ * prim_file:internal_native2name, as for \c efile_marshal_path. */
+posix_errno_t efile_marshal_name(ErlNifEnv *env, ERL_NIF_TERM name, efile_path_t *result);
 
 /** @brief Returns the underlying handle as an implementation-defined term.
  *

@@ -926,6 +926,9 @@
 /* Define if you don't have a definition of INADDR_LOOPBACK */
 #undef HAVE_NO_INADDR_LOOPBACK
 
+/* Define to 1 if you have the 'openat' function. */
+#undef HAVE_OPENAT
+
 /* Define to 1 if you have the 'openpty' function. */
 #undef HAVE_OPENPTY
 

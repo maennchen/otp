@@ -131,11 +131,17 @@ copy(#file_descriptor{module = ?MODULE} = Source,
     %% XXX Should be moved down to the driver for optimization.
     file:copy_opened(Source, Dest, Length).
 
-open(Name, Modes) ->
+%% Opens a name against an open directory. The operating system resolves the
+%% name against the directory the caller holds, so another process cannot
+%% replace a directory in the path and make the caller open a different file.
+%% The name itself is not checked. On Unix a name that contains ".." or starts
+%% with a separator still reaches a file outside the directory. Windows refuses
+%% such a name.
+open(Target, Modes) ->
     %% The try/catch pattern seen here is used throughout the file to adhere to
     %% the public file interface, which has leaked through for ages because of
     %% "raw files."
-    try open_nif(encode_path(Name), Modes) of
+    try open_nif(encode_target(Target), Modes) of
         {ok, Ref} -> {ok, make_fd(Modes, Ref)};
         {error, Reason} -> {error, Reason}
     catch
@@ -528,7 +534,7 @@ build_fd_data([read | Modes], FRef, Owner, RASz, _Mode) ->
 build_fd_data([_Ignored | Modes], FRef, Owner, RASz, Mode) ->
     build_fd_data(Modes, FRef, Owner, RASz, Mode).
 
-open_nif(_Name, _Modes) ->
+open_nif(_Target, _Modes) ->
     erlang:nif_error(undef).
 
 %% Takes over a file that another process opened. A file is closed when the
@@ -951,6 +957,15 @@ proplist_get_value(Key, [Key | _Rest], _Default) ->
     true;
 proplist_get_value(Key, [_Other | Rest], Default) ->
     proplist_get_value(Key, Rest, Default).
+
+%% Turns what the caller named into what a NIF takes. A path keeps the
+%% encoding it always had. A name in an open directory carries the directory
+%% as well.
+encode_target({#file_descriptor{module = ?MODULE} = Dir, Name}) ->
+    #{ handle := DirRef } = get_fd_data(Dir),
+    {dir, DirRef, encode_path(Name)};
+encode_target(Path) ->
+    encode_path(Path).
 
 encode_path(Path) ->
     prim_file:internal_name2native(Path).

@@ -32,6 +32,25 @@
 #include <strsafe.h>
 #include <wchar.h>
 
+/* Win32 has no CreateFileW that takes a directory handle, so opening a name
+ * relative to a directory needs the native API. winternl.h declares the calls
+ * and the types they need. The emulator links against ntdll for them. */
+#include <winternl.h>
+
+#define EFILE_FILE_OPEN 0x00000001
+#define EFILE_FILE_CREATE 0x00000002
+#define EFILE_FILE_OPEN_IF 0x00000003
+#define EFILE_FILE_OVERWRITE_IF 0x00000005
+
+#define EFILE_FILE_DIRECTORY_FILE 0x00000001
+#define EFILE_FILE_WRITE_THROUGH 0x00000002
+#define EFILE_FILE_SYNCHRONOUS_IO_NONALERT 0x00000020
+#define EFILE_FILE_NON_DIRECTORY_FILE 0x00000040
+
+/* The status that open_name_at answers for a name it cannot pass on. It maps
+ * to EINVAL, as the calls that take a path report for such a name. */
+#define EFILE_STATUS_INVALID_PARAMETER ((NTSTATUS)0xC000000DL)
+
 #define IS_SLASH(a)  ((a) == L'\\' || (a) == L'/')
 
 #define FILE_SHARE_FLAGS (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
@@ -222,6 +241,67 @@ posix_errno_t efile_marshal_path(ErlNifEnv *env, ERL_NIF_TERM path, efile_path_t
     }
 
     return get_full_path(env, (WCHAR*)raw_path.data, result);
+}
+
+posix_errno_t efile_marshal_name(ErlNifEnv *env, ERL_NIF_TERM name, efile_path_t *result) {
+    ErlNifBinary raw_name;
+    WCHAR *characters;
+    size_t length, i;
+
+    if(!enif_inspect_binary(env, name, &raw_name)) {
+        return EINVAL;
+    } else if(raw_name.size % sizeof(WCHAR)) {
+        return EINVAL;
+    }
+
+    if(has_invalid_null_termination(&raw_name)) {
+        return EINVAL;
+    }
+
+    /* The name is kept as it is. Expanding it into a full path, as
+     * efile_marshal_path does, would name a file somewhere else, and the
+     * native calls refuse a full path together with a directory handle. */
+    characters = (WCHAR*)raw_name.data;
+    length = raw_name.size / sizeof(WCHAR);
+
+    while(length > 0 && characters[length - 1] == L'\0') {
+        length--;
+    }
+
+    if(length == 0) {
+        return EINVAL;
+    }
+
+    /* A name that names a drive or that starts at the root of one is a path
+     * rather than a name in the directory the caller holds. */
+    if(characters[0] == L'\\' || characters[0] == L'/') {
+        return EINVAL;
+    }
+
+    if(length >= 2 && characters[1] == L':') {
+        return EINVAL;
+    }
+
+    /* The system takes a backslash as the separator. A name that was written
+     * with forward slashes is accepted as well, as it is for a path. */
+    if(!enif_alloc_binary((length + 1) * sizeof(WCHAR), result)) {
+        return ENOMEM;
+    }
+
+    for(i = 0; i < length; i++) {
+        WCHAR c = characters[i];
+
+        ((WCHAR*)result->data)[i] = (c == L'/') ? L'\\' : c;
+    }
+
+    ((WCHAR*)result->data)[length] = L'\0';
+    result->size = length * sizeof(WCHAR);
+
+    /* The binary now belongs to the environment, as a path does, so the
+     * caller does not release it. */
+    enif_make_binary(env, result);
+
+    return 0;
 }
 
 ERL_NIF_TERM efile_get_handle(ErlNifEnv *env, efile_data_t *d) {
@@ -441,6 +521,21 @@ static int is_path_root(const efile_path_t *path) {
     return path_iterator >= path_end && !IS_SLASH(path_start[length - 1]);
 }
 
+/* Wraps an open handle in a resource. */
+static posix_errno_t build_open_resource(HANDLE handle,
+        enum efile_modes_t modes, ErlNifResourceType *nif_type,
+        efile_data_t **d) {
+    efile_win_t *w;
+
+    w = (efile_win_t*)enif_alloc_resource(nif_type, sizeof(efile_win_t));
+    w->handle = handle;
+
+    EFILE_INIT_RESOURCE(&w->common, modes);
+    (*d) = &w->common;
+
+    return 0;
+}
+
 static posix_errno_t open_path(const efile_path_t *path,
         enum efile_modes_t modes, ErlNifResourceType *nif_type,
         efile_data_t **d) {
@@ -490,21 +585,13 @@ static posix_errno_t open_path(const efile_path_t *path,
         FILE_SHARE_FLAGS, NULL, open_mode, attributes, NULL);
 
     if(handle != INVALID_HANDLE_VALUE) {
-        efile_win_t *w;
-
         /* Directory mode specified, but path is not a directory. */
         if((modes & EFILE_MODE_DIRECTORY) && !handle_has_file_attributes(handle, FILE_ATTRIBUTE_DIRECTORY)) {
             CloseHandle(handle);
             return ENOTDIR;
         }
 
-        w = (efile_win_t*)enif_alloc_resource(nif_type, sizeof(efile_win_t));
-        w->handle = handle;
-
-        EFILE_INIT_RESOURCE(&w->common, modes);
-        (*d) = &w->common;
-
-        return 0;
+        return build_open_resource(handle, modes, nif_type, d);
     } else {
         DWORD last_error = GetLastError();
 
@@ -516,6 +603,118 @@ static posix_errno_t open_path(const efile_path_t *path,
 
         return windows_to_posix_errno(last_error);
     }
+}
+
+static posix_errno_t nt_status_to_posix_errno(NTSTATUS status) {
+    return windows_to_posix_errno(RtlNtStatusToDosError(status));
+}
+
+/* Translates the modes the caller asked for into what NtCreateFile takes.
+ * Returns 0 for a combination of modes that opens nothing. */
+static int open_modes_to_flags(enum efile_modes_t modes,
+        ACCESS_MASK *access_flags, ULONG *disposition, ULONG *options) {
+    *access_flags = 0;
+    *options = 0;
+
+    if(modes & EFILE_MODE_DIRECTORY) {
+        *access_flags |= GENERIC_READ;
+        *disposition = EFILE_FILE_OPEN;
+        *options |= EFILE_FILE_DIRECTORY_FILE;
+
+        return 1;
+    }
+
+    *options |= EFILE_FILE_NON_DIRECTORY_FILE;
+
+    if(modes & EFILE_MODE_READ && !(modes & EFILE_MODE_WRITE)) {
+        *access_flags |= GENERIC_READ;
+        *disposition = EFILE_FILE_OPEN;
+    } else if(modes & EFILE_MODE_WRITE && !(modes & EFILE_MODE_READ)) {
+        *access_flags |= GENERIC_WRITE;
+        *disposition = EFILE_FILE_OVERWRITE_IF;
+    } else if(modes & EFILE_MODE_READ_WRITE) {
+        *access_flags |= GENERIC_READ | GENERIC_WRITE;
+        *disposition = EFILE_FILE_OPEN_IF;
+    } else {
+        return 0;
+    }
+
+    if(modes & EFILE_MODE_APPEND) {
+        *access_flags |= FILE_APPEND_DATA;
+        *disposition = EFILE_FILE_OPEN_IF;
+    }
+
+    if(modes & EFILE_MODE_EXCLUSIVE) {
+        *disposition = EFILE_FILE_CREATE;
+    }
+
+    if(modes & EFILE_MODE_SYNC) {
+        *options |= EFILE_FILE_WRITE_THROUGH;
+    }
+
+    return 1;
+}
+
+/* Opens a name against an open directory and answers with the handle. The
+ * caller closes it. Win32 cannot open a name relative to a directory handle,
+ * so this uses the native call that takes the directory in its object
+ * attributes. */
+static NTSTATUS open_name_at(HANDLE dir, const WCHAR *name,
+        ACCESS_MASK access_flags, ULONG options, ULONG disposition,
+        HANDLE *result) {
+    OBJECT_ATTRIBUTES object_attributes;
+    IO_STATUS_BLOCK io_status_block;
+    UNICODE_STRING object_name;
+    size_t name_length;
+
+    name_length = wcslen(name);
+
+    if(name_length == 0 || name_length > (USHRT_MAX / sizeof(WCHAR))) {
+        return EFILE_STATUS_INVALID_PARAMETER;
+    }
+
+    object_name.Buffer = (PWSTR)name;
+    object_name.Length = (USHORT)(name_length * sizeof(WCHAR));
+    object_name.MaximumLength = object_name.Length;
+
+    sys_memset(&object_attributes, 0, sizeof(object_attributes));
+    object_attributes.Length = sizeof(object_attributes);
+    object_attributes.RootDirectory = dir;
+    object_attributes.ObjectName = &object_name;
+    object_attributes.Attributes = OBJ_CASE_INSENSITIVE;
+
+    sys_memset(&io_status_block, 0, sizeof(io_status_block));
+
+    /* The synchronous option requires the right to wait on the file, so it is
+     * asked for here rather than at every call. */
+    return NtCreateFile(result, access_flags | SYNCHRONIZE, &object_attributes,
+        &io_status_block, NULL, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_FLAGS,
+        disposition, options | EFILE_FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+}
+
+static posix_errno_t open_at(efile_data_t *dir, const efile_path_t *path,
+        enum efile_modes_t modes, ErlNifResourceType *nif_type,
+        efile_data_t **d) {
+    efile_win_t *parent = (efile_win_t*)dir;
+    ACCESS_MASK access_flags;
+    ULONG disposition, options;
+    NTSTATUS status;
+    HANDLE handle;
+
+    if(!open_modes_to_flags(modes, &access_flags, &disposition, &options)) {
+        (*d) = NULL;
+        return EINVAL;
+    }
+
+    status = open_name_at(parent->handle, (const WCHAR*)path->data,
+        access_flags, options, disposition, &handle);
+
+    if(!NT_SUCCESS(status)) {
+        (*d) = NULL;
+        return nt_status_to_posix_errno(status);
+    }
+
+    return build_open_resource(handle, modes, nif_type, d);
 }
 
 static void tmp_nop_invalid_parameter_handler(const wchar_t* expression,
@@ -535,6 +734,8 @@ posix_errno_t efile_open(const efile_target_t *target, enum efile_modes_t modes,
     switch(target->kind) {
     case EFILE_TARGET_PATH:
         return open_path(&target->name, modes, nif_type, d);
+    case EFILE_TARGET_AT:
+        return open_at(target->dir, &target->name, modes, nif_type, d);
     default:
         (*d) = NULL;
         return EINVAL;

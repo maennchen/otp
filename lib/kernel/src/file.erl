@@ -1502,13 +1502,41 @@ Typical error reasons:
 
 - **`enospc`** - There is no space left on the device (if `write` access was
   specified).
+
+## Opening a file in an open directory
+
+`File` can also be a `{Dir, Name}` tuple. `Dir` is a directory that was opened
+with the modes `raw`, `read` and `directory`. `Name` is the name of a file in
+that directory.
+
+The operating system resolves `Name` against the open directory. It does not
+resolve the path of the directory again, so another process cannot replace a
+directory in that path and make this function open a different file. The file
+stays open after the directory is closed.
+
+`Name` itself is not checked. On Unix a name that contains `..` or that starts
+with a separator still reaches a file outside the directory. Windows refuses
+such a name.
+
+```erlang
+{ok, Dir} = file:open("/tmp/example", [raw, read, directory]),
+{ok, Fd} = file:open({Dir, "data.txt"}, [read]),
+ok = file:close(Dir).
+```
+
+The mode `ram` is not allowed with a `{Dir, Name}` tuple, and gives
+`{error, badarg}`.
 """.
 -spec open(File, Modes) -> {ok, IoDevice} | {error, Reason} when
-      File :: Filename | iodata(),
+      File :: Filename | iodata() | {Dir, Filename},
       Filename :: name_all(),
+      Dir :: fd(),
       Modes :: [mode() | ram | directory],
       IoDevice :: io_device(),
       Reason :: posix() | badarg | system_limit.
+
+open(Target, ModeList) when ?IS_AT_TARGET(Target), is_list(ModeList) ->
+    open_at(Target, ModeList);
 
 open(Item, ModeList) when is_list(ModeList) ->
     case {lists:member(raw, ModeList), lists:member(ram, ModeList)} of
@@ -1541,6 +1569,73 @@ open(Item, ModeList) when is_list(ModeList) ->
 %% Old obsolete mode specification in atom or 2-tuple format
 open(Item, Mode) ->
     open(Item, mode_list(Mode)).
+
+%% Builds the target that prim_file expects. This unwraps the directory and
+%% encodes the name the same way as a path.
+at_target({Dir, Name}) ->
+    case file_name(Name) of
+        {error, _} = Error ->
+            Error;
+        FileName ->
+            {unwrap_fd(Dir), FileName}
+    end.
+
+%% A directory that file:open/2 returned is wrapped in the layers that were
+%% asked for, and only the file underneath them can open a name.
+unwrap_fd(#file_descriptor{module = ?PRIM_FILE} = Fd) ->
+    Fd;
+unwrap_fd(#file_descriptor{data = #file_descriptor{} = Inner}) ->
+    unwrap_fd(Inner);
+unwrap_fd(Fd) ->
+    Fd.
+
+%% The directory belongs to the calling process, so the file is opened here
+%% even when the caller asked for an io server. The io server then adopts the
+%% open file instead of opening a name in its own process, and the file is
+%% closed when the io server dies rather than when the caller does.
+open_at(Target0, ModeList) ->
+    case at_target(Target0) of
+        {error, _} = Error ->
+            Error;
+        Target ->
+            open_at_1(Target, ModeList)
+    end.
+
+open_at_1(Target, ModeList) ->
+    case {lists:member(raw, ModeList), lists:member(ram, ModeList)} of
+        {_, true} ->
+            {error, badarg};
+        {true, false} ->
+            ?PRIM_FILE:open(Target, ModeList);
+        {false, false} ->
+            open_at_io_server(Target, ModeList)
+    end.
+
+open_at_io_server({_Dir, Name} = Target, ModeList) ->
+    case check_args([Name | ModeList]) of
+        ok ->
+            case ?PRIM_FILE:open(Target, ModeList) of
+                {ok, Fd} ->
+                    start_io_server_for(Fd, ModeList);
+                Error ->
+                    Error
+            end;
+        Error ->
+            Error
+    end.
+
+start_io_server_for(Fd, ModeList) ->
+    OpenFun = fun(_ReadMode, _Opts) -> ?PRIM_FILE:adopt(Fd) end,
+
+    case file_io_server:start_handle(self(), OpenFun, ModeList) of
+        {ok, _Pid} = Result ->
+            Result;
+        Error ->
+            %% The io server never took the file, so it is still ours to
+            %% close.
+            _ = ?PRIM_FILE:close(Fd),
+            Error
+    end.
 
 %%%-----------------------------------------------------------------
 %%% The following interface functions operate on open files.

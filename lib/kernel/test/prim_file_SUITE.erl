@@ -43,6 +43,8 @@
 	 list_dir/1,
 	 list_dir_handle/1]).
 
+-export([open_at/1]).
+
 -export([file_write_handle_info/1]).
 
 -export([adopt/1]).
@@ -65,7 +67,7 @@ suite() -> [].
 all() -> 
     [read_write_file, {group, dirs}, {group, files},
      delete, rename, {group, errors}, {group, links},
-     list_dir_limit, list_dir, list_dir_handle, adopt].
+     list_dir_limit, list_dir, list_dir_handle, adopt, open_at].
 
 groups() -> 
     [{dirs, [],
@@ -1927,6 +1929,58 @@ wait_until_closed(Fd, N) ->
         Other ->
             ct:fail({still_open, Other})
     end.
+
+%% Tests that a name is opened against an open directory, so the path of the
+%% directory is not resolved a second time.
+open_at(Config) ->
+    RootDir = proplists:get_value(priv_dir, Config),
+    TestDir = filename:join(RootDir, ?MODULE_STRING++"_open_at"),
+    ok = ?PRIM_FILE:make_dir(TestDir),
+    Name = filename:join(TestDir, "file"),
+    ok = ?PRIM_FILE:write_file(Name, "contents"),
+
+    {ok, Dir} = ?PRIM_FILE:open(TestDir, [read, directory]),
+
+    {ok, Fd} = ?PRIM_FILE:open({Dir, "file"}, [read]),
+    {ok, <<"contents">>} = ?PRIM_FILE:read(Fd, 100),
+    ok = ?PRIM_FILE:close(Fd),
+
+    %% The file stays open after the directory is closed.
+    {ok, Fd2} = ?PRIM_FILE:open({Dir, "file"}, [read]),
+    ok = ?PRIM_FILE:close(Dir),
+    {ok, <<"contents">>} = ?PRIM_FILE:read(Fd2, 100),
+    ok = ?PRIM_FILE:close(Fd2),
+
+    {ok, Dir2} = ?PRIM_FILE:open(TestDir, [read, directory]),
+
+    %% A name that is not in the directory reports the same error as a path
+    %% that does not exist.
+    {error, enoent} = ?PRIM_FILE:open({Dir2, "missing"}, [read]),
+
+    %% A file can be created through the directory as well.
+    {ok, New} = ?PRIM_FILE:open({Dir2, "new"}, [write]),
+    ok = ?PRIM_FILE:write(New, "written"),
+    ok = ?PRIM_FILE:close(New),
+    {ok, <<"written">>} = ?PRIM_FILE:read_file(filename:join(TestDir, "new")),
+
+    %% The modes a path takes are honoured, sync among them.
+    {ok, Synced} = ?PRIM_FILE:open({Dir2, "synced"}, [write, sync]),
+    ok = ?PRIM_FILE:write(Synced, "synced"),
+    ok = ?PRIM_FILE:close(Synced),
+    {ok, <<"synced">>} = ?PRIM_FILE:read_file(filename:join(TestDir, "synced")),
+
+    ok = ?PRIM_FILE:close(Dir2),
+
+    %% A file that is not a directory cannot be used to open a name.
+    {ok, Plain} = ?PRIM_FILE:open(Name, [read]),
+    {error, enotdir} = ?PRIM_FILE:open({Plain, "file"}, [read]),
+    ok = ?PRIM_FILE:close(Plain),
+
+    ok = ?PRIM_FILE:delete(filename:join(TestDir, "new")),
+    ok = ?PRIM_FILE:delete(filename:join(TestDir, "synced")),
+    ok = ?PRIM_FILE:delete(Name),
+    ok = ?PRIM_FILE:del_dir(TestDir),
+    ok.
 
 %%%
 %%% Support for testing large files.

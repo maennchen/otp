@@ -32,4 +32,11 @@
 -define(CALL_FD(Fd, Method, Args),
     apply(Fd#file_descriptor.module, Method, [Fd | Args])).
 
+%% A name that an operation resolves against an open directory. The test does
+%% not raise for a term of another shape, so it can be joined with orelse in a
+%% guard.
+-define(IS_AT_TARGET(T),
+        is_tuple(T) andalso tuple_size(T) =:= 2
+        andalso is_record(element(1, T), file_descriptor)).
+
 -endif.
