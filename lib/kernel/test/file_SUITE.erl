@@ -53,7 +53,7 @@
 	 list_dir/1,list_dir_error/1,list_dir_handle/1,
 	 file_write_handle_info/1,
 	 open_at/1, open_at_symlink/1, read_at/1, write_at/1,
-	 link_at/1, copy_at/1, open_root/1,
+	 link_at/1, copy_at/1, open_root/1, dup/1,
 	 untranslatable_names/1, untranslatable_names_error/1,
 	 pos1/1, pos2/1, pos3/1]).
 -export([close/1, consult1/1, path_consult/1, delete/1]).
@@ -159,7 +159,7 @@ groups() ->
       [open1, old_modes, new_modes, path_open, close, access,
        read_write, pread_write, append, open_errors,
        exclusive, open_at, open_at_symlink, read_at, write_at,
-       link_at, copy_at, open_root]},
+       link_at, copy_at, open_root, dup]},
      {pos, [], [pos1, pos2, pos3]},
      {file_info, [],
       [file_info_basic_file, file_info_basic_directory,
@@ -1394,6 +1394,47 @@ copy_at(Config) when is_list(Config) ->
     ok = ?FILE_MODULE:close(To),
     ok = ?FILE_MODULE:close(From),
     ok = ?FILE_MODULE:del_dir(filename:join(TestDir, "to")),
+    ok = ?FILE_MODULE:del_dir(TestDir),
+
+    [] = flush(),
+    ok.
+
+%% A copy of a raw file belongs to the process that made it.
+dup(Config) when is_list(Config) ->
+    RootDir = proplists:get_value(priv_dir, Config),
+    TestDir = filename:join(RootDir, ?MODULE_STRING++"_dup"),
+    ok = ?FILE_MODULE:make_dir(TestDir),
+    Log = filename:join(TestDir, "log"),
+    Parent = self(),
+
+    %% A list mode file is copied with its list mode.
+    {ok, A} = ?FILE_MODULE:open(Log, [raw, append]),
+    ok = ?FILE_MODULE:write(A, "a"),
+    Pid = spawn_link(fun() ->
+                             {ok, B} = ?FILE_MODULE:dup(A),
+                             ok = ?FILE_MODULE:write(B, "b"),
+                             ok = ?FILE_MODULE:close(B),
+                             Parent ! {self(), done}
+                     end),
+    receive {Pid, done} -> ok end,
+    ok = ?FILE_MODULE:write(A, "c"),
+    ok = ?FILE_MODULE:close(A),
+    {ok, <<"abc">>} = ?FILE_MODULE:read_file(Log),
+
+    {ok, Reader} = ?FILE_MODULE:open(Log, [raw, read]),
+    {ok, Copy} = ?FILE_MODULE:dup(Reader),
+    {ok, "abc"} = ?FILE_MODULE:pread(Copy, 0, 3),
+    ok = ?FILE_MODULE:close(Copy),
+    ok = ?FILE_MODULE:close(Reader),
+
+    {ok, Delayed} = ?FILE_MODULE:open(Log, [raw, write, delayed_write]),
+    {error, badarg} = ?FILE_MODULE:dup(Delayed),
+    ok = ?FILE_MODULE:close(Delayed),
+    {ok, Server} = ?FILE_MODULE:open(Log, [read]),
+    {error, badarg} = ?FILE_MODULE:dup(Server),
+    ok = ?FILE_MODULE:close(Server),
+
+    ok = ?FILE_MODULE:delete(Log),
     ok = ?FILE_MODULE:del_dir(TestDir),
 
     [] = flush(),

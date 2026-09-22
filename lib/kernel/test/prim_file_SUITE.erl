@@ -44,7 +44,7 @@
 	 list_dir_handle/1]).
 
 -export([open_at/1, read_at/1, write_at/1, link_at/1, open_in_root/1,
-         resolve_in_root/1, open_root/1]).
+         resolve_in_root/1, open_root/1, dup/1]).
 
 -export([file_write_handle_info/1]).
 
@@ -69,7 +69,7 @@ all() ->
     [read_write_file, {group, dirs}, {group, files},
      delete, rename, {group, errors}, {group, links},
      list_dir_limit, list_dir, list_dir_handle, adopt, open_at, read_at,
-     write_at, link_at, open_in_root, resolve_in_root, open_root].
+     write_at, link_at, open_in_root, resolve_in_root, open_root, dup].
 
 groups() -> 
     [{dirs, [],
@@ -2519,6 +2519,76 @@ resolve_in_root(Config) ->
 
 sorted({ok, Names}) -> {ok, lists:sort(Names)};
 sorted(Other) -> Other.
+
+%% A copy of a raw file belongs to the process that made it.
+dup(Config) ->
+    RootDir = proplists:get_value(priv_dir, Config),
+    TestDir = filename:join(RootDir, ?MODULE_STRING++"_dup"),
+    ok = ?PRIM_FILE:make_dir(TestDir),
+    ok = ?PRIM_FILE:write_file(filename:join(TestDir, "inside"), "INSIDE"),
+    Log = filename:join(TestDir, "log"),
+
+    %% Appends through a copy land in the same file.
+    {ok, A} = ?PRIM_FILE:open(Log, [write, append]),
+    ok = ?PRIM_FILE:write(A, "a"),
+    ok = in_other_process(fun() ->
+                                  {ok, B} = ?PRIM_FILE:dup(A),
+                                  ok = ?PRIM_FILE:write(B, "b"),
+                                  ?PRIM_FILE:close(B)
+                          end),
+    ok = ?PRIM_FILE:write(A, "c"),
+    ok = ?PRIM_FILE:close(A),
+    {ok, <<"abc">>} = ?PRIM_FILE:read_file(Log),
+
+    %% A copy of a root is a root, and outlives the original.
+    {ok, R} = ?PRIM_FILE:open_root(TestDir),
+    {ok, R2} = in_other_process(fun() -> ?PRIM_FILE:dup(R) end),
+    ok = ?PRIM_FILE:close(R),
+    {ok, R3} = in_other_process(fun() -> ?PRIM_FILE:dup(R2) end),
+    ok = in_other_process(fun() ->
+                                  {ok, R4} = ?PRIM_FILE:dup(R3),
+                                  {ok, <<"INSIDE">>} =
+                                      ?PRIM_FILE:read_file({R4, "inside"}),
+                                  {error, exdev} =
+                                      ?PRIM_FILE:read_file({R4, "../x"}),
+                                  ?PRIM_FILE:close(R4)
+                          end),
+
+    %% The copy belongs to its maker. Nobody else can use it.
+    {'EXIT', {not_on_controlling_process, _}} =
+        (catch ?PRIM_FILE:read_file({R2, "inside"})),
+    {'EXIT', {not_on_controlling_process, _}} =
+        (catch ?PRIM_FILE:read_file({R3, "inside"})),
+
+    %% A closed original cannot be copied.
+    {error, einval} = ?PRIM_FILE:dup(R),
+
+    %% A read buffer would go stale.
+    {ok, Buffered} = ?PRIM_FILE:open(Log, [read, read_ahead]),
+    {error, badarg} = ?PRIM_FILE:dup(Buffered),
+    ok = ?PRIM_FILE:close(Buffered),
+
+    ok = ?PRIM_FILE:delete(Log),
+    ok = ?PRIM_FILE:delete(filename:join(TestDir, "inside")),
+    ok = ?PRIM_FILE:del_dir(TestDir),
+    ok.
+
+in_other_process(Fun) ->
+    Parent = self(),
+    {Pid, Ref} = spawn_monitor(fun() -> Parent ! {self(), Fun()},
+                                        receive stop -> ok end
+                               end),
+    receive
+        {Pid, Result} ->
+            %% The process stays alive while the caller inspects the result,
+            %% so a copy it made is not closed by its death yet.
+            Ref2 = monitor(process, Pid),
+            erlang:demonitor(Ref, [flush]),
+            put({dup_process, Pid}, Ref2),
+            Result;
+        {'DOWN', Ref, process, Pid, Reason} ->
+            ct:fail(Reason)
+    end.
 
 %% A root from open_root/1 makes {Root, Name} resolve as {root, Root, Name}.
 open_root(Config) ->

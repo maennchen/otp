@@ -1412,6 +1412,21 @@ posix_errno_t efile_from_fd(int fd,
     }
 }
 
+posix_errno_t efile_dup(efile_data_t *d, ErlNifResourceType *nif_type,
+        efile_data_t **copy) {
+    efile_win_t *w = (efile_win_t*)d;
+    HANDLE handle;
+
+    if(!DuplicateHandle(GetCurrentProcess(), w->handle, GetCurrentProcess(),
+                        &handle, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        (*copy) = NULL;
+        return windows_to_posix_errno(GetLastError());
+    }
+
+    return build_open_resource(handle,
+        d->modes & ~EFILE_MODE_FROM_ALREADY_OPEN_FD, nif_type, copy);
+}
+
 int efile_close(efile_data_t *d, posix_errno_t *error) {
     efile_win_t *w = (efile_win_t*)d;
     HANDLE handle;

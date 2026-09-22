@@ -187,6 +187,11 @@ ERL_NIF_TERM efile_get_handle(ErlNifEnv *env, efile_data_t *d);
  * operations like sendfile(2). */
 posix_errno_t efile_dup_handle(ErlNifEnv *env, efile_data_t *d, ErlNifEvent *handle);
 
+/** @brief Duplicates the file into a new resource with the same modes. The
+ * copy shares the file position with the original. */
+posix_errno_t efile_dup(efile_data_t *d, ErlNifResourceType *nif_type,
+        efile_data_t **copy);
+
 /** @brief Read until EOF or the given iovec has been filled.
  *
  * @return -1 on failure, or the number of bytes read on success. The return

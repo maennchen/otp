@@ -231,7 +231,7 @@ operating system kernel.
 %% Specialized
 -export([ipread_s32bu_p32bu/3]).
 %% Generic file contents.
--export([open/2, open_root/1, close/1, advise/4, allocate/3,
+-export([open/2, open_root/1, dup/1, close/1, advise/4, allocate/3,
 	 read/2, write/2, 
 	 pread/2, pread/3, pwrite/2, pwrite/3,
 	 read_line/1,
@@ -1735,6 +1735,45 @@ open_root(Dir) ->
         Name ->
             ?PRIM_FILE:open_root(Name)
     end.
+
+-doc """
+Copies a raw file for the calling process.
+
+A raw file can only be used by the process that opened it. A copy belongs to
+the process that made it, and is closed like any other file. The original and
+the copy share the file position, so use the copy with `append`, with
+`pread/3` and `pwrite/3`, or with a directory or root, where nothing uses the
+position.
+
+A file opened with `read_ahead`, `delayed_write` or `compressed` cannot be
+copied, and gives `{error, badarg}`.
+
+```erlang
+{ok, Root} = file:open_root("/srv/uploads"),
+Pid = spawn(fun() ->
+    {ok, MyRoot} = file:dup(Root),
+    {ok, Data} = file:read_file({MyRoot, "report.txt"}),
+    ok = file:close(MyRoot)
+end).
+```
+""".
+-doc(#{since => <<"OTP 30.0">>}).
+-spec dup(File) -> {ok, Copy} | {error, Reason} when
+      File :: fd(),
+      Copy :: fd(),
+      Reason :: posix() | badarg.
+
+dup(#file_descriptor{module = ?PRIM_FILE} = Fd) ->
+    ?PRIM_FILE:dup(Fd);
+dup(#file_descriptor{module = raw_file_io_list, data = Inner}) ->
+    case dup(Inner) of
+        {ok, Copy} ->
+            {ok, #file_descriptor{module = raw_file_io_list, data = Copy}};
+        Error ->
+            Error
+    end;
+dup(_) ->
+    {error, badarg}.
 
 %% Builds the target that prim_file expects. This unwraps the directory and
 %% encodes the name the same way as a path.

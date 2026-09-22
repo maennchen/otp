@@ -815,6 +815,30 @@ posix_errno_t efile_from_fd(int fd,
     return errno;
 }
 
+posix_errno_t efile_dup(efile_data_t *d, ErlNifResourceType *nif_type,
+        efile_data_t **copy) {
+    efile_unix_t *u = (efile_unix_t*)d;
+    efile_unix_t *c;
+    int fd;
+
+    do {
+        fd = dup(u->fd);
+    } while(fd == -1 && errno == EINTR);
+
+    if(fd == -1) {
+        (*copy) = NULL;
+        return errno;
+    }
+
+    c = (efile_unix_t*)enif_alloc_resource(nif_type, sizeof(efile_unix_t));
+    c->fd = fd;
+
+    EFILE_INIT_RESOURCE(&c->common, d->modes & ~EFILE_MODE_FROM_ALREADY_OPEN_FD);
+    (*copy) = &c->common;
+
+    return 0;
+}
+
 int efile_close(efile_data_t *d, posix_errno_t *error) {
     efile_unix_t *u = (efile_unix_t*)d;
     int fd;

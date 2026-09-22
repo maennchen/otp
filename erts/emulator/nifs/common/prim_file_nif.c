@@ -167,6 +167,7 @@ static ERL_NIF_TERM file_handle_wrapper(file_op_impl_t operation, ErlNifEnv *env
         return file_handle_wrapper( name ## _impl , env, argc, argv); \
     }
 
+WRAP_FILE_HANDLE_EXPORT(dup_nif)
 WRAP_FILE_HANDLE_EXPORT(read_nif)
 WRAP_FILE_HANDLE_EXPORT(write_nif)
 WRAP_FILE_HANDLE_EXPORT(pread_nif)
@@ -189,6 +190,7 @@ static ErlNifFunc nif_funcs[] = {
     /* File handle ops */
     {"open_nif", 2, open_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"close_nif", 1, close_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"dup_nif", 1, dup_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"read_nif", 2, read_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"write_nif", 2, write_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"pread_nif", 3, pread_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
@@ -734,6 +736,24 @@ static ERL_NIF_TERM set_controlling_process_nif_impl(efile_data_t *d, ErlNifEnv 
     d->monitor = monitor;
 
     return am_ok;
+}
+
+/* Copies the file for the calling process, which becomes the owner of the
+ * copy. Any process may call this. */
+static ERL_NIF_TERM dup_nif_impl(efile_data_t *d, ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    posix_errno_t posix_errno;
+    efile_data_t *copy;
+
+    ASSERT(argc == 0);
+    (void)argv;
+
+    posix_errno = efile_dup(d, efile_resource_type, &copy);
+
+    if(posix_errno != 0) {
+        return posix_error_to_tuple(env, posix_errno);
+    }
+
+    return create_ref_or_error_tuple(env, copy);
 }
 
 static ERL_NIF_TERM open_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {

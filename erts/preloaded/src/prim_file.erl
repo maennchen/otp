@@ -24,7 +24,7 @@
 
 -export([on_load/0]).
 
--export([open/2, open_root/1, close/1,
+-export([open/2, open_root/1, dup/1, close/1,
          sync/1, datasync/1, truncate/1, advise/4, allocate/3,
          read_line/1, read/2, write/2, position/2,
          pread/2, pread/3, pwrite/2, pwrite/3]).
@@ -67,7 +67,7 @@
          internal_normalize_utf8/1,
          is_translatable/1]).
 
--nifs([open_nif/2, close_nif/1, read_nif/2, write_nif/2, pread_nif/3,
+-nifs([open_nif/2, dup_nif/1, close_nif/1, read_nif/2, write_nif/2, pread_nif/3,
        pwrite_nif/3, seek_nif/3, sync_nif/2, truncate_nif/1, allocate_nif/3,
        advise_nif/4, read_handle_info_nif/1, list_handle_dir_nif/1,
        set_handle_permissions_nif/2, set_handle_owner_nif/3,
@@ -549,6 +549,32 @@ build_fd_data([_Ignored | Modes], FRef, Owner, RASz, Mode) ->
     build_fd_data(Modes, FRef, Owner, RASz, Mode).
 
 open_nif(_Target, _Modes) ->
+    erlang:nif_error(undef).
+
+%% Copies a raw file for the calling process, which need not own the
+%% original. The copy shares the file position, so a read-ahead buffer would
+%% go stale.
+dup(#file_descriptor{module = ?MODULE, data = #{ r_ahead_size := RASz }})
+  when RASz > 0 ->
+    {error, badarg};
+dup(#file_descriptor{module = ?MODULE, data = #{ handle := FRef } = Data}) ->
+    try dup_nif(FRef) of
+        {ok, Copy} ->
+            Data1 = Data#{ handle := Copy, owner := self() },
+            Data2 = case Data1 of
+                        #{ r_buffer := _ } ->
+                            Data1#{ r_buffer := prim_buffer:new() };
+                        _ ->
+                            Data1
+                    end,
+            {ok, #file_descriptor{module = ?MODULE, data = Data2}};
+        {error, Reason} ->
+            {error, Reason}
+    catch
+        error:badarg -> {error, badarg}
+    end.
+
+dup_nif(_FileRef) ->
     erlang:nif_error(undef).
 
 %% Takes over a file that another process opened. A file is closed when the
