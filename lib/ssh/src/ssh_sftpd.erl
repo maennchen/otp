@@ -54,6 +54,7 @@ Specifies a channel process to handle an SFTP subsystem.
 	  xf,   			% [{channel,ssh_xfer states}...]
 	  cwd,				% current dir (on first connect)
 	  root,				% root dir
+	  root_handle,			% root dir opened with file:open_root/1
 	  remote_channel,		% remote channel
 	  pending,                      % binary() 
 	  file_handler,			% atom() - callback module 
@@ -86,6 +87,14 @@ Options:
   `m:filelib` APIs to access the standard OTP file server. This option can be
   used to plug in other file servers.
 
+  > #### Change {: .info }
+  >
+  > Since OTP 30, when `root` is set, every name the file handler receives is
+  > a `{Root, Name}` tuple, where `Root` is the root directory opened with
+  > `file:open_root/1` and `Name` starts with `/`. The `m:file` functions
+  > take that tuple as they take a path. A file handler that expects a string
+  > has to be changed, or used without the `root` option.
+
 - **`max_files`** - The default value is `0`, which means that there is no upper
   limit. If supplied, the number of filenames returned to the SFTP client per
   `READDIR` request is limited to at most the given value.
@@ -106,6 +115,12 @@ Options:
   Then the user cannot see any files above this root. If, for example, the root
   directory is set to `/tmp`, then the user sees this directory as `/`. If the
   user then writes `cd /etc`, the user moves to `/tmp/etc`.
+
+  The root is opened with `file:open_root/1`, and every name is resolved
+  against it. A name cannot reach a file outside the root, not through `..`
+  and not through a symbolic link, even when the file system changes while
+  the server runs. The subsystem does not start if the root cannot be
+  opened.
 
   Note: This provides application-level isolation. For additional security,
   consider using OS-level chroot or similar mechanisms. See the
@@ -175,14 +190,20 @@ init(Options) ->
     MaxHandles = proplists:get_value(max_handles, Options, 1000),
     MaxPath = proplists:get_value(max_path, Options, 4096),
     Vsn = proplists:get_value(sftpd_vsn, Options, 5),
-    {ok,  State#state{cwd = CWD,
-                      root = Root,
-                      max_files = MaxLength,
-                      max_handles = MaxHandles,
-                      max_path = MaxPath,
-		      options = Options,
-		      handles = [], pending = <<>>,
-		      xf = #ssh_xfer{vsn = Vsn, ext = []}}}.
+    case open_root(Root) of
+        {ok, RootHandle} ->
+            {ok,  State#state{cwd = CWD,
+                              root = Root,
+                              root_handle = RootHandle,
+                              max_files = MaxLength,
+                              max_handles = MaxHandles,
+                              max_path = MaxPath,
+                              options = Options,
+                              handles = [], pending = <<>>,
+                              xf = #ssh_xfer{vsn = Vsn, ext = []}}};
+        {error, Reason} ->
+            {stop, {root, Root, Reason}}
+    end.
 
 
 %%--------------------------------------------------------------------
@@ -239,7 +260,8 @@ handle_msg({ssh_channel_up, ChannelId,  ConnectionManager},
 %% The return value is ignored.
 %%--------------------------------------------------------------------
 -doc false.
-terminate(_, #state{handles=Handles, file_handler=FileMod, file_state=FS}) ->
+terminate(_, #state{handles=Handles, file_handler=FileMod, file_state=FS,
+                    root_handle=RootHandle}) ->
     CloseFun = fun({_, file, {_, Fd}}, FS0) ->
 		       {_Res, FS1} = FileMod:close(Fd, FS0),
 		       FS1;
@@ -247,7 +269,24 @@ terminate(_, #state{handles=Handles, file_handler=FileMod, file_state=FS}) ->
 		       FS0
 	       end,
     lists:foldl(CloseFun, FS, Handles),
+    close_root(RootHandle),
     ok.
+
+open_root("") ->
+    {ok, undefined};
+open_root(Root) ->
+    file:open_root(Root).
+
+close_root(undefined) ->
+    ok;
+close_root(RootHandle) ->
+    _ = file:close(RootHandle),
+    ok.
+
+fs_path(AbsPath, #state{root_handle = undefined}) ->
+    AbsPath;
+fs_path(AbsPath, #state{root_handle = RootHandle} = State) ->
+    {RootHandle, chroot_filename(AbsPath, State)}.
 
 %%--------------------------------------------------------------------
 %%% Internal functions
@@ -361,7 +400,7 @@ handle_op(?SSH_FXP_OPENDIR, ReqId,
     AbsPath = relate_file_name(RelPath, State0),
     
     XF = State0#state.xf,
-    {IsDir, FS1} = FileMod:is_dir(AbsPath, FS0),
+    {IsDir, FS1} = FileMod:is_dir(fs_path(AbsPath, State0), FS0),
     State1 = State0#state{file_state = FS1},
     HandlesCnt = length(State0#state.handles),
     case IsDir of
@@ -447,7 +486,7 @@ handle_op(?SSH_FXP_WRITE, ReqId,
 handle_op(?SSH_FXP_READLINK, ReqId, <<?UINT32(PLen), RelPath:PLen/binary>>, 
 	  State = #state{file_handler = FileMod, file_state = FS0}) ->
     AbsPath = relate_file_name(RelPath, State),
-    {Res, FS1} = FileMod:read_link(AbsPath, FS0),
+    {Res, FS1} = FileMod:read_link(fs_path(AbsPath, State), FS0),
     case Res of
 	{ok, NewPath} ->
         AbsTarget = filename:absname(NewPath, filename:dirname(AbsPath)),
@@ -468,7 +507,7 @@ handle_op(?SSH_FXP_MKDIR, ReqId, <<?UINT32(PLen), BPath:PLen/binary,
 				  Attr/binary>>, 
 	  State0 = #state{file_handler = FileMod, file_state = FS0}) ->
     Path = relate_file_name(BPath, State0),
-    {Res, FS1} = FileMod:make_dir(Path, FS0),
+    {Res, FS1} = FileMod:make_dir(fs_path(Path, State0), FS0),
     State1 = State0#state{file_state = FS1},
     case Res of
 	ok ->
@@ -493,7 +532,7 @@ handle_op(?SSH_FXP_FSETSTAT, ReqId, <<?UINT32(HLen), BinHandle:HLen/binary,
 handle_op(?SSH_FXP_REMOVE, ReqId, <<?UINT32(PLen), BPath:PLen/binary>>, 
 	  State0 = #state{file_handler = FileMod, file_state = FS0, xf = #ssh_xfer{vsn = Vsn}}) ->
     Path = relate_file_name(BPath, State0),
-    {IsDir, _FS1} = FileMod:is_dir(Path, FS0),
+    {IsDir, _FS1} = FileMod:is_dir(fs_path(Path, State0), FS0),
     case IsDir of %% This version 6 we still have ver 5
 	true when Vsn > 5 ->
 	    ssh_xfer:xf_send_status(State0#state.xf, ReqId,
@@ -504,14 +543,14 @@ handle_op(?SSH_FXP_REMOVE, ReqId, <<?UINT32(PLen), BPath:PLen/binary>>,
 				    ?SSH_FX_FAILURE, "File is a directory"),
             State0;
 	false ->
-	    {Status, FS1} = FileMod:delete(Path, FS0),
+	    {Status, FS1} = FileMod:delete(fs_path(Path, State0), FS0),
 	    State1 = State0#state{file_state = FS1},
 	    send_status(Status, ReqId, State1)
     end;
 handle_op(?SSH_FXP_RMDIR, ReqId, <<?UINT32(PLen), BPath:PLen/binary>>, 
 	  State0 = #state{file_handler = FileMod, file_state = FS0}) ->
     Path = relate_file_name(BPath, State0),
-    {Status, FS1} = FileMod:del_dir(Path, FS0),
+    {Status, FS1} = FileMod:del_dir(fs_path(Path, State0), FS0),
     State1 = State0#state{file_state = FS1},
     send_status(Status, ReqId, State1);
 
@@ -529,7 +568,7 @@ handle_op(?SSH_FXP_RENAME, ReqId,
 	0 ->
 	    case Flags band ?SSH_FXP_RENAME_OVERWRITE of
 		0 ->
-		    {Res, FS1} = FileMod:read_link_info(Path2, FS0),
+		    {Res, FS1} = FileMod:read_link_info(fs_path(Path2, State0), FS0),
 		    State1 = State0#state{file_state = FS1},
 		    case Res of
 			{ok, _Info} ->
@@ -555,7 +594,14 @@ handle_op(?SSH_FXP_SYMLINK, ReqId,
 	  State0 = #state{file_handler = FileMod, file_state = FS0}) ->
     LinkPath = relate_file_name(Link, State0),
     TargetPath = relate_file_name(Target, State0),
-    {Status, FS1} = FileMod:make_symlink(TargetPath, LinkPath, FS0),
+    {Status, FS1} =
+        case FileMod:make_symlink(TargetPath, fs_path(LinkPath, State0), FS0) of
+            {{error, enotsup}, FS0a} when State0#state.root_handle =/= undefined ->
+                %% The platform makes no link in an open directory.
+                FileMod:make_symlink(TargetPath, LinkPath, FS0a);
+            Other ->
+                Other
+        end,
     State1 = State0#state{file_state = FS1},
     send_status(Status, ReqId, State1).
 
@@ -597,14 +643,14 @@ read_dir(State0 = #state{file_handler = FileMod, max_files = MaxLength, file_sta
     if
 	length(Files) > MaxLength ->
 	    {ToSend, NewCache} = lists:split(MaxLength, Files),
-	    {NamesAndAttrs, FS1} = get_attrs(AbsPath, ToSend, FileMod, FS0, Vsn),
+	    {NamesAndAttrs, FS1} = get_attrs(AbsPath, ToSend, FileMod, FS0, Vsn, State0),
 	    ssh_xfer:xf_send_names(XF, ReqId, NamesAndAttrs),
 	    Handles = lists:keyreplace(Handle, 1,
 				       State0#state.handles,
 				       {Handle, directory, {AbsPath,{cache, NewCache}}}),
 	    State0#state{handles = Handles, file_state = FS1};
 	true ->
-	    {NamesAndAttrs, FS1} = get_attrs(AbsPath, Files, FileMod, FS0, Vsn),
+	    {NamesAndAttrs, FS1} = get_attrs(AbsPath, Files, FileMod, FS0, Vsn, State0),
 	    ssh_xfer:xf_send_names(XF, ReqId, NamesAndAttrs),
 	    Handles = lists:keyreplace(Handle, 1,
 				       State0#state.handles,
@@ -613,10 +659,10 @@ read_dir(State0 = #state{file_handler = FileMod, max_files = MaxLength, file_sta
     end;
 read_dir(State0 = #state{file_handler = FileMod, max_files = MaxLength, file_state = FS0},
 	 XF = #ssh_xfer{cm = _CM, channel = _Channel, vsn = Vsn}, ReqId, Handle, AbsPath, _Status) ->
-    {Res, FS1} = FileMod:list_dir(AbsPath, FS0),
+    {Res, FS1} = FileMod:list_dir(fs_path(AbsPath, State0), FS0),
     case Res of
 	{ok, Files} when MaxLength == 0 orelse MaxLength > length(Files) ->
-	    {NamesAndAttrs, FS2} = get_attrs(AbsPath, Files, FileMod, FS1, Vsn),
+	    {NamesAndAttrs, FS2} = get_attrs(AbsPath, Files, FileMod, FS1, Vsn, State0),
 	    ssh_xfer:xf_send_names(XF, ReqId, NamesAndAttrs),
 	    Handles = lists:keyreplace(Handle, 1,
 				       State0#state.handles,
@@ -624,7 +670,7 @@ read_dir(State0 = #state{file_handler = FileMod, max_files = MaxLength, file_sta
 	    State0#state{handles = Handles, file_state = FS2};
 	{ok, Files} ->
 	    {ToSend, Cache} = lists:split(MaxLength, Files),
-	    {NamesAndAttrs, FS2} = get_attrs(AbsPath, ToSend, FileMod, FS1, Vsn),
+	    {NamesAndAttrs, FS2} = get_attrs(AbsPath, ToSend, FileMod, FS1, Vsn, State0),
 	    ssh_xfer:xf_send_names(XF, ReqId, NamesAndAttrs),
 	    Handles = lists:keyreplace(Handle, 1,
 				       State0#state.handles,
@@ -684,14 +730,14 @@ get_long_name(FileName, I) when is_record(I, file_info) ->
         I#file_info.mode, I#file_info.uid, I#file_info.gid}).
 
 %%% get_attrs: get stat of each file and return
-get_attrs(AbsBase, Files, FileMod, FS, Vsn) ->
-    get_attrs(AbsBase, Files, FileMod, FS, Vsn, []).
+get_attrs(AbsBase, Files, FileMod, FS, Vsn, State) ->
+    get_attrs(AbsBase, Files, FileMod, FS, Vsn, State, []).
 
-get_attrs(_AbsBase, [], _FileMod, FS, _Vsn, Acc) ->
+get_attrs(_AbsBase, [], _FileMod, FS, _Vsn, _State, Acc) ->
     {lists:reverse(Acc), FS};
-get_attrs(AbsBase, [F | Rest], FileMod, FS0, Vsn, Acc) ->
+get_attrs(AbsBase, [F | Rest], FileMod, FS0, Vsn, State, Acc) ->
     Path = filename:absname(F, AbsBase),
-    case FileMod:read_link_info(Path, FS0) of
+    case FileMod:read_link_info(fs_path(Path, State), FS0) of
 	{{ok, Info}, FS1} ->
 		Name = if Vsn =< 3 ->
 			 LongName = get_long_name(F, Info),
@@ -700,12 +746,12 @@ get_attrs(AbsBase, [F | Rest], FileMod, FS0, Vsn, Acc) ->
 			 F
 	     end,
 	    Attrs = ssh_sftp:info_to_attr(Info),
-	    get_attrs(AbsBase, Rest, FileMod, FS1, Vsn, [{Name, Attrs} | Acc]);
-	{{error, Msg}, FS1} when 
+	    get_attrs(AbsBase, Rest, FileMod, FS1, Vsn, State, [{Name, Attrs} | Acc]);
+	{{error, Msg}, FS1} when
               Msg == enoent ;   % The item has disappeared after reading the list of items to check
               Msg == eacces ->  % You are not allowed to read this
             %% Skip this F and check the remaining Rest
-	    get_attrs(AbsBase, Rest, FileMod, FS1, Vsn, Acc);
+	    get_attrs(AbsBase, Rest, FileMod, FS1, Vsn, State, Acc);
 	{Error, FS1} ->
 	    {Error, FS1}
     end.
@@ -742,7 +788,7 @@ stat(ReqId, RelPath, State0, F) ->
 
 do_stat(ReqId, AbsPath, State0=#state{file_handler=FileMod, file_state=FS0}, F) ->
     XF = State0#state.xf,
-    {Res, FS1} = FileMod:F(AbsPath, FS0),
+    {Res, FS1} = FileMod:F(fs_path(AbsPath, State0), FS0),
     State1 = State0#state{file_state = FS1},
     case Res of
 	{ok, FileInfo} ->
@@ -840,8 +886,8 @@ do_open(ReqId, State0, Path, Flags) ->
            max_handles = MaxHandles} = State0,
     HandlesCnt = length(State0#state.handles),
     AbsPath = relate_file_name(Path, State0),
-    {IsDir, _FS1} = FileMod:is_dir(AbsPath, FS0),
-    case IsDir of 
+    {IsDir, _FS1} = FileMod:is_dir(fs_path(AbsPath, State0), FS0),
+    case IsDir of
 	true when Vsn > 5 ->
 	    ssh_xfer:xf_send_status(State0#state.xf, ReqId,
 				    ?SSH_FX_FILE_IS_A_DIRECTORY, "File is a directory"),
@@ -852,7 +898,7 @@ do_open(ReqId, State0, Path, Flags) ->
 	    State0;
 	false when HandlesCnt < MaxHandles ->
 	    OpenFlags = [binary | Flags],
-	    {Res, FS1} = FileMod:open(AbsPath, OpenFlags, FS0),
+	    {Res, FS1} = FileMod:open(fs_path(AbsPath, State0), OpenFlags, FS0),
 	    State1 = State0#state{file_state = FS1},
 	    case Res of
 		{ok, IoDevice} ->
@@ -1108,11 +1154,11 @@ set_stat(Attr, Path,
     {DecodedAttr, _Rest} = 
 	ssh_xfer:decode_ATTR((State0#state.xf)#ssh_xfer.vsn, Attr),
     Info = ssh_sftp:attr_to_info(DecodedAttr),
-    {Res1, FS1} = FileMod:read_link_info(Path, FS0),
+    {Res1, FS1} = FileMod:read_link_info(fs_path(Path, State0), FS0),
     case Res1 of
 	{ok, OldInfo} ->
 	    NewInfo = set_file_info(Info, OldInfo),
-	    {Res2, FS2} = FileMod:write_file_info(Path, NewInfo, FS1),
+	    {Res2, FS2} = FileMod:write_file_info(fs_path(Path, State0), NewInfo, FS1),
 	    State1 = State0#state{file_state = FS2},
 	    {Res2, State1};
 	{error, Error} ->
@@ -1141,7 +1187,7 @@ set_file_info(#file_info{atime = Dst_atime, mtime = Dst_mtime,
 
 rename(Path, Path2, ReqId, State0) ->
     #state{file_handler = FileMod, file_state = FS0} = State0,
-    {Status, FS1} = FileMod:rename(Path, Path2, FS0),
+    {Status, FS1} = FileMod:rename(fs_path(Path, State0), fs_path(Path2, State0), FS0),
     State1 = State0#state{file_state = FS1},
     send_status(Status, ReqId, State1).
 

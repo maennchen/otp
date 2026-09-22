@@ -25,40 +25,45 @@
 -module(ssh_sftpd_file_api).
 -moduledoc false.
 
+%% Since OTP 30, the path is a {Root, Name} tuple when the sftpd
+%% option root is set. Root is the root directory opened with
+%% file:open_root/1, and Name is relative to it.
+-type path() :: file:name() | {Root :: file:fd(), Name :: file:name()}.
+
 %% To be further specified later
 -callback close(file:io_device(), State::term()) ->
     {ok, State::term()} | {{error, Reason::term()}, State::term()}.
--callback delete(file:name(), State::term()) ->
+-callback delete(path(), State::term()) ->
     {ok, State::term()} | {{error, Reason::term()}, State::term()}.
--callback del_dir(file:name(), State::term()) ->
+-callback del_dir(path(), State::term()) ->
     {ok, State::term()} | {{error, Reason::term()}, State::term()}.
 -callback get_cwd(State::term()) ->
     {{ok, Dir::term()}, State::term()} | {{error, Reason::term()}, State::term()}.
--callback is_dir(file:name(), State::term()) ->
+-callback is_dir(path(), State::term()) ->
     {boolean(), State::term()}.
--callback list_dir(file:name(), State::term()) ->
+-callback list_dir(path(), State::term()) ->
     {{ok, Filenames::term()}, State::term()} | {{error, Reason::term()}, State::term()}.
--callback make_dir(Dir::term(), State::term()) ->
+-callback make_dir(path(), State::term()) ->
     {ok, State::term()} | {{error, Reason::term()}, State::term()}.
--callback make_symlink(Path2::term(), Path::term(), State::term()) ->
+-callback make_symlink(Target::file:name(), Link::path(), State::term()) ->
     {ok, State::term()} | {{error, Reason::term()}, State::term()}.
--callback open(Path::term(), Flags::term(), State::term()) ->
+-callback open(path(), Flags::term(), State::term()) ->
     {{ok, IoDevice::term()}, State::term()} | {{error, Reason::term()}, State::term()}.
 -callback position(file:io_device(), Offs::term(), State::term()) ->
     {{ok, NewPosition::term()}, State::term()} | {{error, Reason::term()}, State::term()}.
 -callback read(file:io_device(), Len::term(), State::term()) ->
     {{ok, Data::term()},State::term()} | {eof, State::term()} | {{error, Reason::term()}, State::term()}.
--callback read_link(file:name(), State::term()) ->
+-callback read_link(path(), State::term()) ->
     {{ok, FileName::term()}, State::term()} | {{error, Reason::term()}, State::term()}.
--callback read_link_info(file:name(), State::term()) ->
+-callback read_link_info(path(), State::term()) ->
     {{ok, FileInfo::term()}, State::term()} | {{error, Reason::term()}, State::term()}.
--callback read_file_info(file:name(), State::term()) ->
+-callback read_file_info(path(), State::term()) ->
     {{ok, FileInfo::term()}, State::term()} | {{error, Reason::term()},State::term()}.
--callback rename(file:name(), file:name(), State::term()) ->
+-callback rename(path(), path(), State::term()) ->
     {ok, State::term()} | {{error, Reason::term()}, State::term()}.
 -callback write(file:io_device(), Data::term(), State::term()) ->
     {ok, State::term()} | {{error, Reason::term()}, State::term()}.
--callback write_file_info(file:name(),Info::term(), State::term()) ->
+-callback write_file_info(path(), Info::term(), State::term()) ->
     {ok, State::term()} | {{error, Reason::term()}, State::term()}.
 
 

@@ -38,6 +38,7 @@
 -export([
          access_outside_root/1,
          relative_root/1,
+         missing_root/1,
          links/1,
          links_root/1,
          mk_rm_dir/1,
@@ -124,6 +125,7 @@ all() ->
      ver6_basic,
      access_outside_root,
      relative_root,
+     missing_root,
      root_with_cwd,
      relative_path,
      open_file_dir_v5,
@@ -165,7 +167,8 @@ end_per_group(_GroupName, Config) ->
 
 %%--------------------------------------------------------------------
 
-init_per_testcase(relative_root, Config) ->
+init_per_testcase(TestCase, Config)
+  when TestCase =:= relative_root; TestCase =:= missing_root ->
     ssh:start(),
     prep(Config),
     Config;
@@ -209,7 +212,8 @@ init_per_testcase(TestCase, Config0) ->
             Other
     end.
 
-end_per_testcase(relative_root, _Config) ->
+end_per_testcase(TestCase, _Config)
+  when TestCase =:= relative_root; TestCase =:= missing_root ->
     ssh:stop();
 end_per_testcase(access_attributes_outside_root, Config) ->
     Sftpd = proplists:get_value(sftpd, Config),
@@ -871,6 +875,30 @@ relative_root(Config) when is_list(Config) ->
        ssh:daemon(0, [{subsystems, SubSystems}|Options])),
     ok.
 
+%%--------------------------------------------------------------------
+missing_root(Config) when is_list(Config) ->
+    PrivDir = proplists:get_value(priv_dir, Config),
+    ClientUserDir = filename:join(PrivDir, nopubkey),
+    SystemDir = filename:join(PrivDir, system),
+    Options = [{system_dir, SystemDir},
+               {user_dir, PrivDir},
+               {user_passwords,[{?USER, ?PASSWD}]},
+               {pwdfun, fun(_,_) -> true end}],
+    RootDir = filename:join(PrivDir, missing_root),
+    SubSystems = [ssh_sftpd:subsystem_spec([{root, RootDir}])],
+    {ok, Sftpd} = ssh:daemon(0, [{subsystems, SubSystems} | Options]),
+    Port = ssh_test_lib:daemon_port(Sftpd),
+    Cm = ssh_test_lib:connect(Port,
+                              [{user_dir, ClientUserDir},
+                               {user, ?USER}, {password, ?PASSWD},
+                               {user_interaction, false},
+                               {silently_accept_hosts, true}]),
+    {ok, Channel} =
+        ssh_connection:session_channel(Cm, ?XFER_WINDOW_SIZE, ?XFER_PACKET_SIZE, ?SSH_TIMEOUT),
+    failure = ssh_connection:subsystem(Cm, Channel, "sftp", ?SSH_TIMEOUT),
+    ssh:stop_daemon(Sftpd),
+    ok.
+
 try_access(Path, Cm, Channel, ReqId) ->
     Return = 
         open_file(Path, Cm, Channel, ReqId, 
@@ -908,7 +936,6 @@ root_with_cwd(Config) when is_list(Config) ->
     CWD     = filename:join(RootDir, home),
     FileName = "root_with_cwd.txt",
     FilePath = filename:join(CWD, FileName),
-    ok = filelib:ensure_dir(FilePath),
     {Cm, Channel} = proplists:get_value(sftp, Config),
 
     %% repeat procedure to make sure uniq file handles are generated
@@ -1086,6 +1113,7 @@ prep_sftpd(root_with_cwd, Config) ->
     PrivDir = proplists:get_value(priv_dir, Config),
     RootDir = filename:join(PrivDir, root_with_cwd),
     CWD     = filename:join(RootDir, home),
+    ok = filelib:ensure_path(CWD),
     {ssh_sftpd:subsystem_spec([{root, RootDir}, {cwd, CWD}]), Config};
 prep_sftpd(TestCase, Config) when TestCase =:= relative_path;
                                   TestCase =:= open_file_dir_v5;
