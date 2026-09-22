@@ -1049,7 +1049,7 @@ Typical error reasons:
 `Filename` can also be a file opened with `open/2` in [`raw`](`m:file#raw`)
 mode. This function then changes the open file without resolving its path
 again. The change always applies to the file you opened, even if another
-process replaces the path.
+process replaces the path. On Windows the file must be open for writing.
 """.
 -doc(#{since => <<"OTP R15B">>}).
 -spec write_file_info(Filename, FileInfo, Opts) -> ok | {error, Reason} when
@@ -1276,7 +1276,8 @@ Typical error reasons:
 make_symlink(Old, New) when ?IS_AT_TARGET(New) ->
     %% The target of the link is stored as it is given, so only the new name
     %% belongs to a directory.
-    either_call(make_symlink, [file_name(Old), at_target(New)]);
+    either_call(make_symlink, [converted(file_name(Old)),
+                               converted(at_target(New))]);
 
 make_symlink(Old, New) ->
     check_and_call(make_symlink, [file_name(Old), file_name(New)]).
@@ -1683,18 +1684,22 @@ at_call(Function, Target0, Args) ->
 %% whether it can do this. Windows has no directory that means "the working
 %% directory", so it answers enotsup.
 either_target(Target) when ?IS_AT_TARGET(Target) ->
-    at_target(Target);
+    converted(at_target(Target));
 either_target(Name) ->
-    file_name(Name).
+    converted(file_name(Name)).
 
-%% Calls prim_file with names that were each converted already, unless the
-%% conversion of one of them failed.
-either_call(Function, Args) ->
-    case lists:keyfind(error, 1, Args) of
-        {error, _} = Error ->
+converted({error, _} = Error) ->
+    Error;
+converted(Name) ->
+    {ok, Name}.
+
+%% Calls prim_file with converted names, unless one of them is an error.
+either_call(Function, Converted) ->
+    case [Error || {error, _} = Error <- Converted] of
+        [Error | _] ->
             Error;
-        false ->
-            apply(?PRIM_FILE, Function, Args)
+        [] ->
+            apply(?PRIM_FILE, Function, [Name || {ok, Name} <- Converted])
     end.
 
 %% A directory that file:open/2 returned is wrapped in the layers that were
@@ -1723,9 +1728,25 @@ open_at_1(Target, ModeList) ->
         {_, true} ->
             {error, badarg};
         {true, false} ->
-            ?PRIM_FILE:open(Target, ModeList);
+            open_at_raw(Target, ModeList);
         {false, false} ->
             open_at_io_server(Target, ModeList)
+    end.
+
+%% The directory belongs to the calling process, so the file is opened here
+%% and the raw layers take it over.
+open_at_raw(Target, ModeList) ->
+    case ?PRIM_FILE:open(Target, ModeList) of
+        {ok, Fd} ->
+            case raw_file_io:open(Fd, ModeList) of
+                {ok, _} = Result ->
+                    Result;
+                Error ->
+                    _ = ?PRIM_FILE:close(Fd),
+                    Error
+            end;
+        Error ->
+            Error
     end.
 
 open_at_io_server({_Dir, Name} = Target, ModeList) ->
@@ -1742,7 +1763,7 @@ open_at_io_server({_Dir, Name} = Target, ModeList) ->
     end.
 
 start_io_server_for(Fd, ModeList) ->
-    OpenFun = fun(_ReadMode, _Opts) -> ?PRIM_FILE:adopt(Fd) end,
+    OpenFun = fun(_ReadMode, Opts) -> raw_file_io:open(Fd, [raw | Opts]) end,
 
     case file_io_server:start_handle(self(), OpenFun, ModeList) of
         {ok, _Pid} = Result ->
@@ -2309,8 +2330,8 @@ copy_int({SourceName, SourceOpts}, Dest, Length)
     case either_target(SourceName) of
 	{error, _} = Error ->
 	    Error;
-	Source ->
-	    case open(Source, [read | SourceOpts]) of
+	{ok, _} ->
+	    case open(SourceName, [read | SourceOpts]) of
 		{ok, Handle} ->
 		    Result = copy_opened_int(Handle, Dest, Length, 0),
 		    _ = close(Handle),
@@ -2326,8 +2347,8 @@ copy_int(Source, {DestName, DestOpts}, Length)
     case either_target(DestName) of
 	{error, _} = Error ->
 	    Error;
-	Dest ->
-	    case open(Dest, [write | DestOpts]) of
+	{ok, _} ->
+	    case open(DestName, [write | DestOpts]) of
 		{ok, Handle} ->
                     case copy_opened_int(Source, Handle, Length, 0) of
                         {ok, _} = OK ->
@@ -2377,7 +2398,7 @@ copy_at(Source, SourceOpts, Dest, DestOpts, Length) ->
             Result =
                 case open(Dest, [write, binary | DestOpts]) of
                     {ok, Out} ->
-                        copy_at_close(In, Out, Length);
+                        copy_and_close(In, Out, Length);
                     {error, _} = Error ->
                         Error
                 end,
@@ -2387,7 +2408,7 @@ copy_at(Source, SourceOpts, Dest, DestOpts, Length) ->
             Error
     end.
 
-copy_at_close(In, Out, Length) ->
+copy_and_close(In, Out, Length) ->
     case copy_opened_int(In, Out, Length, 0) of
         {ok, _} = OK ->
             case close(Out) of

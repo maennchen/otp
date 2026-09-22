@@ -1012,10 +1012,17 @@ open_at(Config) when is_list(Config) ->
 
     {ok, Dir} = ?FILE_MODULE:open(TestDir, [raw, read, directory]),
 
-    %% A raw file reads the same contents as a path does.
+    %% A raw file reads the same contents as a path does, through the same
+    %% layers, so list mode gives a list.
     {ok, Raw} = ?FILE_MODULE:open({Dir, "file"}, [raw, read]),
-    {ok, <<"contents">>} = ?FILE_MODULE:read(Raw, 100),
+    {ok, "contents"} = ?FILE_MODULE:read(Raw, 100),
     ok = ?FILE_MODULE:close(Raw),
+    {ok, RawBin} = ?FILE_MODULE:open({Dir, "file"}, [raw, read, binary]),
+    {ok, <<"contents">>} = ?FILE_MODULE:read(RawBin, 100),
+    ok = ?FILE_MODULE:close(RawBin),
+    {ok, Delayed} = ?FILE_MODULE:open({Dir, "file"}, [raw, read, delayed_write]),
+    {ok, "contents"} = ?FILE_MODULE:read(Delayed, 100),
+    ok = ?FILE_MODULE:close(Delayed),
 
     %% Without the raw mode the caller gets an io server, which reads the same
     %% contents as a list.

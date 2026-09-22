@@ -724,7 +724,13 @@ static ERL_NIF_TERM set_controlling_process_nif_impl(efile_data_t *d, ErlNifEnv 
         return posix_error_to_tuple(env, ESRCH);
     }
 
-    enif_demonitor_process(env, d, &d->monitor);
+    if(enif_demonitor_process(env, d, &d->monitor)) {
+        /* The old owner died during this call and asked for a close. The new
+         * owner keeps the file, so withdraw that close. */
+        erts_atomic32_cmpxchg_acqb(&d->state, EFILE_STATE_BUSY,
+                                   EFILE_STATE_CLOSE_PENDING);
+    }
+
     d->monitor = monitor;
 
     return am_ok;

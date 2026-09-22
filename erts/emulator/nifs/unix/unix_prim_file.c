@@ -140,6 +140,10 @@ static int open_file_is_dir(const efile_path_t *path, int fd) {
     int error;
 
 #ifndef HAVE_FSTAT
+    if(path == NULL) {
+        return 0;
+    }
+
     error = stat((const char*)path->data, &file_info);
     (void)fd;
 #else
@@ -197,8 +201,7 @@ static void get_open_flags(enum efile_modes_t modes, int *flags, int *mode) {
 }
 
 /* Wraps a descriptor that open(2) or openat(2) returned in a resource. The
- * path is passed on to open_file_is_dir, which only reads it on a platform
- * without fstat. */
+ * path is NULL for a name in a directory. */
 static posix_errno_t build_open_resource(const efile_path_t *path, int fd,
         enum efile_modes_t modes, ErlNifResourceType *nif_type,
         efile_data_t **d) {
@@ -276,7 +279,7 @@ static posix_errno_t open_at(efile_data_t *dir, const efile_path_t *path,
         fd = openat(u->fd, (const char*)path->data, flags, mode);
     } while(fd == -1 && errno == EINTR);
 
-    return build_open_resource(path, fd, modes, nif_type, d);
+    return build_open_resource(NULL, fd, modes, nif_type, d);
 #endif
 }
 
@@ -320,23 +323,17 @@ static void resolved_release(struct efile_resolved *resolved) {
  * unreasonable time. */
 #define EFILE_MAX_WALK_STEPS 4096
 
-/* One position in a walk from a root directory.
- *
- * "fd" is the directory the next component is resolved against. "depth" counts
- * how far the walk has moved below the root, so that ".." can be refused when
- * it would leave the root. The root itself is at depth 0 and is never closed
- * by the walk. */
+/* One position in a walk from a root directory. "fd" is the directory the
+ * next component is resolved against. The root itself is never closed. */
 struct root_walk {
     int root_fd;
     int fd;
-    int depth;
     int links_followed;
 };
 
 static void walk_init(struct root_walk *walk, int root_fd) {
     walk->root_fd = root_fd;
     walk->fd = root_fd;
-    walk->depth = 0;
     walk->links_followed = 0;
 }
 
@@ -348,45 +345,9 @@ static void walk_close(struct root_walk *walk) {
     walk->fd = walk->root_fd;
 }
 
-/* Moves the walk to the root, which is where an absolute name and the target
- * of an absolute link both start. */
-static void walk_reset(struct root_walk *walk) {
-    walk_close(walk);
-    walk->depth = 0;
-}
-
 static void walk_enter(struct root_walk *walk, int fd) {
     walk_close(walk);
     walk->fd = fd;
-    walk->depth++;
-}
-
-/* Moves the walk to the directory above. The root has nothing above it, so a
- * caller that asks for that is leaving the root. */
-static posix_errno_t walk_leave(struct root_walk *walk) {
-    int parent_fd;
-
-    if(walk->depth == 0) {
-        return EXDEV;
-    }
-
-    do {
-        parent_fd = openat(walk->fd, "..", O_RDONLY | O_NOFOLLOW
-#ifdef O_DIRECTORY
-                           | O_DIRECTORY
-#endif
-                           );
-    } while(parent_fd == -1 && errno == EINTR);
-
-    if(parent_fd == -1) {
-        return errno;
-    }
-
-    walk_close(walk);
-    walk->fd = parent_fd;
-    walk->depth--;
-
-    return 0;
 }
 
 /* Reads the length of the component that starts at "name", and where the next
@@ -411,6 +372,42 @@ static int component_is(const char *name, size_t length, const char *against) {
     return strlen(against) == length && memcmp(name, against, length) == 0;
 }
 
+/* Removes the ".." at "up_start" and the component before it, so that the
+ * walk can start again from the root. Asking the system for ".." would race
+ * with a rename of the directory the walk is in. A "." before the ".." does
+ * not count. EXDEV when nothing is left to remove: the name leaves the root. */
+static posix_errno_t remove_parent_reference(char *name, size_t up_start,
+        size_t up_next) {
+    size_t previous, scan;
+    int found;
+
+    found = 0;
+    previous = 0;
+    scan = 0;
+
+    while(scan < up_start) {
+        size_t length, next;
+
+        length = component_length(&name[scan], &next);
+
+        if(length > 0 && !component_is(&name[scan], length, ".")) {
+            previous = scan;
+            found = 1;
+        }
+
+        scan += next;
+    }
+
+    if(!found) {
+        return EXDEV;
+    }
+
+    sys_memmove(&name[previous], &name[up_start + up_next],
+                strlen(&name[up_start + up_next]) + 1);
+
+    return 0;
+}
+
 /* Puts the target of a link in place of the component at "offset", ahead of
  * what follows that component. An absolute target starts again at the root,
  * as an absolute name does. */
@@ -420,7 +417,7 @@ static posix_errno_t splice_link_target(struct root_walk *walk, char *name,
     size_t target_length, rest_length;
 
     if(target[0] == '/') {
-        walk_reset(walk);
+        walk_close(walk);
 
         while(target[0] == '/') {
             target++;
@@ -464,12 +461,6 @@ static posix_errno_t walk_to_last(struct root_walk *walk, char *name,
     size_t offset = 0;
     int steps = 0;
 
-    /* A name that starts at the root is resolved from the root, as it would be
-     * if the root were the whole file system. */
-    if(name[0] == '/') {
-        walk_reset(walk);
-    }
-
     for(;;) {
         char component[PATH_MAX];
         size_t length, next;
@@ -500,13 +491,16 @@ static posix_errno_t walk_to_last(struct root_walk *walk, char *name,
         }
 
         if(component_is(&name[offset], length, "..")) {
-            posix_errno_t posix_errno = walk_leave(walk);
+            posix_errno_t posix_errno;
+
+            posix_errno = remove_parent_reference(name, offset, next);
 
             if(posix_errno != 0) {
                 return posix_errno;
             }
 
-            offset += next;
+            walk_close(walk);
+            offset = 0;
             continue;
         }
 
@@ -720,7 +714,7 @@ static posix_errno_t open_in_root(efile_data_t *root,
                     flags | O_NOFOLLOW, mode);
     } while(fd == -1 && errno == EINTR);
 
-    posix_errno = build_open_resource(path, fd, modes, nif_type, d);
+    posix_errno = build_open_resource(NULL, fd, modes, nif_type, d);
 
     resolved_release(&resolved);
 
@@ -775,7 +769,6 @@ static posix_errno_t resolve_target(const efile_target_t *target, int flags,
 #endif
 }
 
-#if defined(HAVE_RENAMEAT) || defined(HAVE_LINKAT)
 /* As resolve_target, but this function answers a target that is a path with
  * the working directory and the path itself. An operation that takes two
  * names can take a path for one of them and a name in a directory for the
@@ -788,7 +781,6 @@ static posix_errno_t resolve_either(const efile_target_t *target, int flags,
 
     return resolve_target(target, flags, resolved);
 }
-#endif
 
 posix_errno_t efile_open(const efile_target_t *target, enum efile_modes_t modes,
         ErlNifResourceType *nif_type, efile_data_t **d) {
@@ -1316,17 +1308,8 @@ static void build_file_info(struct stat *data, efile_fileinfo_t *result) {
     result->gid = data->st_gid;
 }
 
-/* Fills in whether the file can be read and written, from the checks the
- * caller made. A caller that has no check passes -1 for both, and the owner
- * bits of the mode answer instead. */
-static void build_file_access(int readable, int writable, struct stat *data,
+static void build_file_access(int readable, int writable,
         efile_fileinfo_t *result) {
-    if(readable < 0) {
-        /* Just look at read/write access for owner. */
-        result->access = ((data->st_mode >> 6) & 07) >> 1;
-        return;
-    }
-
     result->access = EFILE_ACCESS_NONE;
 
     if(readable) {
@@ -1336,6 +1319,14 @@ static void build_file_access(int readable, int writable, struct stat *data,
         result->access |= EFILE_ACCESS_WRITE;
     }
 }
+
+#if defined(NO_ACCESS) || !defined(HAVE_FACCESSAT)
+/* For a platform that cannot ask: the owner bits of the mode. */
+static void build_file_access_from_mode(struct stat *data,
+        efile_fileinfo_t *result) {
+    result->access = ((data->st_mode >> 6) & 07) >> 1;
+}
+#endif
 
 static posix_errno_t read_info_path(const efile_path_t *path, int follow_links,
         efile_fileinfo_t *result) {
@@ -1355,10 +1346,9 @@ static posix_errno_t read_info_path(const efile_path_t *path, int follow_links,
 
 #ifndef NO_ACCESS
     build_file_access(access((const char*)path->data, R_OK) == 0,
-                      access((const char*)path->data, W_OK) == 0,
-                      &data, result);
+                      access((const char*)path->data, W_OK) == 0, result);
 #else
-    build_file_access(-1, -1, &data, result);
+    build_file_access_from_mode(&data, result);
 #endif
 
     return 0;
@@ -1408,23 +1398,23 @@ static posix_errno_t read_info_at(const efile_target_t *target,
     struct efile_resolved resolved;
     struct stat data;
     posix_errno_t posix_errno;
-    int flags;
+    int resolve_flags, stat_flags;
 
-    flags = EFILE_RESOLVE_SELF_OK;
+    resolve_flags = EFILE_RESOLVE_SELF_OK;
 
     if(follow_links) {
-        flags |= EFILE_RESOLVE_FOLLOW_LAST;
+        resolve_flags |= EFILE_RESOLVE_FOLLOW_LAST;
     }
 
-    posix_errno = resolve_target(target, flags, &resolved);
+    posix_errno = resolve_target(target, resolve_flags, &resolved);
 
     if(posix_errno != 0) {
         return posix_errno;
     }
 
-    flags = resolved.follow_last ? 0 : AT_SYMLINK_NOFOLLOW;
+    stat_flags = resolved.follow_last ? 0 : AT_SYMLINK_NOFOLLOW;
 
-    if(fstatat(resolved.parent_fd, resolved.component, &data, flags) < 0) {
+    if(fstatat(resolved.parent_fd, resolved.component, &data, stat_flags) < 0) {
         posix_errno = errno;
     } else {
         build_file_info(&data, result);
@@ -1433,9 +1423,9 @@ static posix_errno_t read_info_at(const efile_target_t *target,
         build_file_access(
             faccessat(resolved.parent_fd, resolved.component, R_OK, 0) == 0,
             faccessat(resolved.parent_fd, resolved.component, W_OK, 0) == 0,
-            &data, result);
+            result);
 #else
-        build_file_access(-1, -1, &data, result);
+        build_file_access_from_mode(&data, result);
 #endif
     }
 

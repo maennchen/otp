@@ -73,10 +73,7 @@ start_link_handle(Owner, OpenFun, ModeList)
 %%% Server starter, dispatcher and helpers
 
 do_start(Spawn, Owner, FileName, ModeList) ->
-    OpenFun = fun(ReadMode, Opts0) ->
-                      Opts = maybe_add_read_ahead(ReadMode, Opts0),
-                      raw_file_io:open(FileName, [raw | Opts])
-              end,
+    OpenFun = fun(_ReadMode, Opts) -> raw_file_io:open(FileName, [raw | Opts]) end,
     do_start_handle(Spawn, Owner, OpenFun, ModeList).
 
 do_start_handle(Spawn, Owner, OpenFun, ModeList) ->
@@ -89,7 +86,7 @@ do_start_handle(Spawn, Owner, OpenFun, ModeList) ->
 		  erlang:dt_restore_tag(Utag),
 		  case parse_options(ModeList) of
                       {ReadMode, UnicodeMode, Opts} ->
-                          case OpenFun(ReadMode, Opts) of
+                          case OpenFun(ReadMode, maybe_add_read_ahead(ReadMode, Opts)) of
 			      {ok, Handle} ->
 				  M = erlang:monitor(process, Owner),
 				  Self ! {Ref, ok},

@@ -1038,6 +1038,11 @@ static posix_errno_t walk_to_last(struct root_walk *walk, WCHAR *name,
         NTSTATUS status;
         HANDLE opened;
 
+        /* An absolute name starts at the root. */
+        while(name[offset] == L'\\' || name[offset] == L'/') {
+            offset++;
+        }
+
         length = next_component(&name[offset], component, MAX_PATH, &next);
 
         if(length == 0) {
@@ -2681,7 +2686,6 @@ static posix_errno_t rename_at(const efile_target_t *old_target,
     posix_errno_t posix_errno;
     HANDLE handle;
     NTSTATUS status;
-    int old_owned, new_owned;
 
     posix_errno = resolve_either(old_target, 0, &old_resolved);
 
@@ -2782,7 +2786,6 @@ static posix_errno_t make_hard_link_at(const efile_target_t *existing_target,
     posix_errno_t posix_errno;
     HANDLE handle;
     NTSTATUS status;
-    int existing_owned, new_owned;
 
     posix_errno = resolve_either(existing_target, 0, &existing_resolved);
 
@@ -2991,12 +2994,6 @@ static posix_errno_t delete_name_at(const efile_target_t *target, int is_dir) {
     if(!SetFileInformationByHandle(handle, FileDispositionInfo,
                                    &disposition, sizeof(disposition))) {
         posix_errno = windows_to_posix_errno(GetLastError());
-
-        /* A directory that is not empty reports as EEXIST, as it does for
-         * del_dir_path. */
-        if(is_dir && posix_errno == EACCES) {
-            posix_errno = EEXIST;
-        }
     }
 
     CloseHandle(handle);

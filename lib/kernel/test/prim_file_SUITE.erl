@@ -2338,7 +2338,7 @@ read_in_root(R, Name) ->
 open_in_root_symlink(R, TestDir, Root) ->
     Relative = filename:join(Root, "relative"),
 
-    case ?PRIM_FILE:make_symlink("../secret", Relative) of
+    case relative_symlink(file, "../secret", Relative) of
         {error, enotsup} ->
             ok;
         {error, eperm} ->
@@ -2353,20 +2353,20 @@ open_in_root_symlink(R, TestDir, Root) ->
             {ok, <<"SECRET">>} = ?PRIM_FILE:read_file(Relative),
 
             %% A link that stays inside is followed, and so is a link to it.
-            ok = ?PRIM_FILE:make_symlink("inside", filename:join(Root, "link")),
-            ok = ?PRIM_FILE:make_symlink("link", filename:join(Root, "link2")),
+            ok = relative_symlink(file, "inside", filename:join(Root, "link")),
+            ok = relative_symlink(file, "link", filename:join(Root, "link2")),
             {ok, <<"INSIDE">>} = read_in_root(R, "link"),
             {ok, <<"INSIDE">>} = read_in_root(R, "link2"),
 
             %% A link whose target leaves the root and comes back is refused,
             %% because the walk never leaves.
-            ok = ?PRIM_FILE:make_symlink("../root/inside",
-                                         filename:join(Root, "out_and_back")),
+            ok = relative_symlink(file, "../root/inside",
+                                  filename:join(Root, "out_and_back")),
             {error, exdev} = ?PRIM_FILE:open({root, R, "out_and_back"}, [read]),
 
             %% A cycle of links ends with eloop.
-            ok = ?PRIM_FILE:make_symlink("cycle_b", filename:join(Root, "cycle_a")),
-            ok = ?PRIM_FILE:make_symlink("cycle_a", filename:join(Root, "cycle_b")),
+            ok = relative_symlink(file, "cycle_b", filename:join(Root, "cycle_a")),
+            ok = relative_symlink(file, "cycle_a", filename:join(Root, "cycle_b")),
             {error, eloop} = ?PRIM_FILE:open({root, R, "cycle_a"}, [read]),
             {error, eloop} = ?PRIM_FILE:open({root, R, "cycle_a/x"}, [read]),
 
@@ -2389,33 +2389,50 @@ open_in_root_symlink(R, TestDir, Root) ->
     end.
 
 %% A link to a directory in the middle of a name is followed by the walk as
-%% well, one link at a time. Windows types a link by the file it is made
-%% from, and here that file is named relative to the link, so this part runs
-%% on Unix only.
+%% well, one link at a time.
 open_in_root_dir_symlink(R, Root) ->
+    ok = ?PRIM_FILE:write_file(filename:join([Root, "sub", "deep"]), "DEEP"),
+    ok = relative_symlink(dir, "sub", filename:join(Root, "to_sub")),
+    ok = relative_symlink(dir, "to_sub", filename:join(Root, "to_to_sub")),
+    {ok, <<"DEEP">>} = read_in_root(R, "to_sub/deep"),
+    {ok, <<"DEEP">>} = read_in_root(R, "to_to_sub/deep"),
+    {ok, <<"INSIDE">>} = read_in_root(R, "to_sub/../inside"),
+
+    %% A link to a directory outside is refused, wherever it sits.
+    ok = relative_symlink(dir, "..", filename:join(Root, "up")),
+    {error, exdev} = ?PRIM_FILE:open({root, R, "up/secret"}, [read]),
+    {error, exdev} = ?PRIM_FILE:open({root, R, "to_sub/../up/secret"}, [read]),
+
+    [ok = delete_symlink(dir, filename:join(Root, N))
+     || N <- ["up", "to_to_sub", "to_sub"]],
+    ok = ?PRIM_FILE:delete(filename:join([Root, "sub", "deep"])),
+    ok.
+
+%% prim_file:make_symlink/2 stores an absolute target on Windows, so a link
+%% with a relative target is made with mklink there.
+relative_symlink(Kind, Target, Link) ->
     case os:type() of
         {win32, _} ->
-            ok;
+            Flag = case Kind of dir -> "/D "; file -> "" end,
+            Cmd = "mklink " ++ Flag ++ quoted(Link) ++ " " ++ quoted(Target),
+            Output = os:cmd(Cmd),
+            case {string:find(Output, "<<===>>"), string:find(Output, "privilege")} of
+                {nomatch, nomatch} -> ct:fail({Cmd, Output});
+                {nomatch, _} -> {error, eperm};
+                _ -> ok
+            end;
         _ ->
-            ok = ?PRIM_FILE:write_file(filename:join([Root, "sub", "deep"]),
-                                       "DEEP"),
-            ok = ?PRIM_FILE:make_symlink("sub", filename:join(Root, "to_sub")),
-            ok = ?PRIM_FILE:make_symlink("to_sub",
-                                         filename:join(Root, "to_to_sub")),
-            {ok, <<"DEEP">>} = read_in_root(R, "to_sub/deep"),
-            {ok, <<"DEEP">>} = read_in_root(R, "to_to_sub/deep"),
-            {ok, <<"INSIDE">>} = read_in_root(R, "to_sub/../inside"),
+            ?PRIM_FILE:make_symlink(Target, Link)
+    end.
 
-            %% A link to a directory outside is refused, wherever it sits.
-            ok = ?PRIM_FILE:make_symlink("..", filename:join(Root, "up")),
-            {error, exdev} = ?PRIM_FILE:open({root, R, "up/secret"}, [read]),
-            {error, exdev} = ?PRIM_FILE:open({root, R, "to_sub/../up/secret"},
-                                             [read]),
+quoted(Path) ->
+    "\"" ++ filename:nativename(Path) ++ "\"".
 
-            [ok = ?PRIM_FILE:delete(filename:join(Root, N))
-             || N <- ["up", "to_to_sub", "to_sub"]],
-            ok = ?PRIM_FILE:delete(filename:join([Root, "sub", "deep"])),
-            ok
+%% Windows removes a link to a directory as a directory.
+delete_symlink(dir, Link) ->
+    case os:type() of
+        {win32, _} -> ?PRIM_FILE:del_dir(Link);
+        _ -> ?PRIM_FILE:delete(Link)
     end.
 
 %% Tests that every operation resolves a name in a root through the walk, so
@@ -2509,7 +2526,7 @@ sorted(Other) -> Other.
 resolve_in_root_links(R, TestDir, Root, Info) ->
     Escape = filename:join(Root, "escape"),
 
-    case ?PRIM_FILE:make_symlink("../secret", Escape) of
+    case relative_symlink(file, "../secret", Escape) of
         {error, enotsup} ->
             ok;
         {error, eperm} ->
@@ -2532,8 +2549,8 @@ resolve_in_root_links(R, TestDir, Root, Info) ->
             {ok, #file_info{size = 6}} = ?PRIM_FILE:read_file_info(Escape),
 
             %% A link that stays inside is followed.
-            ok = ?PRIM_FILE:make_symlink("inside",
-                                         filename:join(Root, "to_inside")),
+            ok = relative_symlink(file, "inside",
+                                  filename:join(Root, "to_inside")),
             {ok, #file_info{type = regular, size = 6}} =
                 ?PRIM_FILE:read_file_info({root, R, "to_inside"}),
 
