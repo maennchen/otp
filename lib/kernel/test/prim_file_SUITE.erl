@@ -43,7 +43,8 @@
 	 list_dir/1,
 	 list_dir_handle/1]).
 
--export([open_at/1, read_at/1, write_at/1, link_at/1]).
+-export([open_at/1, read_at/1, write_at/1, link_at/1, open_in_root/1,
+         resolve_in_root/1]).
 
 -export([file_write_handle_info/1]).
 
@@ -68,7 +69,7 @@ all() ->
     [read_write_file, {group, dirs}, {group, files},
      delete, rename, {group, errors}, {group, links},
      list_dir_limit, list_dir, list_dir_handle, adopt, open_at, read_at,
-     write_at, link_at].
+     write_at, link_at, open_in_root, resolve_in_root].
 
 groups() -> 
     [{dirs, [],
@@ -2255,6 +2256,317 @@ link_at(Config) ->
     ok = ?PRIM_FILE:del_dir(filename:join(TestDir, "other")),
     ok = ?PRIM_FILE:del_dir(TestDir),
     ok.
+
+%% Tests that a name opened in a root cannot reach a file outside that root,
+%% however the name is written.
+open_in_root(Config) ->
+    RootDir = proplists:get_value(priv_dir, Config),
+    TestDir = filename:join(RootDir, ?MODULE_STRING++"_open_in_root"),
+    ok = ?PRIM_FILE:make_dir(TestDir),
+
+    %% The secret sits beside the root, so every escape below aims at it.
+    Secret = filename:join(TestDir, "secret"),
+    ok = ?PRIM_FILE:write_file(Secret, "SECRET"),
+
+    Root = filename:join(TestDir, "root"),
+    ok = ?PRIM_FILE:make_dir(Root),
+    ok = ?PRIM_FILE:write_file(filename:join(Root, "inside"), "INSIDE"),
+    ok = ?PRIM_FILE:make_dir(filename:join(Root, "sub")),
+
+    {ok, R} = ?PRIM_FILE:open(Root, [read, directory]),
+
+    %% A name that stays inside reaches the file it names.
+    {ok, <<"INSIDE">>} = read_in_root(R, "inside"),
+    {ok, <<"INSIDE">>} = ?PRIM_FILE:read_file({root, R, "inside"}),
+
+    %% ".." is counted against how far the walk has moved below the root.
+    {ok, <<"INSIDE">>} = read_in_root(R, "sub/../inside"),
+    {ok, <<"INSIDE">>} = read_in_root(R, "sub/./../inside"),
+
+    %% A ".." that would leave the root is refused.
+    {error, exdev} = ?PRIM_FILE:open({root, R, "../secret"}, [read]),
+    {error, exdev} = ?PRIM_FILE:open({root, R, "sub/../../secret"}, [read]),
+    {error, exdev} = ?PRIM_FILE:open({root, R, ".."}, [read, directory]),
+
+    %% An absolute name starts again at the root rather than at the file
+    %% system root, so it names a file inside.
+    {ok, <<"INSIDE">>} = read_in_root(R, "/inside"),
+    {error, enoent} = ?PRIM_FILE:open({root, R, "/secret"}, [read]),
+
+    %% A name that ends on a directory opens that directory.
+    {ok, SubFd} = ?PRIM_FILE:open({root, R, "sub/"}, [read, directory]),
+    ok = ?PRIM_FILE:close(SubFd),
+    {ok, RootFd} = ?PRIM_FILE:open({root, R, "."}, [read, directory]),
+    ok = ?PRIM_FILE:close(RootFd),
+
+    %% A file is made in a root as it is in a directory.
+    {ok, New} = ?PRIM_FILE:open({root, R, "sub/new"}, [write]),
+    ok = ?PRIM_FILE:write(New, "NEW"),
+    ok = ?PRIM_FILE:close(New),
+    {ok, <<"NEW">>} = ?PRIM_FILE:read_file(filename:join([Root, "sub", "new"])),
+    ok = ?PRIM_FILE:delete(filename:join([Root, "sub", "new"])),
+
+    %% Errors match what a path reports.
+    {error, enoent} = ?PRIM_FILE:open({root, R, "missing"}, [read]),
+    {error, enotdir} = ?PRIM_FILE:open({root, R, "inside/x"}, [read]),
+    {error, enametoolong} =
+        ?PRIM_FILE:open({root, R, lists:duplicate(5000, $a)}, [read]),
+
+    open_in_root_symlink(R, TestDir, Root),
+
+    ok = ?PRIM_FILE:close(R),
+
+    ok = ?PRIM_FILE:delete(filename:join(Root, "inside")),
+    ok = ?PRIM_FILE:del_dir(filename:join(Root, "sub")),
+    ok = ?PRIM_FILE:del_dir(Root),
+    ok = ?PRIM_FILE:delete(Secret),
+    ok = ?PRIM_FILE:del_dir(TestDir),
+    ok.
+
+read_in_root(R, Name) ->
+    case ?PRIM_FILE:open({root, R, Name}, [read]) of
+        {ok, Fd} ->
+            Result = ?PRIM_FILE:read(Fd, 100),
+            ok = ?PRIM_FILE:close(Fd),
+            Result;
+        Error ->
+            Error
+    end.
+
+%% A symbolic link is followed by the walk itself, so a link that points out
+%% of the root cannot be used to leave it.
+open_in_root_symlink(R, TestDir, Root) ->
+    Relative = filename:join(Root, "relative"),
+
+    case ?PRIM_FILE:make_symlink("../secret", Relative) of
+        {error, enotsup} ->
+            ok;
+        {error, eperm} ->
+            {win32,_} = os:type(),
+            ok;
+        ok ->
+            %% The target of the link is resolved from the directory that
+            %% holds the link, so it leaves the root and is refused.
+            {error, exdev} = ?PRIM_FILE:open({root, R, "relative"}, [read]),
+
+            %% Through a path, with no root, the same link reaches the secret.
+            {ok, <<"SECRET">>} = ?PRIM_FILE:read_file(Relative),
+
+            %% A link that stays inside is followed, and so is a link to it.
+            ok = ?PRIM_FILE:make_symlink("inside", filename:join(Root, "link")),
+            ok = ?PRIM_FILE:make_symlink("link", filename:join(Root, "link2")),
+            {ok, <<"INSIDE">>} = read_in_root(R, "link"),
+            {ok, <<"INSIDE">>} = read_in_root(R, "link2"),
+
+            %% A link whose target leaves the root and comes back is refused,
+            %% because the walk never leaves.
+            ok = ?PRIM_FILE:make_symlink("../root/inside",
+                                         filename:join(Root, "out_and_back")),
+            {error, exdev} = ?PRIM_FILE:open({root, R, "out_and_back"}, [read]),
+
+            %% A cycle of links ends with eloop.
+            ok = ?PRIM_FILE:make_symlink("cycle_b", filename:join(Root, "cycle_a")),
+            ok = ?PRIM_FILE:make_symlink("cycle_a", filename:join(Root, "cycle_b")),
+            {error, eloop} = ?PRIM_FILE:open({root, R, "cycle_a"}, [read]),
+            {error, eloop} = ?PRIM_FILE:open({root, R, "cycle_a/x"}, [read]),
+
+            %% An absolute target is reinterpreted against the root on Unix,
+            %% where it names nothing, and refused outright on Windows.
+            Absolute = filename:join(Root, "absolute"),
+            ok = ?PRIM_FILE:make_symlink(filename:join(TestDir, "secret"),
+                                         Absolute),
+            case ?PRIM_FILE:open({root, R, "absolute"}, [read]) of
+                {error, enoent} -> ok;
+                {error, exdev} -> {win32,_} = os:type(), ok
+            end,
+
+            open_in_root_dir_symlink(R, Root),
+
+            [ok = ?PRIM_FILE:delete(filename:join(Root, N))
+             || N <- ["absolute", "cycle_a", "cycle_b", "out_and_back",
+                      "link2", "link", "relative"]],
+            ok
+    end.
+
+%% A link to a directory in the middle of a name is followed by the walk as
+%% well, one link at a time. Windows types a link by the file it is made
+%% from, and here that file is named relative to the link, so this part runs
+%% on Unix only.
+open_in_root_dir_symlink(R, Root) ->
+    case os:type() of
+        {win32, _} ->
+            ok;
+        _ ->
+            ok = ?PRIM_FILE:write_file(filename:join([Root, "sub", "deep"]),
+                                       "DEEP"),
+            ok = ?PRIM_FILE:make_symlink("sub", filename:join(Root, "to_sub")),
+            ok = ?PRIM_FILE:make_symlink("to_sub",
+                                         filename:join(Root, "to_to_sub")),
+            {ok, <<"DEEP">>} = read_in_root(R, "to_sub/deep"),
+            {ok, <<"DEEP">>} = read_in_root(R, "to_to_sub/deep"),
+            {ok, <<"INSIDE">>} = read_in_root(R, "to_sub/../inside"),
+
+            %% A link to a directory outside is refused, wherever it sits.
+            ok = ?PRIM_FILE:make_symlink("..", filename:join(Root, "up")),
+            {error, exdev} = ?PRIM_FILE:open({root, R, "up/secret"}, [read]),
+            {error, exdev} = ?PRIM_FILE:open({root, R, "to_sub/../up/secret"},
+                                             [read]),
+
+            [ok = ?PRIM_FILE:delete(filename:join(Root, N))
+             || N <- ["up", "to_to_sub", "to_sub"]],
+            ok = ?PRIM_FILE:delete(filename:join([Root, "sub", "deep"])),
+            ok
+    end.
+
+%% Tests that every operation resolves a name in a root through the walk, so
+%% that no operation reaches a file outside the root.
+resolve_in_root(Config) ->
+    RootDir = proplists:get_value(priv_dir, Config),
+    TestDir = filename:join(RootDir, ?MODULE_STRING++"_resolve_in_root"),
+    ok = ?PRIM_FILE:make_dir(TestDir),
+
+    %% The secret sits beside the root, so every escape below aims at it.
+    Secret = filename:join(TestDir, "secret"),
+    ok = ?PRIM_FILE:write_file(Secret, "SECRET"),
+
+    Root = filename:join(TestDir, "root"),
+    ok = ?PRIM_FILE:make_dir(Root),
+    ok = ?PRIM_FILE:write_file(filename:join(Root, "inside"), "INSIDE"),
+    ok = ?PRIM_FILE:make_dir(filename:join(Root, "sub")),
+
+    {ok, R} = ?PRIM_FILE:open(Root, [read, directory]),
+
+    %% Reading a name.
+    {ok, #file_info{type = regular, size = 6}} =
+        ?PRIM_FILE:read_file_info({root, R, "inside"}),
+    {ok, #file_info{type = regular}} =
+        ?PRIM_FILE:read_file_info({root, R, "sub/../inside"}),
+    {ok, #file_info{type = directory}} =
+        ?PRIM_FILE:read_link_info({root, R, "sub"}),
+    {ok, ["inside", "sub"]} = sorted(?PRIM_FILE:list_dir({root, R, "."})),
+    {ok, []} = ?PRIM_FILE:list_dir({root, R, "sub"}),
+    {ok, []} = ?PRIM_FILE:list_dir({root, R, "sub/"}),
+    {error, exdev} = ?PRIM_FILE:read_file_info({root, R, "../secret"}),
+    {error, exdev} = ?PRIM_FILE:list_dir({root, R, ".."}),
+    {error, enoent} = ?PRIM_FILE:read_file_info({root, R, "missing"}),
+    {error, enotdir} = ?PRIM_FILE:list_dir({root, R, "inside"}),
+
+    %% Changing a name.
+    ok = ?PRIM_FILE:make_dir({root, R, "sub/made"}),
+    ok = ?PRIM_FILE:make_dir({root, R, "/top"}),
+    {ok, #file_info{type = directory}} =
+        ?PRIM_FILE:read_file_info(filename:join(Root, "top")),
+    ok = ?PRIM_FILE:del_dir({root, R, "top"}),
+    {error, exdev} = ?PRIM_FILE:make_dir({root, R, "../made"}),
+    {error, exdev} = ?PRIM_FILE:make_dir({root, R, "sub/../../made"}),
+
+    ok = ?PRIM_FILE:write_file(filename:join([Root, "sub", "made", "f"]), "F"),
+    {error, exdev} = ?PRIM_FILE:delete({root, R, "sub/../../secret"}),
+    ok = ?PRIM_FILE:rename({root, R, "sub/made/f"}, {root, R, "sub/g"}),
+    {ok, <<"F">>} = ?PRIM_FILE:read_file({root, R, "sub/g"}),
+    {error, exdev} = ?PRIM_FILE:rename({root, R, "sub/g"}, {root, R, "../g"}),
+    {error, exdev} = ?PRIM_FILE:rename({root, R, "../secret"}, {root, R, "sub/g"}),
+    ok = ?PRIM_FILE:delete({root, R, "sub/g"}),
+    ok = ?PRIM_FILE:del_dir({root, R, "sub/made"}),
+
+    {ok, Info} = ?PRIM_FILE:read_file_info({root, R, "inside"}),
+    Time = {{2001, 2, 3}, {4, 5, 6}},
+    ok = ?PRIM_FILE:write_file_info({root, R, "inside"},
+                                    Info#file_info{mtime = Time}),
+    {ok, #file_info{mtime = Time}} =
+        ?PRIM_FILE:read_file_info(filename:join(Root, "inside")),
+    {error, exdev} = ?PRIM_FILE:write_file_info({root, R, "../secret"}, Info),
+
+    %% A name that resolves to the root itself is a directory that can be read
+    %% or changed, but not removed, made or renamed.
+    {ok, #file_info{type = directory}} =
+        ?PRIM_FILE:read_file_info({root, R, "sub/.."}),
+    {error, eisdir} = ?PRIM_FILE:delete({root, R, "."}),
+    {error, eisdir} = ?PRIM_FILE:del_dir({root, R, "sub/.."}),
+    {error, eisdir} = ?PRIM_FILE:make_dir({root, R, "."}),
+    {error, eisdir} = ?PRIM_FILE:rename({root, R, "."}, {root, R, "x"}),
+
+    resolve_in_root_links(R, TestDir, Root, Info),
+
+    ok = ?PRIM_FILE:close(R),
+
+    %% A closed root cannot hold a name.
+    {error, einval} = ?PRIM_FILE:read_file_info({root, R, "inside"}),
+
+    ok = ?PRIM_FILE:delete(filename:join(Root, "inside")),
+    ok = ?PRIM_FILE:del_dir(filename:join(Root, "sub")),
+    ok = ?PRIM_FILE:del_dir(Root),
+    ok = ?PRIM_FILE:delete(Secret),
+    ok = ?PRIM_FILE:del_dir(TestDir),
+    ok.
+
+sorted({ok, Names}) -> {ok, lists:sort(Names)};
+sorted(Other) -> Other.
+
+%% An operation that acts on a link itself is given the link. An operation
+%% that would follow the link has the walk follow it, so the link cannot lead
+%% out of the root.
+resolve_in_root_links(R, TestDir, Root, Info) ->
+    Escape = filename:join(Root, "escape"),
+
+    case ?PRIM_FILE:make_symlink("../secret", Escape) of
+        {error, enotsup} ->
+            ok;
+        {error, eperm} ->
+            {win32,_} = os:type(),
+            ok;
+        ok ->
+            {ok, #file_info{type = symlink}} =
+                ?PRIM_FILE:read_link_info({root, R, "escape"}),
+            %% Windows resolves a link to a full path, so the target is only
+            %% checked for pointing at the file that was linked.
+            {ok, EscapeTarget} = ?PRIM_FILE:read_link({root, R, "escape"}),
+            "secret" = filename:basename(EscapeTarget),
+
+            {error, exdev} = ?PRIM_FILE:read_file_info({root, R, "escape"}),
+            {error, exdev} = ?PRIM_FILE:write_file_info({root, R, "escape"},
+                                                        Info),
+            {error, exdev} = ?PRIM_FILE:list_dir({root, R, "escape/"}),
+
+            %% Through a path, with no root, the same link reaches the secret.
+            {ok, #file_info{size = 6}} = ?PRIM_FILE:read_file_info(Escape),
+
+            %% A link that stays inside is followed.
+            ok = ?PRIM_FILE:make_symlink("inside",
+                                         filename:join(Root, "to_inside")),
+            {ok, #file_info{type = regular, size = 6}} =
+                ?PRIM_FILE:read_file_info({root, R, "to_inside"}),
+
+            %% A link is removed as the link, not as what it points at.
+            ok = ?PRIM_FILE:delete({root, R, "escape"}),
+            {ok, #file_info{size = 6}} =
+                ?PRIM_FILE:read_file_info(filename:join(TestDir, "secret")),
+
+            %% A hard link is made in a root, with both names resolved through
+            %% the walk. A symbolic link is made the same way where the
+            %% platform can make one relative to a directory.
+            ok = ?PRIM_FILE:make_link({root, R, "inside"}, {root, R, "hard"}),
+            {ok, #file_info{links = 2}} =
+                ?PRIM_FILE:read_file_info({root, R, "hard"}),
+            {error, exdev} = ?PRIM_FILE:make_link({root, R, "../secret"},
+                                                  {root, R, "hard2"}),
+            {error, exdev} = ?PRIM_FILE:make_link({root, R, "inside"},
+                                                  {root, R, "../hard2"}),
+            ok = ?PRIM_FILE:delete({root, R, "hard"}),
+
+            case ?PRIM_FILE:make_symlink("inside", {root, R, "soft"}) of
+                ok ->
+                    {ok, "inside"} = ?PRIM_FILE:read_link({root, R, "soft"}),
+                    {error, exdev} =
+                        ?PRIM_FILE:make_symlink("inside", {root, R, "../soft"}),
+                    ok = ?PRIM_FILE:delete({root, R, "soft"});
+                {error, enotsup} ->
+                    {win32, _} = os:type()
+            end,
+
+            ok = ?PRIM_FILE:delete({root, R, "to_inside"}),
+            ok
+    end.
 
 %%%
 %%% Support for testing large files.

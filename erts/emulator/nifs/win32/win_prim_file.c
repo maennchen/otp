@@ -312,16 +312,6 @@ posix_errno_t efile_marshal_name(ErlNifEnv *env, ERL_NIF_TERM name, efile_path_t
         return EINVAL;
     }
 
-    /* A name that names a drive or that starts at the root of one is a path
-     * rather than a name in the directory the caller holds. */
-    if(characters[0] == L'\\' || characters[0] == L'/') {
-        return EINVAL;
-    }
-
-    if(length >= 2 && characters[1] == L':') {
-        return EINVAL;
-    }
-
     /* The system takes a backslash as the separator. A name that was written
      * with forward slashes is accepted as well, as it is for a path. */
     if(!enif_alloc_binary((length + 1) * sizeof(WCHAR), result)) {
@@ -342,6 +332,18 @@ posix_errno_t efile_marshal_name(ErlNifEnv *env, ERL_NIF_TERM name, efile_path_t
     enif_make_binary(env, result);
 
     return 0;
+}
+
+/* Returns whether a name names a drive or starts at the root of one. Such a
+ * name is a path rather than a name in the directory the caller holds. A
+ * name in a root is walked, and the walk starts an absolute name at the root
+ * again, so only a name in an open directory is refused. */
+static int name_is_rooted(const WCHAR *name) {
+    if(name[0] == L'\\' || name[0] == L'/') {
+        return 1;
+    }
+
+    return name[0] != L'\0' && name[1] == L':';
 }
 
 ERL_NIF_TERM efile_get_handle(ErlNifEnv *env, efile_data_t *d) {
@@ -706,7 +708,7 @@ static int open_modes_to_flags(enum efile_modes_t modes,
 /* Opens a name against an open directory and answers with the handle. The
  * caller closes it. Win32 cannot open a name relative to a directory handle,
  * so this uses the native call that takes the directory in its object
- * attributes. */
+ * attributes. An empty name opens the directory itself again. */
 static NTSTATUS open_name_at(HANDLE dir, const WCHAR *name,
         ACCESS_MASK access_flags, ULONG options, ULONG disposition,
         HANDLE *result) {
@@ -717,7 +719,7 @@ static NTSTATUS open_name_at(HANDLE dir, const WCHAR *name,
 
     name_length = wcslen(name);
 
-    if(name_length == 0 || name_length > (USHRT_MAX / sizeof(WCHAR))) {
+    if(name_length > (USHRT_MAX / sizeof(WCHAR))) {
         return EFILE_STATUS_INVALID_PARAMETER;
     }
 
@@ -749,7 +751,8 @@ static posix_errno_t open_at(efile_data_t *dir, const efile_path_t *path,
     NTSTATUS status;
     HANDLE handle;
 
-    if(!open_modes_to_flags(modes, &access_flags, &disposition, &options)) {
+    if(!open_modes_to_flags(modes, &access_flags, &disposition, &options)
+       || name_is_rooted((const WCHAR*)path->data)) {
         (*d) = NULL;
         return EINVAL;
     }
@@ -795,17 +798,529 @@ static void resolved_release(struct efile_resolved *resolved) {
     }
 }
 
+/* The most links that may be followed while one name is resolved. The limit
+ * stops a cycle of links from resolving forever. */
+#define EFILE_MAX_LINK_DEPTH 32
+
+/* The structure that FSCTL_GET_REPARSE_POINT fills in for a symbolic link. The
+ * Windows SDK declares it only in the DDK. */
+typedef struct {
+    ULONG ReparseTag;
+    USHORT ReparseDataLength;
+    USHORT Reserved;
+    USHORT SubstituteNameOffset;
+    USHORT SubstituteNameLength;
+    USHORT PrintNameOffset;
+    USHORT PrintNameLength;
+    ULONG Flags;
+    WCHAR PathBuffer[1];
+} EFILE_SYMBOLIC_LINK_REPARSE_BUFFER;
+
+#define EFILE_SYMLINK_FLAG_RELATIVE 0x00000001
+
+/* Reads the target of a symbolic link as it is stored, which is what the walk
+ * has to resolve. GetFinalPathNameByHandleW cannot be used, because it answers
+ * with the name of the link rather than the name it points at.
+ *
+ * Returns 0 with "is_link" set and the target filled in for a symbolic link
+ * with a relative target. Returns 0 with "is_link" clear for a reparse point
+ * that does not stand for another name, which the walk treats as the file it
+ * is.
+ *
+ * A link whose target names a drive is refused with EXDEV. Windows stores
+ * such a target as a full path, and to read it as a name under the root
+ * would answer for a file the link does not name. A junction stands for a
+ * full path in the same way, so it is refused as well. */
+static posix_errno_t read_link_target(HANDLE handle, WCHAR *target,
+        size_t target_length, int *is_link) {
+    char buffer[MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
+    EFILE_SYMBOLIC_LINK_REPARSE_BUFFER *reparse;
+    DWORD returned_length;
+    size_t name_length;
+    const WCHAR *name;
+
+    reparse = (EFILE_SYMBOLIC_LINK_REPARSE_BUFFER*)buffer;
+
+    if(!DeviceIoControl(handle, FSCTL_GET_REPARSE_POINT, NULL, 0,
+                        buffer, sizeof(buffer), &returned_length, NULL)) {
+        return windows_to_posix_errno(GetLastError());
+    }
+
+    if(reparse->ReparseTag != IO_REPARSE_TAG_SYMLINK) {
+        if(IsReparseTagNameSurrogate(reparse->ReparseTag)) {
+            return EXDEV;
+        }
+
+        *is_link = 0;
+
+        return 0;
+    }
+
+    if(!(reparse->Flags & EFILE_SYMLINK_FLAG_RELATIVE)) {
+        return EXDEV;
+    }
+
+    name = &reparse->PathBuffer[reparse->SubstituteNameOffset / sizeof(WCHAR)];
+    name_length = reparse->SubstituteNameLength / sizeof(WCHAR);
+
+    if(name_length >= target_length) {
+        return ENAMETOOLONG;
+    }
+
+    sys_memcpy(target, name, name_length * sizeof(WCHAR));
+    target[name_length] = L'\0';
+    *is_link = 1;
+
+    return 0;
+}
+
+/* Copies the component that starts at name, and reports where the next one
+ * starts. Repeated separators are skipped. */
+static size_t next_component(const WCHAR *name, WCHAR *component,
+        size_t component_length, size_t *next) {
+    size_t length = 0;
+
+    while(name[length] != L'\0' && name[length] != L'\\' && name[length] != L'/') {
+        length++;
+    }
+
+    *next = length;
+
+    while(name[*next] == L'\\' || name[*next] == L'/') {
+        (*next)++;
+    }
+
+    if(length > 0 && length < component_length) {
+        sys_memcpy(component, name, length * sizeof(WCHAR));
+        component[length] = L'\0';
+    }
+
+    return length;
+}
+
+static int component_is(const WCHAR *name, size_t length, const WCHAR *against) {
+    return wcslen(against) == length
+        && wcsncmp(name, against, length) == 0;
+}
+
+/* Rewrites name so that the component before the given one is removed, along
+ * with the ".." itself. The walk then starts again from the root, which is how
+ * a ".." is resolved without asking the system to open one. NtCreateFile
+ * refuses ".." as a name, so it cannot be opened. A "." before the ".." names
+ * no directory, so the component before that one is removed instead.
+ *
+ * Returns EXDEV when there is no component to remove, because the name then
+ * leaves the root. */
+static posix_errno_t remove_parent_reference(WCHAR *name, size_t up_start,
+        size_t up_next) {
+    size_t previous, scan;
+    int found;
+
+    /* Find where the last component before this one that is not "." starts.
+     * A leading separator has been skipped by the walk already. */
+    found = 0;
+    previous = 0;
+    scan = 0;
+
+    while(scan < up_start) {
+        size_t length, next;
+
+        length = 0;
+
+        while(name[scan + length] != L'\0' && name[scan + length] != L'\\'
+              && name[scan + length] != L'/') {
+            length++;
+        }
+
+        next = length;
+
+        while(name[scan + next] == L'\\' || name[scan + next] == L'/') {
+            next++;
+        }
+
+        if(!(length == 1 && name[scan] == L'.') && length > 0) {
+            previous = scan;
+            found = 1;
+        }
+
+        scan += next;
+    }
+
+    if(!found) {
+        return EXDEV;
+    }
+
+    /* Move what follows the ".." over the component before it. */
+    wmemmove(&name[previous], &name[up_start + up_next],
+             wcslen(&name[up_start + up_next]) + 1);
+
+    return 0;
+}
+
+/* Puts the target of a link in place of the component at "offset", ahead of
+ * what follows that component. The name is a buffer of MAX_PATH. */
+static posix_errno_t splice_link_target(WCHAR *name, size_t offset,
+        size_t next, const WCHAR *target) {
+    WCHAR rest[MAX_PATH];
+    size_t target_length = wcslen(target);
+    size_t rest_length = wcslen(&name[offset + next]);
+
+    if(offset + target_length + 1 + rest_length >= MAX_PATH) {
+        return ENAMETOOLONG;
+    }
+
+    sys_memcpy(rest, &name[offset + next], (rest_length + 1) * sizeof(WCHAR));
+    sys_memcpy(&name[offset], target, target_length * sizeof(WCHAR));
+
+    if(rest_length > 0) {
+        name[offset + target_length] = L'\\';
+        sys_memcpy(&name[offset + target_length + 1], rest,
+                   (rest_length + 1) * sizeof(WCHAR));
+    } else {
+        name[offset + target_length] = L'\0';
+    }
+
+    return 0;
+}
+
+/* One walk from a root directory. "current" is the directory the next
+ * component is resolved against. It is the root itself, which the walk never
+ * closes, or a directory the walk opened. */
+struct root_walk {
+    HANDLE root;
+    HANDLE current;
+    int links_followed;
+};
+
+static void walk_init(struct root_walk *walk, HANDLE root) {
+    walk->root = root;
+    walk->current = root;
+    walk->links_followed = 0;
+}
+
+static void walk_close(struct root_walk *walk) {
+    if(walk->current != walk->root) {
+        CloseHandle(walk->current);
+    }
+
+    walk->current = walk->root;
+}
+
+static void walk_enter(struct root_walk *walk, HANDLE dir) {
+    walk_close(walk);
+    walk->current = dir;
+}
+
+/* Resolves every component of "name" but the last one, so that the caller is
+ * left holding the directory the last component belongs to. The name is
+ * changed as links are followed and ".." is removed, so it has to be a buffer
+ * of MAX_PATH.
+ *
+ * On success "last" holds the last component and "last_length" its length. A
+ * name whose last component is "." or ".." has no last component of its own.
+ * The walk resolves such a name in full and sets "last_length" to 0.
+ *
+ * The last component is always a plain name. It holds no separator. It is
+ * never "." or "..", because the walk resolves both of those itself. The
+ * caller can therefore open it against the directory the walk ended on, and
+ * the system cannot reach a file outside that directory.
+ *
+ * The walk always ends. Every turn moves past a component, removes a ".."
+ * along with the component before it, or puts the target of a link in the
+ * name, and only a bounded number of links is followed. */
+static posix_errno_t walk_to_last(struct root_walk *walk, WCHAR *name,
+        WCHAR *last, size_t last_size, size_t *last_length) {
+    size_t offset = 0;
+
+    for(;;) {
+        WCHAR component[MAX_PATH];
+        size_t length, next;
+        NTSTATUS status;
+        HANDLE opened;
+
+        length = next_component(&name[offset], component, MAX_PATH, &next);
+
+        if(length == 0) {
+            /* The name ended, so the walk is at the directory that holds it
+             * and there is no component left to open. */
+            last[0] = L'\0';
+            *last_length = 0;
+
+            return 0;
+        }
+
+        if(component_is(&name[offset], length, L".")) {
+            offset += next;
+            continue;
+        }
+
+        if(component_is(&name[offset], length, L"..")) {
+            posix_errno_t posix_errno;
+
+            posix_errno = remove_parent_reference(name, offset, next);
+
+            if(posix_errno != 0) {
+                return posix_errno;
+            }
+
+            /* The name changed, so the walk starts again from the root. */
+            walk_close(walk);
+            offset = 0;
+            continue;
+        }
+
+        if(name[offset + next] == L'\0') {
+            /* This is the last component, and the caller opens it. The
+             * checks above consume "." and "..", and a name that holds a
+             * separator does not reach here. This component is therefore a
+             * plain name. */
+            if(length >= last_size) {
+                return ENAMETOOLONG;
+            }
+
+            sys_memcpy(last, component, (length + 1) * sizeof(WCHAR));
+            *last_length = length;
+
+            return 0;
+        }
+
+        /* A component in the middle is opened for its attributes alone, so
+         * that a link is seen rather than followed. */
+        status = open_name_at(walk->current, component, FILE_READ_ATTRIBUTES,
+            EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_OPEN_REPARSE_POINT,
+            EFILE_FILE_OPEN, &opened);
+
+        if(!NT_SUCCESS(status)) {
+            return nt_status_to_posix_errno(status);
+        }
+
+        if(handle_has_file_attributes(opened, FILE_ATTRIBUTE_REPARSE_POINT)) {
+            WCHAR target[MAX_PATH];
+            posix_errno_t posix_errno;
+            int is_link;
+
+            posix_errno = read_link_target(opened, target, MAX_PATH, &is_link);
+            CloseHandle(opened);
+
+            if(posix_errno != 0) {
+                return posix_errno;
+            }
+
+            if(is_link) {
+                if(walk->links_followed++ > EFILE_MAX_LINK_DEPTH) {
+                    return ELOOP;
+                }
+
+                /* The link is followed by putting its target in place of the
+                 * component, so that the rest of the name is resolved from
+                 * wherever the target leads. */
+                posix_errno = splice_link_target(name, offset, next, target);
+
+                if(posix_errno != 0) {
+                    return posix_errno;
+                }
+
+                continue;
+            }
+
+            /* A reparse point that does not stand for another name is entered
+             * like any other directory. */
+        } else {
+            CloseHandle(opened);
+        }
+
+        status = open_name_at(walk->current, component, FILE_READ_ATTRIBUTES,
+            EFILE_FILE_DIRECTORY_FILE | EFILE_FILE_OPEN_FOR_BACKUP_INTENT,
+            EFILE_FILE_OPEN, &opened);
+
+        if(!NT_SUCCESS(status)) {
+            return nt_status_to_posix_errno(status);
+        }
+
+        walk_enter(walk, opened);
+        offset += next;
+    }
+}
+
+/* Resolves a name in a root to the directory that holds its last component,
+ * and that component. The rules are those of walk_to_last, so the name cannot
+ * reach a file outside the root.
+ *
+ * "follow_last" says whether a last component that is a symbolic link is
+ * followed as well, from the directory that holds the link. The component the
+ * caller is left with is then never a link. An operation that acts on the
+ * link itself does not ask for that.
+ *
+ * A name that resolves to a directory the walk holds has no last component of
+ * its own. With EFILE_RESOLVE_SELF_OK the caller is given an empty component
+ * against that directory, which names the directory itself. Without it the
+ * caller is told EISDIR, because it would act on the name itself.
+ *
+ * The walk hands the directory it holds to the caller, which closes it
+ * through resolved_release. The root itself is never closed. */
+static posix_errno_t resolve_in_root(efile_data_t *root,
+        const efile_path_t *path, int flags, struct efile_resolved *resolved) {
+    efile_win_t *r = (efile_win_t*)root;
+    WCHAR name[MAX_PATH];
+    posix_errno_t posix_errno;
+    struct root_walk walk;
+    size_t last_length;
+
+    if(path->size >= sizeof(name)) {
+        return ENAMETOOLONG;
+    }
+
+    sys_memcpy(name, path->data, path->size);
+    name[path->size / sizeof(WCHAR)] = L'\0';
+
+    walk_init(&walk, r->handle);
+
+    /* Each turn resolves the name to the directory that holds its last
+     * component. A last component that is a symbolic link starts another turn
+     * with the target of the link, which is resolved from the directory that
+     * holds the link. */
+    for(;;) {
+        WCHAR target[MAX_PATH];
+        NTSTATUS status;
+        HANDLE handle;
+        int is_link;
+
+        posix_errno = walk_to_last(&walk, name, resolved->component, MAX_PATH,
+                                   &last_length);
+
+        if(posix_errno != 0) {
+            walk_close(&walk);
+            return posix_errno;
+        }
+
+        if(last_length == 0 || !(flags & EFILE_RESOLVE_FOLLOW_LAST)) {
+            break;
+        }
+
+        /* The component is opened for its attributes alone, without following
+         * a link, so that a link is seen. A name that names nothing is left
+         * to the operation, which reports that or creates the file. */
+        status = open_name_at(walk.current, resolved->component,
+            FILE_READ_ATTRIBUTES,
+            EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_OPEN_REPARSE_POINT,
+            EFILE_FILE_OPEN, &handle);
+
+        if(!NT_SUCCESS(status)) {
+            break;
+        }
+
+        if(!handle_has_file_attributes(handle, FILE_ATTRIBUTE_REPARSE_POINT)) {
+            CloseHandle(handle);
+            break;
+        }
+
+        posix_errno = read_link_target(handle, target, MAX_PATH, &is_link);
+        CloseHandle(handle);
+
+        if(posix_errno != 0) {
+            walk_close(&walk);
+            return posix_errno;
+        }
+
+        if(!is_link) {
+            /* A reparse point that does not stand for another name is the
+             * file itself. */
+            break;
+        }
+
+        if(walk.links_followed++ > EFILE_MAX_LINK_DEPTH) {
+            walk_close(&walk);
+            return ELOOP;
+        }
+
+        /* The target replaces the name, and the walk carries on from the
+         * directory that holds the link. */
+        sys_memcpy(name, target, (wcslen(target) + 1) * sizeof(WCHAR));
+    }
+
+    /* An empty component names the directory the walk holds, which
+     * open_name_at opens again for an empty name. */
+    if(resolved->component[0] == L'\0' && !(flags & EFILE_RESOLVE_SELF_OK)) {
+        walk_close(&walk);
+        return EISDIR;
+    }
+
+    /* The walk holds the directory. It gives the directory to the caller
+     * rather than closing it. */
+    resolved->parent = walk.current;
+    resolved->owned = (walk.current != walk.root);
+    resolved->follow_last = 0;
+
+    return 0;
+}
+
+static posix_errno_t open_in_root(efile_data_t *root,
+        const efile_path_t *path, enum efile_modes_t modes,
+        ErlNifResourceType *nif_type, efile_data_t **d) {
+    struct efile_resolved resolved;
+    ACCESS_MASK access_flags;
+    ULONG disposition, options;
+    posix_errno_t posix_errno;
+    NTSTATUS status;
+    HANDLE handle;
+
+    if(!open_modes_to_flags(modes, &access_flags, &disposition, &options)) {
+        (*d) = NULL;
+        return EINVAL;
+    }
+
+    posix_errno = resolve_in_root(root, path,
+        EFILE_RESOLVE_FOLLOW_LAST | EFILE_RESOLVE_SELF_OK, &resolved);
+
+    if(posix_errno != 0) {
+        (*d) = NULL;
+        return posix_errno;
+    }
+
+    /* The walk followed every link, so the component is not a link. The
+     * reparse point option makes sure that one that appeared since is opened
+     * as itself rather than followed to a file outside the root. */
+    status = open_name_at(resolved.parent, resolved.component, access_flags,
+        options | EFILE_FILE_OPEN_FOR_BACKUP_INTENT
+        | EFILE_FILE_OPEN_REPARSE_POINT, disposition, &handle);
+
+    resolved_release(&resolved);
+
+    if(!NT_SUCCESS(status)) {
+        (*d) = NULL;
+        return nt_status_to_posix_errno(status);
+    }
+
+    return build_open_resource(handle, modes, nif_type, d);
+}
+
 /* Turns a target that is not a path into what the operation calls the system
- * with. The caller gives the result to resolved_release when it is done.
+ * with. The caller gives the result to resolved_release when it is done. An
+ * operation with an "_at" variant takes a name in an open directory and a
+ * name in a root through that variant, and this function tells them apart.
  *
  * A name in an open directory is used as it is, against that directory. The
  * name is not checked, so a name that holds ".." still reaches a file outside
  * the directory. The system checks the name on the call itself, so the flags
- * only say how the call is made. */
+ * only say how the call is made.
+ *
+ * A name in a root is walked, and the caller is given the directory that
+ * holds the last component, and that component, which is then always a plain
+ * name. */
 static posix_errno_t resolve_target(const efile_target_t *target, int flags,
         struct efile_resolved *resolved) {
     efile_win_t *w = (efile_win_t*)target->dir;
-    size_t length = wcslen((const WCHAR*)target->name.data);
+    size_t length;
+
+    if(target->kind == EFILE_TARGET_ROOT) {
+        return resolve_in_root(target->dir, &target->name, flags, resolved);
+    }
+
+    if(name_is_rooted((const WCHAR*)target->name.data)) {
+        return EINVAL;
+    }
+
+    length = wcslen((const WCHAR*)target->name.data);
 
     if(length >= MAX_PATH) {
         return ENAMETOOLONG;
@@ -852,6 +1367,8 @@ posix_errno_t efile_open(const efile_target_t *target, enum efile_modes_t modes,
         return open_path(&target->name, modes, nif_type, d);
     case EFILE_TARGET_AT:
         return open_at(target->dir, &target->name, modes, nif_type, d);
+    case EFILE_TARGET_ROOT:
+        return open_in_root(target->dir, &target->name, modes, nif_type, d);
     default:
         (*d) = NULL;
         return EINVAL;
@@ -1427,6 +1944,7 @@ posix_errno_t efile_read_info(const efile_target_t *target, int follow_links,
     case EFILE_TARGET_PATH:
         return read_info_path(&target->name, follow_links, result);
     case EFILE_TARGET_AT:
+    case EFILE_TARGET_ROOT:
         return read_info_at(target, follow_links, result);
     default:
         return EINVAL;
@@ -1536,6 +2054,7 @@ posix_errno_t efile_set_permissions(const efile_target_t *target, Uint32 permiss
     case EFILE_TARGET_PATH:
         return set_permissions_path(&target->name, permissions);
     case EFILE_TARGET_AT:
+    case EFILE_TARGET_ROOT:
         return set_permissions_at(target, permissions);
     default:
         return EINVAL;
@@ -1562,6 +2081,7 @@ posix_errno_t efile_set_owner(const efile_target_t *target, Sint32 owner, Sint32
     case EFILE_TARGET_PATH:
         return set_owner_path(&target->name, owner, group);
     case EFILE_TARGET_AT:
+    case EFILE_TARGET_ROOT:
         /* There is no owner to set on this platform, as set_owner_path
          * shows. */
         return 0;
@@ -1686,6 +2206,7 @@ posix_errno_t efile_set_time(const efile_target_t *target, Sint64 a_time,
     case EFILE_TARGET_PATH:
         return set_time_path(&target->name, a_time, m_time, c_time);
     case EFILE_TARGET_AT:
+    case EFILE_TARGET_ROOT:
         return set_time_at(target, a_time, m_time, c_time);
     default:
         return EINVAL;
@@ -1848,6 +2369,7 @@ posix_errno_t efile_read_link(ErlNifEnv *env, const efile_target_t *target,
     case EFILE_TARGET_PATH:
         return read_link_path(env, &target->name, result);
     case EFILE_TARGET_AT:
+    case EFILE_TARGET_ROOT:
         return read_link_at(env, target, result);
     default:
         return EINVAL;
@@ -1980,6 +2502,7 @@ posix_errno_t efile_list_dir(ErlNifEnv *env, const efile_target_t *target,
     case EFILE_TARGET_PATH:
         return list_dir_path(env, &target->name, result);
     case EFILE_TARGET_AT:
+    case EFILE_TARGET_ROOT:
         return list_dir_at(env, target, result);
     default:
         return EINVAL;
@@ -2158,6 +2681,7 @@ static posix_errno_t rename_at(const efile_target_t *old_target,
     posix_errno_t posix_errno;
     HANDLE handle;
     NTSTATUS status;
+    int old_owned, new_owned;
 
     posix_errno = resolve_either(old_target, 0, &old_resolved);
 
@@ -2258,6 +2782,7 @@ static posix_errno_t make_hard_link_at(const efile_target_t *existing_target,
     posix_errno_t posix_errno;
     HANDLE handle;
     NTSTATUS status;
+    int existing_owned, new_owned;
 
     posix_errno = resolve_either(existing_target, 0, &existing_resolved);
 
@@ -2330,6 +2855,7 @@ posix_errno_t efile_make_soft_link(const efile_path_t *existing_path,
     case EFILE_TARGET_PATH:
         return make_soft_link_path(existing_path, &new_target->name);
     case EFILE_TARGET_AT:
+    case EFILE_TARGET_ROOT:
         /* CreateSymbolicLinkW takes a path for the new link, and Windows has
          * no call that makes a link relative to a directory handle. Resolving
          * the directory back to a path would resolve that path again, which
@@ -2384,6 +2910,7 @@ posix_errno_t efile_make_dir(const efile_target_t *target) {
     case EFILE_TARGET_PATH:
         return make_dir_path(&target->name);
     case EFILE_TARGET_AT:
+    case EFILE_TARGET_ROOT:
         return make_dir_at(target);
     default:
         return EINVAL;
@@ -2482,6 +3009,7 @@ posix_errno_t efile_del_file(const efile_target_t *target) {
     case EFILE_TARGET_PATH:
         return del_file_path(&target->name);
     case EFILE_TARGET_AT:
+    case EFILE_TARGET_ROOT:
         return delete_name_at(target, 0);
     default:
         return EINVAL;
@@ -2509,6 +3037,7 @@ posix_errno_t efile_del_dir(const efile_target_t *target) {
     case EFILE_TARGET_PATH:
         return del_dir_path(&target->name);
     case EFILE_TARGET_AT:
+    case EFILE_TARGET_ROOT:
         return delete_name_at(target, 1);
     default:
         return EINVAL;

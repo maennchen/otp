@@ -53,6 +53,9 @@ static ERL_NIF_TERM am_file_info;
 /* The tag of a name in an open directory. */
 static ERL_NIF_TERM am_dir;
 
+/* The tag of a name that may not leave the directory it is resolved against. */
+static ERL_NIF_TERM am_root;
+
 /* File modes */
 static ERL_NIF_TERM am_read;
 static ERL_NIF_TERM am_write;
@@ -280,6 +283,7 @@ static int load(ErlNifEnv *env, void** priv_data, ERL_NIF_TERM prim_file_pid)
     am_file_info = enif_make_atom(env, "file_info");
 
     am_dir = enif_make_atom(env, "dir");
+    am_root = enif_make_atom(env, "root");
 
     am_bof = enif_make_atom(env, "bof");
     am_cur = enif_make_atom(env, "cur");
@@ -362,7 +366,10 @@ static void release_file_data(efile_data_t *d) {
  * kept as it is given, because expanding it into a path, as a path is
  * expanded on Windows, would name a file somewhere else. The directory is
  * only looked up here. The operation takes it with acquire_target before it
- * acts. */
+ * acts.
+ *
+ * A {root, Ref, Name} tuple names a file in an open directory that the name
+ * may not leave. */
 static posix_errno_t marshal_target(ErlNifEnv *env, ERL_NIF_TERM term,
         efile_target_t *target) {
     const ERL_NIF_TERM *elements;
@@ -375,11 +382,17 @@ static posix_errno_t marshal_target(ErlNifEnv *env, ERL_NIF_TERM term,
         return efile_marshal_path(env, term, &target->name);
     }
 
-    if(arity != 3 || !enif_is_identical(elements[0], am_dir)) {
+    if(arity != 3) {
         return EINVAL;
     }
 
-    target->kind = EFILE_TARGET_AT;
+    if(enif_is_identical(elements[0], am_dir)) {
+        target->kind = EFILE_TARGET_AT;
+    } else if(enif_is_identical(elements[0], am_root)) {
+        target->kind = EFILE_TARGET_ROOT;
+    } else {
+        return EINVAL;
+    }
 
     if(!get_file_data(env, elements[1], &target->dir)) {
         return EINVAL;

@@ -137,6 +137,9 @@ copy(#file_descriptor{module = ?MODULE} = Source,
 %% The name itself is not checked. On Unix a name that contains ".." or starts
 %% with a separator still reaches a file outside the directory. Windows refuses
 %% such a name.
+%%
+%% A name in a root, given as {root, Root, Name}, is resolved one component at
+%% a time against that root, so it cannot reach a file outside the root.
 open(Target, Modes) ->
     %% The try/catch pattern seen here is used throughout the file to adhere to
     %% the public file interface, which has leaked through for ages because of
@@ -963,9 +966,14 @@ proplist_get_value(Key, [_Other | Rest], Default) ->
 %% Turns what the caller named into what a NIF takes. A path keeps the
 %% encoding it always had. A name in an open directory carries the directory
 %% as well.
+%% A name in a root carries the root, and its tag says that the name may not
+%% leave it.
 encode_target({#file_descriptor{module = ?MODULE} = Dir, Name}) ->
     #{ handle := DirRef } = get_fd_data(Dir),
     {dir, DirRef, encode_path(Name)};
+encode_target({root, #file_descriptor{module = ?MODULE} = Root, Name}) ->
+    #{ handle := RootRef } = get_fd_data(Root),
+    {root, RootRef, encode_path(Name)};
 encode_target(Path) ->
     encode_path(Path).
 
