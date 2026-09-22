@@ -30,7 +30,7 @@
          zip_to_binary/1, sanitize_filenames/1,
          unzip_options/1, zip_options/1, list_dir_options/1, aliases/1,
          zip_api/1, open_leak/1, unzip_jar/1,
-	 unzip_traversal_exploit/1,
+	 unzip_traversal_exploit/1, unzip_symlink_escape/1,
          compress_control/1,
 	 foldl/1,fd_leak/1,unicode/1,test_zip_dir/1,
          explicit_file_info/1, mode/1,
@@ -56,7 +56,7 @@ all() ->
      unzip_to_binary, zip_to_binary, unzip_options,
      zip_options, list_dir_options, aliases,
      zip_api, open_leak, unzip_jar, compress_control, foldl,
-     unzip_traversal_exploit, fd_leak, unicode, test_zip_dir,
+     unzip_traversal_exploit, unzip_symlink_escape, fd_leak, unicode, test_zip_dir,
      explicit_file_info, zip_get_2_to_cwd,
      {group, zip_group}, {group, zip64_group}].
 
@@ -578,6 +578,29 @@ unzip_traversal_exploit(Config) ->
     %% clean up
     delete_files([SubDir]),
     ok.
+
+%% A symbolic link in the extraction directory does not lead out of it.
+unzip_symlink_escape(Config) ->
+    PrivDir = get_value(priv_dir, Config),
+    Outside = filename:join(PrivDir, "symlink_escape_outside"),
+    ok = file:make_dir(Outside),
+    SubDir = filename:join(PrivDir, "symlink_escape"),
+    ok = file:make_dir(SubDir),
+    case file:make_symlink(Outside, filename:join(SubDir, "link")) of
+        ok ->
+            {ok, {_, Bin}} =
+                zip:create("escape.zip",
+                           [{"link/escaped.txt", <<"escaped\n">>}],
+                           [memory]),
+            ZipName = filename:join(PrivDir, "escape.zip"),
+            ok = file:write_file(ZipName, Bin),
+            {error, _} = zip:unzip(ZipName, [{cwd, SubDir}]),
+            {error, enoent} =
+                file:read_file(filename:join(Outside, "escaped.txt")),
+            ok;
+        {error, Reason} when Reason =:= enotsup; Reason =:= eperm ->
+            {skip, "symbolic links not supported"}
+    end.
 
 %% Test unzip a jar file (OTP-7382).
 unzip_jar(Config) when is_list(Config) ->

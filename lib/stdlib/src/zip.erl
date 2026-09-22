@@ -94,9 +94,14 @@ convention, add `.zip` to the filename.
 	  open_opts,   % options passed to file:open
 	  feedback,    % feeback (fun)
 	  cwd,         % directory to relate paths to
+          root,        % cwd opened with file:open_root/1
           skip_dirs,   % skip creating empty directories
           extra        % The extra fields to include
 	 }).
+
+%% A name extracted through a root. The file system takes {Root, Name},
+%% and Path is the name in the result.
+-record(in_root, {root, name, path}).
 
 -record(zip_opts, {
 	  output,      % output object (fun)
@@ -426,7 +431,9 @@ do_unzip(F, Options) ->
             %% get rid of zip-comment
             Z = zlib:open(),
             Files = try
-                        get_z_files(Info, Z, In1, Opts, [])
+                        extract_in_root(Opts, fun(Opts1) ->
+                                                      get_z_files(Info, Z, In1, Opts1, [])
+                                              end)
                     after
                         zlib:close(Z),
                         Input(close, In1)
@@ -1757,7 +1764,9 @@ do_openzip_get(#openzip{files = Files, in = In0, input = Input,
 			  file_filter = fun all/1, open_opts = [],
 			  feedback = fun silent/1, cwd = CWD, skip_dirs = SkipDirs,
                           extra = ExtraOpts},
-    R = get_z_files(Files, Z, In0, ZipOpts, []),
+    R = extract_in_root(ZipOpts, fun(ZipOpts1) ->
+                                         get_z_files(Files, Z, In0, ZipOpts1, [])
+                                 end),
     {ok, R};
 do_openzip_get(_) ->
     throw(einval).
@@ -1782,8 +1791,12 @@ do_openzip_get(F, #openzip{files = Files, in = In0, input = Input,
     case file_name_search(F, Files) of
 	{#zip_file{offset = Offset},_}=ZFile ->
 	    In1 = Input({seek, bof, Offset}, In0),
-	    case get_z_file(In1, Z, Input, Output, [], fun silent/1,
-			    CWD, ZFile, fun all/1, false, ExtraOpts) of
+            ZipOpts = #unzip_opts{output = Output, cwd = CWD},
+            Get = fun(#unzip_opts{root = Root}) ->
+                          get_z_file(In1, Z, Input, Output, [], fun silent/1,
+                                     CWD, Root, ZFile, fun all/1, false, ExtraOpts)
+                  end,
+	    case extract_in_root(ZipOpts, Get) of
                 {file, R, _In2} -> {ok, Output(flush, R)};
 		_ -> throw(file_not_found)
 	    end;
@@ -2248,14 +2261,14 @@ get_z_files([#zip_comment{comment = _} | Rest], Z, In, Opts, Acc) ->
     get_z_files(Rest, Z, In, Opts, Acc);
 get_z_files([{#zip_file{offset = Offset} = ZipFile, ZipExtra} | Rest], Z, In0,
 	    #unzip_opts{input = Input, output = Output, open_opts = OpO,
-			file_filter = Filter, feedback = FB,
-			cwd = CWD, skip_dirs = SkipDirs, extra = ExtraOpts} = Opts, Acc0) ->
+			file_filter = Filter, feedback = FB, cwd = CWD, root = Root,
+			skip_dirs = SkipDirs, extra = ExtraOpts} = Opts, Acc0) ->
     case Filter({ZipFile, ZipExtra, CWD}) of
 	true ->
 	    In1 = Input({seek, bof, Offset}, In0),
 	    {In2, Acc1} =
-		case get_z_file(In1, Z, Input, Output, OpO, FB,
-				CWD, {ZipFile, ZipExtra}, Filter, SkipDirs, ExtraOpts) of
+		case get_z_file(In1, Z, Input, Output, OpO, FB, CWD, Root,
+				{ZipFile, ZipExtra}, Filter, SkipDirs, ExtraOpts) of
 		    {Type, GZD, Inx} when Type =:= file; Type =:= dir ->
                         {Inx, [GZD | Acc0]};
 		    {_, Inx}       -> {Inx, Acc0}
@@ -2270,9 +2283,36 @@ flush_and_reverse(Output, [H|T], Acc) ->
 flush_and_reverse(_Output, [], Acc) ->
     Acc.
 
+%% Every name is resolved against cwd opened as a root, so no name in the
+%% archive reaches a file outside cwd.
+extract_in_root(#unzip_opts{output = Output, cwd = CWD} = Opts, Fun) ->
+    case Output({open_root, CWD}, []) of
+        undefined ->
+            Fun(Opts);
+        Root ->
+            try
+                Fun(Opts#unzip_opts{root = Root})
+            after
+                file:close(Root)
+            end
+    end.
+
+target(undefined, CWD, Name) ->
+    add_cwd(CWD, Name);
+target(Root, CWD, Name) ->
+    #in_root{root = Root,
+             name = string:trim(Name, trailing, "/"),
+             path = add_cwd(CWD, Name)}.
+
+fs(#in_root{root = Root, name = Name}) -> {Root, Name};
+fs(FN) -> FN.
+
+path(#in_root{path = Path}) -> Path;
+path(FN) -> FN.
+
 %% get a file from the archive, reading chunks
 get_z_file(In0, Z, Input, Output, OpO, FB,
-	   CWD, {ZipFile,ZipExtra}, Filter, SkipDirs, ExtraOpts) ->
+	   CWD, Root, {ZipFile,ZipExtra}, Filter, SkipDirs, ExtraOpts) ->
     case Input({read, ?LOCAL_FILE_HEADER_SZ}, In0) of
 	{eof, In1} ->
 	    {eof, In1};
@@ -2305,7 +2345,7 @@ get_z_file(In0, Z, Input, Output, OpO, FB,
 			Filter({ZipFile#zip_file{name = FileName1},ZipExtra, CWD})
 		end,
 
-            FileNameWithCwd = add_cwd(CWD, FileName1),
+            FileNameWithCwd = target(Root, CWD, FileName1),
 
             IsDir = lists:last(FileName) =:= $/,
 
@@ -2771,6 +2811,8 @@ binary_io({set_file_info, _F, _FI}, B) ->
     B;
 binary_io({set_file_info, _F, _FI, _O}, B) ->
     B;
+binary_io({open_root, _CWD}, _B) ->
+    undefined;
 binary_io({ensure_path, Dir}, _B) ->
     {Dir, <<>>};
 binary_io({delay, Fun}, B) ->
@@ -2780,23 +2822,40 @@ binary_io(flush, FN) ->
     FN.
 
 file_io({file_info, FN}, _) ->
-    case file:read_file_info(FN) of
+    case file:read_file_info(fs(FN)) of
 	{ok, Info} -> Info;
-	{error, E} -> throw({FN, {{file, file_info, [FN]}, E}})
+	{error, E} -> throw({path(FN), {{file, file_info, [path(FN)]}, E}})
     end;
 file_io({file_info, FN, Opts}, _) ->
-    case file:read_file_info(FN, Opts) of
+    case file:read_file_info(fs(FN), Opts) of
 	{ok, Info} -> Info;
-	{error, E} -> throw({FN, {{file, file_info, [FN, Opts]}, E}})
+	{error, E} -> throw({path(FN), {{file, file_info, [path(FN), Opts]}, E}})
+    end;
+file_io({open_root, CWD}, _) ->
+    Dir = case CWD of
+              "" -> ".";
+              _ -> CWD
+          end,
+    Res = case filelib:ensure_path(Dir) of
+              ok -> file:open_root(Dir);
+              Error -> Error
+          end,
+    case Res of
+        {ok, Root} -> Root;
+        {error, E} -> throw({Dir, {{file, open_root, [Dir]}, E}})
     end;
 file_io({open, FN, Opts}, _) ->
     case lists:member(write, Opts) of
-	true -> ok = filelib:ensure_dir(FN);
+	true ->
+            case filelib:ensure_dir(fs(FN)) of
+                ok -> ok;
+                {error, E0} -> throw({path(FN), {{file, ensure_dir, [path(FN)]}, E0}})
+            end;
 	_ -> ok
     end,
-    case file:open(FN, Opts++[binary]) of
+    case file:open(fs(FN), Opts++[binary]) of
 	{ok, H} -> {H, FN};
-	{error, E} -> throw({FN, {{file, open, [FN, Opts++[binary]]}, E}})
+	{error, E} -> throw({path(FN), {{file, open, [path(FN), Opts++[binary]]}, E}})
     end;
 file_io({read, N}, {H, FN} = S) ->
     case file:read(H, N) of
@@ -2832,8 +2891,8 @@ file_io({pwrite, Pos, Data}, {H, FN} = S) ->
     end;
 file_io({close, FN}, {H, FN}) ->
     case file:close(H) of
-	ok -> #{ name => FN, flush => []};
-	{error, Error} -> throw({{FN, {file, close, [H]}, Error}})
+	ok -> #{ name => path(FN), flush => []};
+	{error, Error} -> throw({{path(FN), {file, close, [H]}, Error}})
     end;
 file_io(close, {_H, FN} = S) ->
     file_io({close, FN}, S);
@@ -2843,19 +2902,19 @@ file_io({list_dir, FN}, _S) ->
 	{error, Error} -> throw({FN, {file, list_dir, [FN]}, Error})
     end;
 file_io({set_file_info, FN, FI}, S) ->
-    case file:write_file_info(FN, FI) of
+    case file:write_file_info(fs(FN), FI) of
 	ok -> S;
-	{error, Error} -> throw({FN, {file, write_file_info, [FN, FI]}, Error})
+	{error, Error} -> throw({path(FN), {file, write_file_info, [path(FN), FI]}, Error})
     end;
 file_io({set_file_info, FN, FI, O}, S) ->
-    case file:write_file_info(FN, FI, O) of
+    case file:write_file_info(fs(FN), FI, O) of
 	ok -> S;
-	{error, Error} -> throw({FN, {file, write_file_info, [FN, FI, O]}, Error})
+	{error, Error} -> throw({path(FN), {file, write_file_info, [path(FN), FI, O]}, Error})
     end;
 file_io({ensure_path, Dir}, _S) ->
-    case filelib:ensure_path(Dir) of
-        ok -> #{ name => Dir, flush => []};
-        {error, E} -> {Dir, {file, ensure_path, [Dir]}, E}
+    case filelib:ensure_path(fs(Dir)) of
+        ok -> #{ name => path(Dir), flush => []};
+        {error, E} -> throw({path(Dir), {file, ensure_path, [path(Dir)]}, E})
     end;
 file_io({delay, Fun}, #{flush := Flush} = H) ->
     H#{flush := [Fun | Flush] };
