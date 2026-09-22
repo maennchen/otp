@@ -43,7 +43,7 @@
 	 list_dir/1,
 	 list_dir_handle/1]).
 
--export([open_at/1]).
+-export([open_at/1, read_at/1]).
 
 -export([file_write_handle_info/1]).
 
@@ -67,7 +67,7 @@ suite() -> [].
 all() -> 
     [read_write_file, {group, dirs}, {group, files},
      delete, rename, {group, errors}, {group, links},
-     list_dir_limit, list_dir, list_dir_handle, adopt, open_at].
+     list_dir_limit, list_dir, list_dir_handle, adopt, open_at, read_at].
 
 groups() -> 
     [{dirs, [],
@@ -1981,6 +1981,93 @@ open_at(Config) ->
     ok = ?PRIM_FILE:delete(Name),
     ok = ?PRIM_FILE:del_dir(TestDir),
     ok.
+
+%% Tests that the read operations take a name in an open directory, and report
+%% what the matching path reports.
+read_at(Config) ->
+    RootDir = proplists:get_value(priv_dir, Config),
+    TestDir = filename:join(RootDir, ?MODULE_STRING++"_read_at"),
+    ok = ?PRIM_FILE:make_dir(TestDir),
+
+    Name = filename:join(TestDir, "file"),
+    Sub = filename:join(TestDir, "sub"),
+    ok = ?PRIM_FILE:write_file(Name, "contents"),
+    ok = ?PRIM_FILE:make_dir(Sub),
+    ok = ?PRIM_FILE:write_file(filename:join(Sub, "inner"), "inner"),
+
+    {ok, Dir} = ?PRIM_FILE:open(TestDir, [read, directory]),
+
+    {ok, #file_info{type = regular, size = 8}} =
+        ?PRIM_FILE:read_file_info({Dir, "file"}),
+    {ok, #file_info{type = directory}} =
+        ?PRIM_FILE:read_file_info({Dir, "sub"}),
+    {ok, #file_info{type = regular}} =
+        ?PRIM_FILE:read_link_info({Dir, "file"}),
+    {ok, ["inner"]} = ?PRIM_FILE:list_dir({Dir, "sub"}),
+    {ok, ["inner"]} = ?PRIM_FILE:list_dir_all({Dir, "sub"}),
+    {ok, <<"contents">>} = ?PRIM_FILE:read_file({Dir, "file"}),
+
+    %% The path and the name report the same values.
+    {ok, ViaPath} = ?PRIM_FILE:read_file_info(Name),
+    {ok, ViaPath} = ?PRIM_FILE:read_file_info({Dir, "file"}),
+    {ok, ViaPathPosix} = ?PRIM_FILE:read_file_info(Name, [{time, posix}]),
+    {ok, ViaPathPosix} = ?PRIM_FILE:read_file_info({Dir, "file"},
+                                                   [{time, posix}]),
+
+    %% Errors match what the matching path reports.
+    {error, enoent} = ?PRIM_FILE:read_file_info({Dir, "missing"}),
+    {error, enoent} = ?PRIM_FILE:read_link_info({Dir, "missing"}),
+    {error, enoent} = ?PRIM_FILE:read_file({Dir, "missing"}),
+    {error, enoent} = ?PRIM_FILE:list_dir({Dir, "missing"}),
+    {error, enotdir} = ?PRIM_FILE:list_dir({Dir, "file"}),
+    {error, einval} = ?PRIM_FILE:read_link({Dir, "file"}),
+
+    %% A file that is not a directory cannot hold a name.
+    {ok, Plain} = ?PRIM_FILE:open(Name, [read]),
+    {error, enotdir} = ?PRIM_FILE:read_file_info({Plain, "file"}),
+    ok = ?PRIM_FILE:close(Plain),
+
+    read_at_symlink(Dir, TestDir),
+
+    ok = ?PRIM_FILE:close(Dir),
+
+    %% A closed directory cannot hold a name either.
+    {error, einval} = ?PRIM_FILE:read_file_info({Dir, "file"}),
+
+    ok = ?PRIM_FILE:delete(filename:join(Sub, "inner")),
+    ok = ?PRIM_FILE:del_dir(Sub),
+    ok = ?PRIM_FILE:delete(Name),
+    ok = ?PRIM_FILE:del_dir(TestDir),
+    ok.
+
+read_at_symlink(Dir, TestDir) ->
+    Link = filename:join(TestDir, "link"),
+
+    case ?PRIM_FILE:make_symlink(filename:join(TestDir, "file"), Link) of
+        {error, enotsup} ->
+            ok;
+        {error, eperm} ->
+            {win32,_} = os:type(),
+            ok;
+        ok ->
+            %% read_file_info follows the link, read_link_info does not.
+            {ok, #file_info{type = regular}} =
+                ?PRIM_FILE:read_file_info({Dir, "link"}),
+            {ok, #file_info{type = symlink}} =
+                ?PRIM_FILE:read_link_info({Dir, "link"}),
+            {ok, ViaPath} = ?PRIM_FILE:read_link_info(Link),
+            {ok, ViaPath} = ?PRIM_FILE:read_link_info({Dir, "link"}),
+
+            %% Windows resolves a link to a full path, so the target is only
+            %% checked for pointing at the file that was linked.
+            {ok, Target} = ?PRIM_FILE:read_link({Dir, "link"}),
+            {ok, Target} = ?PRIM_FILE:read_link(Link),
+            {ok, Target} = ?PRIM_FILE:read_link_all({Dir, "link"}),
+            "file" = filename:basename(Target),
+
+            ok = ?PRIM_FILE:delete(Link),
+            ok
+    end.
 
 %%%
 %%% Support for testing large files.

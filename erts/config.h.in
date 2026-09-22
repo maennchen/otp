@@ -672,6 +672,9 @@
 /* Define if you have the 'end' symbol */
 #undef HAVE_END_SYMBOL
 
+/* Define to 1 if you have the 'faccessat' function. */
+#undef HAVE_FACCESSAT
+
 /* Define if you have a working fallocate() */
 #undef HAVE_FALLOCATE
 
@@ -695,6 +698,9 @@
 
 /* Define to 1 if you have the 'fstat' function. */
 #undef HAVE_FSTAT
+
+/* Define to 1 if you have the 'fstatat' function. */
+#undef HAVE_FSTATAT
 
 /* Define to 1 if you have the 'futimens' function. */
 #undef HAVE_FUTIMENS
@@ -976,6 +982,9 @@
 
 /* Define to 1 if you have the 'pwrite' function. */
 #undef HAVE_PWRITE
+
+/* Define to 1 if you have the 'readlinkat' function. */
+#undef HAVE_READLINKAT
 
 /* Define to 1 if you have the 'recvmmsg' function. */
 #undef HAVE_RECVMMSG

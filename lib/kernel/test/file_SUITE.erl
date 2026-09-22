@@ -52,7 +52,7 @@
 -export([cur_dir_0/1, cur_dir_1/1, make_del_dir/1, make_del_dir_r/1,
 	 list_dir/1,list_dir_error/1,list_dir_handle/1,
 	 file_write_handle_info/1,
-	 open_at/1, open_at_symlink/1,
+	 open_at/1, open_at_symlink/1, read_at/1,
 	 untranslatable_names/1, untranslatable_names_error/1,
 	 pos1/1, pos2/1, pos3/1]).
 -export([close/1, consult1/1, path_consult/1, delete/1]).
@@ -157,7 +157,7 @@ groups() ->
      {open, [],
       [open1, old_modes, new_modes, path_open, close, access,
        read_write, pread_write, append, open_errors,
-       exclusive, open_at, open_at_symlink]},
+       exclusive, open_at, open_at_symlink, read_at]},
      {pos, [], [pos1, pos2, pos3]},
      {file_info, [],
       [file_info_basic_file, file_info_basic_directory,
@@ -1099,6 +1099,83 @@ open_at_symlink(Config) when is_list(Config) ->
 
     [] = flush(),
     ok.
+
+%% The read operations take a {Dir, Name} tuple as well, and report the same
+%% results as the matching path does.
+read_at(Config) when is_list(Config) ->
+    RootDir = proplists:get_value(priv_dir, Config),
+    TestDir = filename:join(RootDir, ?MODULE_STRING++"_read_at"),
+    ok = ?FILE_MODULE:make_dir(TestDir),
+
+    Name = filename:join(TestDir, "file"),
+    Sub = filename:join(TestDir, "sub"),
+    ok = ?FILE_MODULE:write_file(Name, "contents"),
+    ok = ?FILE_MODULE:make_dir(Sub),
+    ok = ?FILE_MODULE:write_file(filename:join(Sub, "inner"), "inner"),
+
+    {ok, Dir} = ?FILE_MODULE:open(TestDir, [raw, read, directory]),
+
+    {ok, #file_info{type = regular, size = 8}} =
+        ?FILE_MODULE:read_file_info({Dir, "file"}),
+    {ok, #file_info{type = directory}} =
+        ?FILE_MODULE:read_file_info({Dir, "sub"}),
+    {ok, #file_info{type = regular}} =
+        ?FILE_MODULE:read_link_info({Dir, "file"}),
+
+    {ok, ["inner"]} = ?FILE_MODULE:list_dir({Dir, "sub"}),
+    {ok, ["inner"]} = ?FILE_MODULE:list_dir_all({Dir, "sub"}),
+
+    {ok, <<"contents">>} = ?FILE_MODULE:read_file({Dir, "file"}),
+    {ok, <<"contents">>} = ?FILE_MODULE:read_file({Dir, "file"}, []),
+    {ok, <<"contents">>} = ?FILE_MODULE:read_file({Dir, "file"}, [raw]),
+
+    %% The time option reaches the same code as it does for a path.
+    {ok, #file_info{mtime = MTime}} =
+        ?FILE_MODULE:read_file_info({Dir, "file"}, [{time, posix}]),
+    true = is_integer(MTime),
+
+    %% Errors match what the matching path reports.
+    {error, enoent} = ?FILE_MODULE:read_file_info({Dir, "missing"}),
+    {error, enoent} = ?FILE_MODULE:read_file({Dir, "missing"}),
+    {error, enotdir} = ?FILE_MODULE:list_dir({Dir, "file"}),
+    {error, einval} = ?FILE_MODULE:read_link({Dir, "file"}),
+
+    read_at_symlink(Dir, TestDir),
+
+    ok = ?FILE_MODULE:close(Dir),
+
+    ok = ?FILE_MODULE:delete(filename:join(Sub, "inner")),
+    ok = ?FILE_MODULE:del_dir(Sub),
+    ok = ?FILE_MODULE:delete(Name),
+    ok = ?FILE_MODULE:del_dir(TestDir),
+
+    [] = flush(),
+    ok.
+
+read_at_symlink(Dir, TestDir) ->
+    Link = filename:join(TestDir, "link"),
+
+    case ?FILE_MODULE:make_symlink(filename:join(TestDir, "file"), Link) of
+        {error, enotsup} ->
+            ok;
+        {error, eperm} ->
+            {win32,_} = os:type(),
+            ok;
+        ok ->
+            %% read_file_info follows the link, read_link_info does not.
+            {ok, #file_info{type = regular}} =
+                ?FILE_MODULE:read_file_info({Dir, "link"}),
+            {ok, #file_info{type = symlink}} =
+                ?FILE_MODULE:read_link_info({Dir, "link"}),
+            %% Windows resolves a link to a full path, so the target is
+            %% only checked for pointing at the file that was linked.
+            {ok, Target} = ?FILE_MODULE:read_link({Dir, "link"}),
+            {ok, Target} = ?FILE_MODULE:read_link_all({Dir, "link"}),
+            "file" = filename:basename(Target),
+
+            ok = ?FILE_MODULE:delete(Link),
+            ok
+    end.
 
 untranslatable_names(Config) ->
     case no_untranslatable_names() of

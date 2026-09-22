@@ -274,6 +274,68 @@ static posix_errno_t open_at(efile_data_t *dir, const efile_path_t *path,
 #endif
 }
 
+/* What an operation calls the system with for a target that is not a path:
+ * the directory the last component of the name belongs to, and that
+ * component. */
+struct efile_resolved {
+    char component[PATH_MAX];
+    int parent_fd;
+
+    /* Whether resolved_release closes the descriptor. */
+    int owned;
+
+    /* Whether the call follows a last component that is a link. */
+    int follow_last;
+};
+
+/* What the operation does with the name. */
+enum efile_resolve_flags_t {
+    /* The operation follows a last component that is a link. */
+    EFILE_RESOLVE_FOLLOW_LAST = (1 << 0),
+
+    /* The operation can act on the directory the name resolves to, as
+     * list_dir can. A delete or a rename cannot. */
+    EFILE_RESOLVE_SELF_OK = (1 << 1)
+};
+
+static void resolved_release(struct efile_resolved *resolved) {
+    if(resolved->owned) {
+        close(resolved->parent_fd);
+    }
+}
+
+/* Fills in a name that the system resolves against the directory as it is.
+ * The name is not checked, so a name that holds ".." still reaches a file
+ * outside the directory. The system checks the name on the call itself, so
+ * the flags only say how the call is made. */
+static posix_errno_t resolve_name(const efile_path_t *name, int parent_fd,
+        int flags, struct efile_resolved *resolved) {
+    size_t length = strlen((const char*)name->data);
+
+    if(length >= sizeof(resolved->component)) {
+        return ENAMETOOLONG;
+    }
+
+    sys_memcpy(resolved->component, name->data, length + 1);
+
+    resolved->parent_fd = parent_fd;
+    resolved->owned = 0;
+    resolved->follow_last = !!(flags & EFILE_RESOLVE_FOLLOW_LAST);
+
+    return 0;
+}
+
+/* Turns a target that is not a path into what the operation calls the system
+ * with. The caller gives the result to resolved_release when it is done.
+ *
+ * A name in an open directory is used as it is, against that directory. */
+static posix_errno_t resolve_target(const efile_target_t *target, int flags,
+        struct efile_resolved *resolved) {
+    efile_unix_t *u = (efile_unix_t*)target->dir;
+
+    return resolve_name(&target->name, u->fd, flags, resolved);
+}
+
 posix_errno_t efile_open(const efile_target_t *target, enum efile_modes_t modes,
         ErlNifResourceType *nif_type, efile_data_t **d) {
     switch(target->kind) {
@@ -798,6 +860,27 @@ static void build_file_info(struct stat *data, efile_fileinfo_t *result) {
     result->gid = data->st_gid;
 }
 
+/* Fills in whether the file can be read and written, from the checks the
+ * caller made. A caller that has no check passes -1 for both, and the owner
+ * bits of the mode answer instead. */
+static void build_file_access(int readable, int writable, struct stat *data,
+        efile_fileinfo_t *result) {
+    if(readable < 0) {
+        /* Just look at read/write access for owner. */
+        result->access = ((data->st_mode >> 6) & 07) >> 1;
+        return;
+    }
+
+    result->access = EFILE_ACCESS_NONE;
+
+    if(readable) {
+        result->access |= EFILE_ACCESS_READ;
+    }
+    if(writable) {
+        result->access |= EFILE_ACCESS_WRITE;
+    }
+}
+
 static posix_errno_t read_info_path(const efile_path_t *path, int follow_links,
         efile_fileinfo_t *result) {
     struct stat data;
@@ -815,17 +898,11 @@ static posix_errno_t read_info_path(const efile_path_t *path, int follow_links,
     build_file_info(&data, result);
 
 #ifndef NO_ACCESS
-    result->access = EFILE_ACCESS_NONE;
-
-    if(access((const char*)path->data, R_OK) == 0) {
-        result->access |= EFILE_ACCESS_READ;
-    }
-    if(access((const char*)path->data, W_OK) == 0) {
-        result->access |= EFILE_ACCESS_WRITE;
-    }
+    build_file_access(access((const char*)path->data, R_OK) == 0,
+                      access((const char*)path->data, W_OK) == 0,
+                      &data, result);
 #else
-    /* Just look at read/write access for owner. */
-    result->access = ((data.st_mode >> 6) & 07) >> 1;
+    build_file_access(-1, -1, &data, result);
 #endif
 
     return 0;
@@ -863,11 +940,62 @@ static int check_access(struct stat *st) {
     return ret;
 }
 
+static posix_errno_t read_info_at(const efile_target_t *target,
+        int follow_links, efile_fileinfo_t *result) {
+#ifndef HAVE_FSTATAT
+    (void)target;
+    (void)follow_links;
+    (void)result;
+
+    return ENOTSUP;
+#else
+    struct efile_resolved resolved;
+    struct stat data;
+    posix_errno_t posix_errno;
+    int flags;
+
+    flags = EFILE_RESOLVE_SELF_OK;
+
+    if(follow_links) {
+        flags |= EFILE_RESOLVE_FOLLOW_LAST;
+    }
+
+    posix_errno = resolve_target(target, flags, &resolved);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    flags = resolved.follow_last ? 0 : AT_SYMLINK_NOFOLLOW;
+
+    if(fstatat(resolved.parent_fd, resolved.component, &data, flags) < 0) {
+        posix_errno = errno;
+    } else {
+        build_file_info(&data, result);
+
+#if defined(HAVE_FACCESSAT) && !defined(NO_ACCESS)
+        build_file_access(
+            faccessat(resolved.parent_fd, resolved.component, R_OK, 0) == 0,
+            faccessat(resolved.parent_fd, resolved.component, W_OK, 0) == 0,
+            &data, result);
+#else
+        build_file_access(-1, -1, &data, result);
+#endif
+    }
+
+    resolved_release(&resolved);
+
+    return posix_errno;
+#endif
+}
+
 posix_errno_t efile_read_info(const efile_target_t *target, int follow_links,
         efile_fileinfo_t *result) {
     switch(target->kind) {
     case EFILE_TARGET_PATH:
         return read_info_path(&target->name, follow_links, result);
+    case EFILE_TARGET_AT:
+        return read_info_at(target, follow_links, result);
     default:
         return EINVAL;
     }
@@ -1036,8 +1164,12 @@ posix_errno_t efile_set_handle_time(efile_data_t *d, Sint64 a_time, Sint64 m_tim
 #endif
 }
 
-static posix_errno_t read_link_path(ErlNifEnv *env, const efile_path_t *path,
-        ERL_NIF_TERM *result) {
+/* Reads a link into a binary, growing the buffer until the result fits. The
+ * reader either reads a path, or reads a name against an open directory. */
+typedef ssize_t (*read_link_fun_t)(void *context, char *buffer, size_t size);
+
+static posix_errno_t read_link_into_binary(ErlNifEnv *env,
+        read_link_fun_t read_link_fun, void *context, ERL_NIF_TERM *result) {
     ErlNifBinary result_bin;
 
     if(!enif_alloc_binary(256, &result_bin)) {
@@ -1047,7 +1179,7 @@ static posix_errno_t read_link_path(ErlNifEnv *env, const efile_path_t *path,
     for(;;) {
         ssize_t bytes_copied;
 
-        bytes_copied = readlink((const char*)path->data, (char*)result_bin.data,
+        bytes_copied = read_link_fun(context, (char*)result_bin.data,
             result_bin.size);
 
         if(bytes_copied <= 0) {
@@ -1075,11 +1207,59 @@ static posix_errno_t read_link_path(ErlNifEnv *env, const efile_path_t *path,
     }
 }
 
+static ssize_t read_link_from_path(void *context, char *buffer, size_t size) {
+    const efile_path_t *path = (const efile_path_t*)context;
+
+    return readlink((const char*)path->data, buffer, size);
+}
+
+static posix_errno_t read_link_path(ErlNifEnv *env, const efile_path_t *path,
+        ERL_NIF_TERM *result) {
+    return read_link_into_binary(env, read_link_from_path, (void*)path, result);
+}
+
+#ifdef HAVE_READLINKAT
+static ssize_t read_link_from_dir(void *context, char *buffer, size_t size) {
+    struct efile_resolved *resolved = (struct efile_resolved*)context;
+
+    return readlinkat(resolved->parent_fd, resolved->component, buffer, size);
+}
+#endif
+
+static posix_errno_t read_link_at(ErlNifEnv *env, const efile_target_t *target,
+        ERL_NIF_TERM *result) {
+#ifndef HAVE_READLINKAT
+    (void)env;
+    (void)target;
+    (void)result;
+
+    return ENOTSUP;
+#else
+    struct efile_resolved resolved;
+    posix_errno_t posix_errno;
+
+    posix_errno = resolve_target(target, 0, &resolved);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    posix_errno = read_link_into_binary(env, read_link_from_dir, &resolved,
+                                        result);
+
+    resolved_release(&resolved);
+
+    return posix_errno;
+#endif
+}
+
 posix_errno_t efile_read_link(ErlNifEnv *env, const efile_target_t *target,
         ERL_NIF_TERM *result) {
     switch(target->kind) {
     case EFILE_TARGET_PATH:
         return read_link_path(env, &target->name, result);
+    case EFILE_TARGET_AT:
+        return read_link_at(env, target, result);
     default:
         return EINVAL;
     }
@@ -1140,11 +1320,72 @@ static posix_errno_t list_dir_path(ErlNifEnv *env, const efile_path_t *path,
     return list_dir_stream(env, dir_stream, result);
 }
 
+static posix_errno_t list_dir_at(ErlNifEnv *env, const efile_target_t *target,
+        ERL_NIF_TERM *result) {
+#if !defined(HAVE_OPENAT) || !defined(HAVE_FDOPENDIR)
+    (void)target;
+
+    *result = enif_make_list(env, 0);
+    return ENOTSUP;
+#else
+    struct efile_resolved resolved;
+    DIR *dir_stream;
+    posix_errno_t posix_errno;
+    int fd, flags;
+
+    posix_errno = resolve_target(target,
+        EFILE_RESOLVE_FOLLOW_LAST | EFILE_RESOLVE_SELF_OK, &resolved);
+
+    if(posix_errno != 0) {
+        *result = enif_make_list(env, 0);
+        return posix_errno;
+    }
+
+    flags = O_RDONLY;
+
+#ifdef O_DIRECTORY
+    flags |= O_DIRECTORY;
+#endif
+
+#ifdef O_NOFOLLOW
+    if(!resolved.follow_last) {
+        flags |= O_NOFOLLOW;
+    }
+#endif
+
+    do {
+        fd = openat(resolved.parent_fd, resolved.component, flags);
+    } while(fd == -1 && errno == EINTR);
+
+    resolved_release(&resolved);
+
+    if(fd == -1) {
+        posix_errno_t saved_errno = errno;
+        *result = enif_make_list(env, 0);
+        return saved_errno;
+    }
+
+    dir_stream = fdopendir(fd);
+
+    if(dir_stream == NULL) {
+        posix_errno_t saved_errno = errno;
+        close(fd);
+        *result = enif_make_list(env, 0);
+        return saved_errno;
+    }
+
+    /* list_dir_stream closes the stream, which closes the descriptor. */
+    return list_dir_stream(env, dir_stream, result);
+#endif
+}
+
 posix_errno_t efile_list_dir(ErlNifEnv *env, const efile_target_t *target,
         ERL_NIF_TERM *result) {
     switch(target->kind) {
     case EFILE_TARGET_PATH:
         return list_dir_path(env, &target->name, result);
+    case EFILE_TARGET_AT:
+        return list_dir_at(env, target, result);
     default:
         return EINVAL;
     }

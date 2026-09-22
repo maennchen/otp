@@ -2366,7 +2366,8 @@ AC_CHECK_FUNCS([ieee_handler fpsetmask finite isnan isinf res_gethostbyname dlop
 		dlvsym pread pwrite memmove strerror strerror_r strerrorname_np strncasecmp \
 		gethrtime localtime_r gmtime_r mprotect madvise posix_madvise \
 		mmap mremap memcpy memrchr mallopt sbrk _sbrk __sbrk brk _brk __brk \
-		flockfile fstat fdopendir futimens futimes openat strlcpy strlcat setsid posix2time time2posix \
+		flockfile fstat fdopendir futimens futimes openat fstatat faccessat readlinkat \
+		strlcpy strlcat setsid posix2time time2posix \
 		setlocale nl_langinfo poll mlockall ppoll vsyslog])
 
 ## We have a special check for inet_pton as AC_CHECK_FUCNS does not work

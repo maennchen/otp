@@ -654,13 +654,16 @@ del_dir_r(File) -> % rm -rf File
 
 -doc(#{equiv => read_file_info(File, [])}).
 -spec read_file_info(File) -> {ok, FileInfo} | {error, Reason} when
-      File :: name_all() | io_device(),
+      File :: name_all() | io_device() | {fd(), name_all()},
       FileInfo :: file_info(),
       Reason :: posix() | badarg.
 
 read_file_info(IoDevice)
   when is_pid(IoDevice); is_record(IoDevice, file_descriptor) ->
     read_file_info(IoDevice, []);
+
+read_file_info(Target) when ?IS_AT_TARGET(Target) ->
+    at_call(read_file_info, Target, []);
 
 read_file_info(Name) ->
     check_and_call(read_file_info, [file_name(Name)]).
@@ -777,10 +780,16 @@ Typical error reasons:
 
 - **`enotdir`** - A component of the filename is not a directory. On some
   platforms, `enoent` is returned instead.
+
+`File` can also be a `{Dir, Name}` tuple. `Dir` is a directory that was opened
+with the modes `raw`, `read` and `directory`. The operating system resolves
+`Name` against that open directory, so another process cannot replace a
+directory in the path of `Dir` and make this function reach a different file.
+See `open/2`.
 """.
 -doc(#{since => <<"OTP R15B">>}).
 -spec read_file_info(File, Opts) -> {ok, FileInfo} | {error, Reason} when
-      File :: name_all() | io_device(),
+      File :: name_all() | io_device() | {fd(), name_all()},
       Opts :: [file_info_option()],
       FileInfo :: file_info(),
       Reason :: posix() | badarg.
@@ -790,6 +799,9 @@ read_file_info(IoDevice, Opts) when is_pid(IoDevice), is_list(Opts) ->
 
 read_file_info(#file_descriptor{module = Module} = Handle, Opts) when is_list(Opts) ->
     Module:read_handle_info(Handle, Opts);
+
+read_file_info(Target, Opts) when ?IS_AT_TARGET(Target), is_list(Opts) ->
+    at_call(read_file_info, Target, [Opts]);
 
 read_file_info(Name, Opts) when is_list(Opts) ->
     Args = [file_name(Name), Opts],
@@ -814,9 +826,12 @@ altname(Name) ->
 
 -doc(#{equiv => read_link_info(Name, [])}).
 -spec read_link_info(Name) -> {ok, FileInfo} | {error, Reason} when
-      Name :: name_all(),
+      Name :: name_all() | {fd(), name_all()},
       FileInfo :: file_info(),
       Reason :: posix() | badarg.
+
+read_link_info(Target) when ?IS_AT_TARGET(Target) ->
+    at_call(read_link_info, Target, []);
 
 read_link_info(Name) ->
     check_and_call(read_link_info, [file_name(Name)]).
@@ -838,10 +853,13 @@ symbolic links, this function is always equivalent to
 """.
 -doc(#{since => <<"OTP R15B">>}).
 -spec read_link_info(Name, Opts) -> {ok, FileInfo} | {error, Reason} when
-      Name :: name_all(),
+      Name :: name_all() | {fd(), name_all()},
       Opts :: [file_info_option()],
       FileInfo :: file_info(),
       Reason :: posix() | badarg.
+
+read_link_info(Target, Opts) when ?IS_AT_TARGET(Target), is_list(Opts) ->
+    at_call(read_link_info, Target, [Opts]);
 
 read_link_info(Name, Opts) when is_list(Opts) ->
     Args = [file_name(Name), Opts],
@@ -874,9 +892,12 @@ Typical error reasons:
 - **`enotsup`** - Symbolic links are not supported on this platform.
 """.
 -spec read_link(Name) -> {ok, Filename} | {error, Reason} when
-      Name :: name_all(),
+      Name :: name_all() | {fd(), name_all()},
       Filename :: filename(),
       Reason :: posix() | badarg.
+
+read_link(Target) when ?IS_AT_TARGET(Target) ->
+    at_call(read_link, Target, []);
 
 read_link(Name) ->
     check_and_call(read_link, [file_name(Name)]).
@@ -898,9 +919,12 @@ Typical error reasons:
 """.
 -doc(#{since => <<"OTP R16B">>}).
 -spec read_link_all(Name) -> {ok, Filename} | {error, Reason} when
-      Name :: name_all(),
+      Name :: name_all() | {fd(), name_all()},
       Filename :: filename_all(),
       Reason :: posix() | badarg.
+
+read_link_all(Target) when ?IS_AT_TARGET(Target) ->
+    at_call(read_link_all, Target, []);
 
 read_link_all(Name) ->
     check_and_call(read_link_all, [file_name(Name)]).
@@ -1052,7 +1076,7 @@ resolving its path again. The result always describes the directory you opened,
 even if another process replaces the path.
 """.
 -spec list_dir(Dir) -> {ok, Filenames} | {error, Reason} when
-      Dir :: name_all() | fd(),
+      Dir :: name_all() | fd() | {fd(), name_all()},
       Filenames :: [filename()],
       Reason :: posix()
               | badarg
@@ -1060,6 +1084,9 @@ even if another process replaces the path.
 
 list_dir(#file_descriptor{module = Module} = Handle) ->
     Module:list_dir(Handle);
+
+list_dir(Target) when ?IS_AT_TARGET(Target) ->
+    at_call(list_dir, Target, []);
 
 list_dir(Name) ->
     check_and_call(list_dir, [file_name(Name)]).
@@ -1082,21 +1109,27 @@ Typical error reasons:
 """.
 -doc(#{since => <<"OTP R16B">>}).
 -spec list_dir_all(Dir) -> {ok, Filenames} | {error, Reason} when
-      Dir :: name_all() | fd(),
+      Dir :: name_all() | fd() | {fd(), name_all()},
       Filenames :: [filename_all()],
       Reason :: posix() | badarg.
 
 list_dir_all(#file_descriptor{module = Module} = Handle) ->
     Module:list_dir_all(Handle);
 
+list_dir_all(Target) when ?IS_AT_TARGET(Target) ->
+    at_call(list_dir_all, Target, []);
+
 list_dir_all(Name) ->
     check_and_call(list_dir_all, [file_name(Name)]).
 
 -doc(#{equiv => read_file(Filename, [])}).
 -spec read_file(Filename) -> {ok, Binary} | {error, Reason} when
-      Filename :: name_all(),
+      Filename :: name_all() | {fd(), name_all()},
       Binary :: binary(),
       Reason :: posix() | badarg | terminated | system_limit.
+
+read_file(Target) when ?IS_AT_TARGET(Target) ->
+    at_call(read_file, Target, []);
 
 read_file(Name) ->
     check_and_call(read_file, [file_name(Name)]).
@@ -1120,13 +1153,28 @@ Typical error reasons:
   platforms, `enoent` is returned instead.
 
 - **`enomem`** - There is not enough memory for the contents of the file.
+
+`Filename` can also be a `{Dir, Name}` tuple. `Dir` is a directory that was
+opened with the modes `raw`, `read` and `directory`. The operating system
+resolves `Name` against that open directory, so another process cannot replace
+a directory in the path of `Dir` and make this function reach a different
+file. The file server is not called for such a tuple, whether or not `raw` is
+set. See `open/2`.
 """.
 -doc(#{since => <<"OTP 27.0">>}).
 -spec read_file(Filename, Opts) -> {ok, Binary} | {error, Reason} when
-      Filename :: name_all(),
+      Filename :: name_all() | {fd(), name_all()},
       Opts :: [read_file_option()],
       Binary :: binary(),
       Reason :: posix() | badarg | terminated | system_limit.
+
+read_file(Target, Opts) when ?IS_AT_TARGET(Target), is_list(Opts) ->
+    case check_args(Opts) of
+        ok ->
+            at_call(read_file, Target, []);
+        Error ->
+            Error
+    end;
 
 read_file(Name, Opts) when is_list(Opts) ->
     FileName = file_name(Name),
@@ -1578,6 +1626,15 @@ at_target({Dir, Name}) ->
             Error;
         FileName ->
             {unwrap_fd(Dir), FileName}
+    end.
+
+%% Calls prim_file on a name in an open directory.
+at_call(Function, Target0, Args) ->
+    case at_target(Target0) of
+        {error, _} = Error ->
+            Error;
+        Target ->
+            apply(?PRIM_FILE, Function, [Target | Args])
     end.
 
 %% A directory that file:open/2 returned is wrapped in the layers that were

@@ -589,14 +589,14 @@ read_handle_info_nif(_FileRef) ->
 %% Quality-of-life helpers
 %%
 
-read_file(Filename) ->
+read_file(Target) ->
     %% We're doing this operation in the NIF to avoid excessive rescheduling.
     try
-        read_file_nif(encode_path(Filename))
+        read_file_nif(encode_target(Target))
     catch
         error:badarg -> {error, badarg}
     end.
-read_file_nif(_Filename) ->
+read_file_nif(_Target) ->
     erlang:nif_error(undef).
 
 write_file(Filename, Bytes) ->
@@ -618,8 +618,8 @@ write_file(Filename, Bytes, Modes) ->
 read_link(Name) -> read_link_1(Name, false).
 read_link_all(Name) -> read_link_1(Name, true).
 
-read_link_1(Name, AcceptRawNames) ->
-    try read_link_nif(encode_path(Name)) of
+read_link_1(Target, AcceptRawNames) ->
+    try read_link_nif(encode_target(Target)) of
         {ok, RawName} -> translate_raw_name(RawName, AcceptRawNames);
         {error, Reason} -> {error, Reason}
     catch
@@ -649,8 +649,8 @@ list_dir_1(#file_descriptor{module = ?MODULE} = Fd, SkipInvalid) ->
     catch
         error:badarg -> {error, badarg}
     end;
-list_dir_1(Name, SkipInvalid) ->
-    try list_dir_nif(encode_path(Name)) of
+list_dir_1(Target, SkipInvalid) ->
+    try list_dir_nif(encode_target(Target)) of
         {ok, RawNames} -> list_dir_convert(RawNames, SkipInvalid, []);
         {error, Reason} -> {error, Reason}
     catch
@@ -695,9 +695,9 @@ read_link_info(Name) ->
 read_link_info(Name, Opts) ->
     read_info_1(Name, 0, proplist_get_value(time, Opts, local)).
 
-read_info_1(Name, FollowLinks, TimeType) ->
+read_info_1(Target, FollowLinks, TimeType) ->
     try
-        case read_info_nif(encode_path(Name), FollowLinks) of
+        case read_info_nif(encode_target(Target), FollowLinks) of
             {error, Reason} -> {error, Reason};
             FileInfo -> {ok, adjust_times(FileInfo, TimeType)}
         end
@@ -912,13 +912,13 @@ altname(Path) ->
         error:badarg -> {error, badarg}
     end.
 
-list_dir_nif(_Path) ->
+list_dir_nif(_Target) ->
     erlang:nif_error(undef).
 list_handle_dir_nif(_FileRef) ->
     erlang:nif_error(undef).
-read_link_nif(_Path) ->
+read_link_nif(_Target) ->
     erlang:nif_error(undef).
-read_info_nif(_Path, _FollowLinks) ->
+read_info_nif(_Target, _FollowLinks) ->
     erlang:nif_error(undef).
 make_hard_link_nif(_Existing, _New) ->
     erlang:nif_error(undef).

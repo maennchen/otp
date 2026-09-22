@@ -46,10 +46,17 @@
 #define EFILE_FILE_WRITE_THROUGH 0x00000002
 #define EFILE_FILE_SYNCHRONOUS_IO_NONALERT 0x00000020
 #define EFILE_FILE_NON_DIRECTORY_FILE 0x00000040
+#define EFILE_FILE_OPEN_FOR_BACKUP_INTENT 0x00004000
+#define EFILE_FILE_OPEN_REPARSE_POINT 0x00200000
 
 /* The status that open_name_at answers for a name it cannot pass on. It maps
  * to EINVAL, as the calls that take a path report for such a name. */
 #define EFILE_STATUS_INVALID_PARAMETER ((NTSTATUS)0xC000000DL)
+
+/* The status for a name that is not the directory it is asked to be. It is
+ * matched on directly, because the error it maps to is not the one a path
+ * reports. */
+#define EFILE_STATUS_NOT_A_DIRECTORY ((NTSTATUS)0xC0000103L)
 
 #define IS_SLASH(a)  ((a) == L'\\' || (a) == L'/')
 
@@ -606,6 +613,10 @@ static posix_errno_t open_path(const efile_path_t *path,
 }
 
 static posix_errno_t nt_status_to_posix_errno(NTSTATUS status) {
+    if(status == EFILE_STATUS_NOT_A_DIRECTORY) {
+        return ENOTDIR;
+    }
+
     return windows_to_posix_errno(RtlNtStatusToDosError(status));
 }
 
@@ -715,6 +726,62 @@ static posix_errno_t open_at(efile_data_t *dir, const efile_path_t *path,
     }
 
     return build_open_resource(handle, modes, nif_type, d);
+}
+
+/* What an operation calls the system with for a target that is not a path:
+ * the directory the last component of the name belongs to, and that
+ * component. */
+struct efile_resolved {
+    WCHAR component[MAX_PATH];
+    HANDLE parent;
+
+    /* Whether resolved_release closes the directory. */
+    int owned;
+
+    /* Whether the call follows a last component that is a link. */
+    int follow_last;
+};
+
+/* What the operation does with the name. */
+enum efile_resolve_flags_t {
+    /* The operation follows a last component that is a link. */
+    EFILE_RESOLVE_FOLLOW_LAST = (1 << 0),
+
+    /* The operation can act on the directory the name resolves to, as
+     * list_dir can. A delete or a rename cannot. */
+    EFILE_RESOLVE_SELF_OK = (1 << 1)
+};
+
+static void resolved_release(struct efile_resolved *resolved) {
+    if(resolved->owned) {
+        CloseHandle(resolved->parent);
+    }
+}
+
+/* Turns a target that is not a path into what the operation calls the system
+ * with. The caller gives the result to resolved_release when it is done.
+ *
+ * A name in an open directory is used as it is, against that directory. The
+ * name is not checked, so a name that holds ".." still reaches a file outside
+ * the directory. The system checks the name on the call itself, so the flags
+ * only say how the call is made. */
+static posix_errno_t resolve_target(const efile_target_t *target, int flags,
+        struct efile_resolved *resolved) {
+    efile_win_t *w = (efile_win_t*)target->dir;
+    size_t length = wcslen((const WCHAR*)target->name.data);
+
+    if(length >= MAX_PATH) {
+        return ENAMETOOLONG;
+    }
+
+    sys_memcpy(resolved->component, target->name.data,
+               (length + 1) * sizeof(WCHAR));
+
+    resolved->parent = w->handle;
+    resolved->owned = 0;
+    resolved->follow_last = !!(flags & EFILE_RESOLVE_FOLLOW_LAST);
+
+    return 0;
 }
 
 static void tmp_nop_invalid_parameter_handler(const wchar_t* expression,
@@ -1039,6 +1106,28 @@ static int is_executable_file(const efile_path_t *path) {
     return 0;
 }
 
+/* Returns whether the handle refers to a link-like object, e.g. a junction
+ * point, symbolic link, or mounted folder. The handle must have been opened
+ * without following reparse points. */
+static int handle_is_name_surrogate(HANDLE handle) {
+    REPARSE_GUID_DATA_BUFFER reparse_buffer;
+    DWORD unused_length;
+    BOOL success;
+
+    success = DeviceIoControl(handle,
+                              FSCTL_GET_REPARSE_POINT, NULL, 0,
+                              &reparse_buffer, sizeof(reparse_buffer),
+                              &unused_length, NULL);
+
+    /* ERROR_MORE_DATA is tolerated since we're guaranteed to have filled
+     * the field we want. */
+    if(success || GetLastError() == ERROR_MORE_DATA) {
+        return IsReparseTagNameSurrogate(reparse_buffer.ReparseTag);
+    }
+
+    return 0;
+}
+
 /* Returns whether the path refers to a link-like object, e.g. a junction
  * point, symbolic link, or mounted folder. */
 static int is_name_surrogate(const efile_path_t *path) {
@@ -1053,20 +1142,7 @@ static int is_name_surrogate(const efile_path_t *path) {
     result = 0;
 
     if(handle != INVALID_HANDLE_VALUE) {
-        REPARSE_GUID_DATA_BUFFER reparse_buffer;
-        DWORD unused_length;
-        BOOL success;
-
-        success = DeviceIoControl(handle,
-                                  FSCTL_GET_REPARSE_POINT, NULL, 0,
-                                  &reparse_buffer, sizeof(reparse_buffer),
-                                  &unused_length, NULL);
-
-        /* ERROR_MORE_DATA is tolerated since we're guaranteed to have filled
-         * the field we want. */
-        if(success || GetLastError() == ERROR_MORE_DATA) {
-            result = IsReparseTagNameSurrogate(reparse_buffer.ReparseTag);
-        }
+        result = handle_is_name_surrogate(handle);
 
         CloseHandle(handle);
      }
@@ -1137,6 +1213,36 @@ static void build_file_info_times(BY_HANDLE_FILE_INFORMATION *native_file_info, 
     if(result->c_time == -EPOCH_DIFFERENCE) {
         result->c_time = result->m_time;
     }
+}
+
+static posix_errno_t read_handle_info(HANDLE handle, efile_fileinfo_t *result) {
+    BY_HANDLE_FILE_INFORMATION native_file_info;
+    posix_errno_t posix_errno;
+    efile_path_t path;
+
+    sys_memset(&native_file_info, 0, sizeof(native_file_info));
+
+    posix_errno = internal_read_link(handle, &path);
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    if(GetFileInformationByHandle(handle, &native_file_info)) {
+        build_file_info_times(&native_file_info, result);
+        build_file_info(&native_file_info, &path, 0, result);
+
+        posix_errno = 0;
+    } else if(is_path_root(&path)) {
+        /* GetFileInformationByHandle is not supported on path roots, so
+         * fall back to read_info_path. */
+        posix_errno = read_info_path(&path, 0, result);
+    } else {
+        posix_errno = windows_to_posix_errno(GetLastError());
+    }
+
+    enif_release_binary(&path);
+
+    return posix_errno;
 }
 
 static posix_errno_t read_info_path(const efile_path_t *path, int follow_links,
@@ -1214,11 +1320,65 @@ static posix_errno_t read_info_path(const efile_path_t *path, int follow_links,
     return 0;
 }
 
+static posix_errno_t read_info_at(const efile_target_t *target,
+        int follow_links, efile_fileinfo_t *result) {
+    struct efile_resolved resolved;
+    posix_errno_t posix_errno;
+    NTSTATUS status;
+    HANDLE handle;
+    ULONG options;
+    int flags;
+
+    flags = EFILE_RESOLVE_SELF_OK;
+
+    if(follow_links) {
+        flags |= EFILE_RESOLVE_FOLLOW_LAST;
+    }
+
+    posix_errno = resolve_target(target, flags, &resolved);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    options = EFILE_FILE_OPEN_FOR_BACKUP_INTENT;
+
+    if(!resolved.follow_last) {
+        options |= EFILE_FILE_OPEN_REPARSE_POINT;
+    }
+
+    status = open_name_at(resolved.parent, resolved.component, GENERIC_READ,
+        options, EFILE_FILE_OPEN, &handle);
+
+    resolved_release(&resolved);
+
+    if(!NT_SUCCESS(status)) {
+        return nt_status_to_posix_errno(status);
+    }
+
+    posix_errno = read_handle_info(handle, result);
+
+    /* read_handle_info answers for the file a handle refers to, and a handle
+     * never refers to a link there, so it cannot report one. A link is told
+     * apart the same way as it is for a path. */
+    if(posix_errno == 0 && !follow_links
+       && handle_has_file_attributes(handle, FILE_ATTRIBUTE_REPARSE_POINT)
+       && handle_is_name_surrogate(handle)) {
+        result->type = EFILE_FILETYPE_SYMLINK;
+    }
+
+    CloseHandle(handle);
+
+    return posix_errno;
+}
+
 posix_errno_t efile_read_info(const efile_target_t *target, int follow_links,
         efile_fileinfo_t *result) {
     switch(target->kind) {
     case EFILE_TARGET_PATH:
         return read_info_path(&target->name, follow_links, result);
+    case EFILE_TARGET_AT:
+        return read_info_at(target, follow_links, result);
     default:
         return EINVAL;
     }
@@ -1226,35 +1386,8 @@ posix_errno_t efile_read_info(const efile_target_t *target, int follow_links,
 
 posix_errno_t efile_read_handle_info(efile_data_t *d, efile_fileinfo_t *result) {
     efile_win_t *w = (efile_win_t*)d;
-    HANDLE handle;
-    BY_HANDLE_FILE_INFORMATION native_file_info;
-    posix_errno_t posix_errno;
-    efile_path_t path;
-    int length;
 
-    sys_memset(&native_file_info, 0, sizeof(native_file_info));
-
-    posix_errno = internal_read_link(w->handle, &path);
-    if(posix_errno != 0) {
-        return posix_errno;
-    }
-
-    if(GetFileInformationByHandle(w->handle, &native_file_info)) {
-        build_file_info_times(&native_file_info, result);
-        build_file_info(&native_file_info, &path, 0, result);
-
-        posix_errno = 0;
-    } else if(is_path_root(&path)) {
-        /* GetFileInformationByHandle is not supported on path roots, so
-         * fall back to read_info_path. */
-        posix_errno = read_info_path(&path, 0, result);
-    } else {
-        posix_errno = windows_to_posix_errno(GetLastError());
-    }
-
-    enif_release_binary(&path);
-
-    return posix_errno;
+    return read_handle_info(w->handle, result);
 }
 
 static posix_errno_t set_handle_permissions(HANDLE handle, Uint32 permissions) {
@@ -1514,11 +1647,76 @@ static posix_errno_t read_link_path(ErlNifEnv *env, const efile_path_t *path,
     return posix_errno;
 }
 
+static posix_errno_t read_link_at(ErlNifEnv *env, const efile_target_t *target,
+        ERL_NIF_TERM *result) {
+    struct efile_resolved resolved;
+    posix_errno_t posix_errno;
+    ErlNifBinary result_bin;
+    NTSTATUS status;
+    HANDLE handle;
+    int is_link;
+
+    posix_errno = resolve_target(target, 0, &resolved);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    /* The link itself is opened first, so that a name that is not a link can
+     * be refused as it is for a path. */
+    status = open_name_at(resolved.parent, resolved.component, GENERIC_READ,
+        EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_OPEN_REPARSE_POINT,
+        EFILE_FILE_OPEN, &handle);
+
+    if(!NT_SUCCESS(status)) {
+        resolved_release(&resolved);
+        return nt_status_to_posix_errno(status);
+    }
+
+    is_link = handle_has_file_attributes(handle, FILE_ATTRIBUTE_REPARSE_POINT)
+        && handle_is_name_surrogate(handle);
+
+    CloseHandle(handle);
+
+    if(!is_link) {
+        resolved_release(&resolved);
+        return EINVAL;
+    }
+
+    /* It is opened again without that option, so that it is followed and the
+     * name of the file it points at can be read. */
+    status = open_name_at(resolved.parent, resolved.component, GENERIC_READ,
+        EFILE_FILE_OPEN_FOR_BACKUP_INTENT, EFILE_FILE_OPEN, &handle);
+
+    resolved_release(&resolved);
+
+    if(!NT_SUCCESS(status)) {
+        return nt_status_to_posix_errno(status);
+    }
+
+    posix_errno = internal_read_link(handle, &result_bin);
+
+    CloseHandle(handle);
+
+    if(posix_errno == 0) {
+        if(!normalize_path_result(&result_bin)) {
+            enif_release_binary(&result_bin);
+            return ENOMEM;
+        }
+
+        (*result) = enif_make_binary(env, &result_bin);
+    }
+
+    return posix_errno;
+}
+
 posix_errno_t efile_read_link(ErlNifEnv *env, const efile_target_t *target,
         ERL_NIF_TERM *result) {
     switch(target->kind) {
     case EFILE_TARGET_PATH:
         return read_link_path(env, &target->name, result);
+    case EFILE_TARGET_AT:
+        return read_link_at(env, target, result);
     default:
         return EINVAL;
     }
@@ -1607,11 +1805,50 @@ posix_errno_t efile_list_handle_dir(ErlNifEnv *env, efile_data_t *d, ERL_NIF_TER
     return list_handle_dir(env, w->handle, result);
 }
 
+static posix_errno_t list_dir_at(ErlNifEnv *env, const efile_target_t *target,
+        ERL_NIF_TERM *result) {
+    struct efile_resolved resolved;
+    posix_errno_t posix_errno;
+    NTSTATUS status;
+    HANDLE handle;
+    ULONG options;
+
+    posix_errno = resolve_target(target,
+        EFILE_RESOLVE_FOLLOW_LAST | EFILE_RESOLVE_SELF_OK, &resolved);
+
+    if(posix_errno != 0) {
+        return posix_errno;
+    }
+
+    options = EFILE_FILE_OPEN_FOR_BACKUP_INTENT | EFILE_FILE_DIRECTORY_FILE;
+
+    if(!resolved.follow_last) {
+        options |= EFILE_FILE_OPEN_REPARSE_POINT;
+    }
+
+    status = open_name_at(resolved.parent, resolved.component, GENERIC_READ,
+        options, EFILE_FILE_OPEN, &handle);
+
+    resolved_release(&resolved);
+
+    if(!NT_SUCCESS(status)) {
+        return nt_status_to_posix_errno(status);
+    }
+
+    posix_errno = list_handle_dir(env, handle, result);
+
+    CloseHandle(handle);
+
+    return posix_errno;
+}
+
 posix_errno_t efile_list_dir(ErlNifEnv *env, const efile_target_t *target,
         ERL_NIF_TERM *result) {
     switch(target->kind) {
     case EFILE_TARGET_PATH:
         return list_dir_path(env, &target->name, result);
+    case EFILE_TARGET_AT:
+        return list_dir_at(env, target, result);
     default:
         return EINVAL;
     }
