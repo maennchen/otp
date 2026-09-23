@@ -983,6 +983,10 @@ change a directory or a link afterwards. To keep a name inside a directory
 when the file is used, open the directory with `file:open_root/1` and give the
 name as `{Root, Name}`.
 
+`Cwd` can also be a directory that was opened with the modes `raw`, `read` and
+`directory`, or a root. The links in the path are then read through that
+directory, and the result is a name to use with it.
+
 _Examples:_
 
 ```erlang
@@ -1001,7 +1005,7 @@ unsafe
 -doc(#{since => <<"OTP 23.0">>}).
 -spec safe_relative_path(Filename, Cwd) -> unsafe | SafeFilename when
       Filename :: filename_all(),
-      Cwd :: filename_all(),
+      Cwd :: filename_all() | file:fd(),
       SafeFilename :: filename_all().
 
 safe_relative_path(Path, "") ->
@@ -1039,8 +1043,8 @@ srp_path([Seg|_]=Segs, Cwd, Seen, Acc) ->
     end.
 
 srp_segment([Seg|Segs], Cwd, Seen, Acc) ->
-    Path = filename:join([Cwd|Acc]),
-    case file:read_link(filename:join(Path, Seg)) of
+    {Path, Target} = srp_target(Cwd, Acc, Seg),
+    case file:read_link(Target) of
         {ok, LinkPath} ->
             srp_link(Path,
                      LinkPath,
@@ -1054,6 +1058,13 @@ srp_segment([Seg|Segs], Cwd, Seen, Acc) ->
                      Seen,
                      Acc++[Seg])
     end.
+
+srp_target(#file_descriptor{} = Dir, Acc, Seg) ->
+    Path = filename:join(["." | Acc]),
+    {Path, {Dir, filename:join(Path, Seg)}};
+srp_target(Cwd, Acc, Seg) ->
+    Path = filename:join([Cwd | Acc]),
+    {Path, filename:join(Path, Seg)}.
 
 srp_link(Path, LinkPath, Segs, Cwd, Seen, Acc) ->
     FullLinkPath = filename:join(Path, LinkPath),

@@ -30,10 +30,11 @@
          ensure_path_single_dir/1, ensure_path_nested_dirs/1,
          ensure_path_binary_args/1, ensure_path_symlink/1,
          ensure_path_relative_path/1, ensure_path_relative_path_dot_dot/1,
-         ensure_path_invalid_path/1,
+         ensure_path_invalid_path/1, ensure_path_in_dir/1,
 	 wildcard_symlink/1, is_file_symlink/1, file_props_symlink/1,
          find_source/1, find_source_subdir/1, find_source_otp/1,
-         safe_relative_path/1, safe_relative_path_links/1]).
+         safe_relative_path/1, safe_relative_path_links/1,
+         safe_relative_path_handle/1]).
 
 -import(lists, [foreach/2]).
 
@@ -59,10 +60,11 @@ all() ->
      ensure_path_single_dir, ensure_path_nested_dirs, ensure_path_binary_args,
      ensure_path_symlink, ensure_path_relative_path,
      ensure_path_relative_path_dot_dot,
-     ensure_path_invalid_path,
+     ensure_path_invalid_path, ensure_path_in_dir,
      wildcard_symlink, is_file_symlink, file_props_symlink,
      find_source, find_source_subdir, find_source_otp,
-     safe_relative_path, safe_relative_path_links].
+     safe_relative_path, safe_relative_path_links,
+     safe_relative_path_handle].
 
 groups() -> 
     [].
@@ -485,6 +487,25 @@ ensure_path_binary_args(Config) when is_list(Config) ->
     ok = filelib:ensure_path(list_to_binary(Path)),
     true = filelib:is_dir(Path).
 
+ensure_path_in_dir(Config) when is_list(Config) ->
+    PrivDir = proplists:get_value(priv_dir, Config),
+    BaseDir = filename:join(PrivDir, "ensure_path_in_dir"),
+    ok = filelib:ensure_path(BaseDir),
+    {ok, Dir} = file:open(BaseDir, [raw, read, directory]),
+    ok = filelib:ensure_path({Dir, "foo/bar/baz"}),
+    true = filelib:is_dir(filename:join(BaseDir, "foo/bar/baz")),
+    ok = filelib:ensure_path({Dir, "foo/bar"}),
+    ok = filelib:ensure_dir({Dir, "foo/qux/file"}),
+    true = filelib:is_dir(filename:join(BaseDir, "foo/qux")),
+    false = filelib:is_dir(filename:join(BaseDir, "foo/qux/file")),
+    ok = file:write_file(filename:join(BaseDir, "file"), <<>>),
+    {error, eexist} = filelib:ensure_path({Dir, "file"}),
+    ok = file:close(Dir),
+    {ok, Root} = file:open_root(BaseDir),
+    {error, exdev} = filelib:ensure_path({Root, "../outside"}),
+    false = filelib:is_dir(filename:join(PrivDir, "outside")),
+    ok = file:close(Root).
+
 ensure_path_invalid_path(Config) when is_list(Config) ->
     PrivDir = proplists:get_value(priv_dir, Config),
     BaseDir = filename:join(PrivDir, "ensure_path_invalid_path"),
@@ -825,6 +846,55 @@ do_test_srp(RelPath) ->
             true = length(Cwd) >= length(Root),
             ok = file:set_cwd(Root),
             SafeRelPath
+    end.
+
+%% Links are read through the open directory that is given as Cwd.
+safe_relative_path_handle(Config) ->
+    PrivDir = ?config(priv_dir, Config),
+    BaseDir = filename:join(PrivDir, "filelib_SUITE_safe_relative_path_handle"),
+    ok = file:make_dir(BaseDir),
+    ok = file:make_dir(filename:join(BaseDir, "sub")),
+    case relative_symlink("..", filename:join(BaseDir, "up")) of
+        ok ->
+            ok = relative_symlink("sub", filename:join(BaseDir, "in")),
+            {ok, Dir} = file:open(BaseDir, [raw, read, directory]),
+            "file" = filelib:safe_relative_path("file", Dir),
+            "sub/file" = filelib:safe_relative_path("sub/./file", Dir),
+            unsafe = filelib:safe_relative_path("../file", Dir),
+            unsafe = filelib:safe_relative_path("up/file", Dir),
+            %% Windows answers a full path for the target of a relative
+            %% link, which is unsafe on its own.
+            case file:read_link({Dir, "in"}) of
+                {ok, "sub"} ->
+                    "sub/file" = filelib:safe_relative_path("in/file", Dir),
+                    "sub/file" = filelib:safe_relative_path("in/../sub/file", Dir),
+                    {ok, Root} = file:open_root(BaseDir),
+                    "sub/file" = filelib:safe_relative_path("in/file", Root),
+                    unsafe = filelib:safe_relative_path("up/file", Root),
+                    ok = file:close(Root);
+                {ok, _} ->
+                    unsafe = filelib:safe_relative_path("in/file", Dir)
+            end,
+            ok = file:close(Dir);
+        {error, eperm} ->
+            {skipped, "This platform/user can't create symlinks."}
+    end.
+
+%% Windows stores the target of a link made with file:make_symlink/2 as a
+%% full path, so a relative link is made with mklink.
+relative_symlink(Target, Link) ->
+    case os:type() of
+        {win32, _} ->
+            Cmd = "mklink /D \"" ++ filename:nativename(Link) ++ "\" \""
+                ++ filename:nativename(Target) ++ "\"",
+            Output = os:cmd(Cmd),
+            case {string:find(Output, "<<===>>"), string:find(Output, "privilege")} of
+                {nomatch, nomatch} -> ct:fail({Cmd, Output});
+                {nomatch, _} -> {error, eperm};
+                _ -> ok
+            end;
+        _ ->
+            file:make_symlink(Target, Link)
     end.
 
 safe_relative_path_links(Config) ->
