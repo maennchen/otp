@@ -335,6 +335,9 @@ posix_errno_t efile_del_dir(const efile_target_t *target);
 posix_errno_t efile_get_cwd(ErlNifEnv *env, ERL_NIF_TERM *result);
 posix_errno_t efile_set_cwd(const efile_path_t *path);
 
+/** @brief Makes an open directory the working directory. */
+posix_errno_t efile_set_handle_cwd(efile_data_t *d);
+
 /** @brief A Windows-specific function for returning the working directory of a
  * given device.
  *

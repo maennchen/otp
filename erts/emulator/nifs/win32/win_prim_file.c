@@ -3237,6 +3237,12 @@ posix_errno_t efile_del_dir(const efile_target_t *target) {
     }
 }
 
+posix_errno_t efile_set_handle_cwd(efile_data_t *d) {
+    (void)d;
+
+    return ENOTSUP;
+}
+
 posix_errno_t efile_set_cwd(const efile_path_t *path) {
     const WCHAR *path_start;
 

@@ -49,7 +49,7 @@
 	 init_per_group/2,end_per_group/2,
 	 init_per_testcase/2, end_per_testcase/2,
 	 read_write_file/1, names/1]).
--export([cur_dir_0/1, cur_dir_1/1, make_del_dir/1, make_del_dir_r/1,
+-export([cur_dir_0/1, cur_dir_1/1, cur_dir_handle/1, make_del_dir/1, make_del_dir_r/1,
 	 list_dir/1,list_dir_error/1,list_dir_handle/1,
 	 file_write_handle_info/1,
 	 open_at/1, open_at_symlink/1, read_at/1, write_at/1,
@@ -148,7 +148,7 @@ all() ->
     ].
 
 groups() -> 
-    [{dirs, [], [make_del_dir, make_del_dir_r, cur_dir_0, cur_dir_1,
+    [{dirs, [], [make_del_dir, make_del_dir_r, cur_dir_0, cur_dir_1, cur_dir_handle,
 		 list_dir, list_dir_error, list_dir_handle,
 		 untranslatable_names, untranslatable_names_error]},
      {files, [],
@@ -761,6 +761,35 @@ cur_dir_1(Config) when is_list(Config) ->
 	_ ->
 	    {error, enotsup} = ?FILE_MODULE:get_cwd("d:")
     end,
+    [] = flush(),
+    ok.
+
+cur_dir_handle(Config) when is_list(Config) ->
+    RootDir = proplists:get_value(priv_dir, Config),
+    TestDir = filename:join(RootDir, ?MODULE_STRING++"_cur_dir_handle"),
+    ok = ?FILE_MODULE:make_dir(TestDir),
+    ok = ?FILE_MODULE:write_file(filename:join(TestDir, "file"), "contents"),
+    {ok, Cwd} = ?FILE_MODULE:get_cwd(),
+    {ok, Dir} = ?FILE_MODULE:open(TestDir, [raw, read, directory]),
+    case ?FILE_MODULE:set_cwd(Dir) of
+        ok ->
+            {ok, <<"contents">>} = ?FILE_MODULE:read_file("file"),
+            {ok, Root} = ?FILE_MODULE:open_root(RootDir),
+            ok = ?FILE_MODULE:set_cwd(Root),
+            true = filelib:is_dir(filename:basename(TestDir)),
+            ok = ?FILE_MODULE:close(Root),
+            {ok, Bin} = ?FILE_MODULE:open(TestDir, [raw, read, directory, binary]),
+            ok = ?FILE_MODULE:set_cwd(Bin),
+            {ok, <<"contents">>} = ?FILE_MODULE:read_file("file"),
+            ok = ?FILE_MODULE:close(Bin),
+            ok = ?FILE_MODULE:set_cwd(Cwd);
+        {error, enotsup} ->
+            {win32, _} = os:type()
+    end,
+    {ok, File} = ?FILE_MODULE:open(filename:join(TestDir, "file"), [raw, read]),
+    {error, enotdir} = ?FILE_MODULE:set_cwd(File),
+    ok = ?FILE_MODULE:close(File),
+    ok = ?FILE_MODULE:close(Dir),
     [] = flush(),
     ok.
 

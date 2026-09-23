@@ -70,6 +70,7 @@
 -nifs([open_nif/2, dup_nif/1, close_nif/1, read_nif/2, write_nif/2, pread_nif/3,
        pwrite_nif/3, seek_nif/3, sync_nif/2, truncate_nif/1, allocate_nif/3,
        advise_nif/4, read_handle_info_nif/1, list_handle_dir_nif/1,
+       set_handle_cwd_nif/1,
        set_handle_permissions_nif/2, set_handle_owner_nif/3,
        set_handle_time_nif/4,
        make_hard_link_nif/2, make_soft_link_nif/2, rename_nif/2,
@@ -888,6 +889,13 @@ get_cwd() ->
     catch
         error:badarg -> {error, badarg}
     end.
+set_cwd(#file_descriptor{module = ?MODULE} = Fd) ->
+    try
+        #{ handle := FRef } = get_fd_data(Fd),
+        set_handle_cwd_nif(FRef)
+    catch
+        error:badarg -> {error, badarg}
+    end;
 set_cwd(Path) ->
     try
         case is_path_translatable(Path) of
@@ -969,6 +977,8 @@ del_dir_nif(_Target) ->
 get_device_cwd_nif(_DevicePath) ->
     erlang:nif_error(undef).
 set_cwd_nif(_Path) ->
+    erlang:nif_error(undef).
+set_handle_cwd_nif(_FileRef) ->
     erlang:nif_error(undef).
 get_cwd_nif() ->
     erlang:nif_error(undef).

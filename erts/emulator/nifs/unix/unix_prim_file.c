@@ -2384,6 +2384,16 @@ posix_errno_t efile_set_cwd(const efile_path_t *path) {
     return 0;
 }
 
+posix_errno_t efile_set_handle_cwd(efile_data_t *d) {
+    efile_unix_t *u = (efile_unix_t*)d;
+
+    if(fchdir(u->fd) < 0) {
+        return errno;
+    }
+
+    return 0;
+}
+
 posix_errno_t efile_get_device_cwd(ErlNifEnv *env, int device_index, ERL_NIF_TERM *result) {
     (void)device_index;
     (void)result;

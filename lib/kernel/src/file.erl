@@ -487,13 +487,21 @@ Typical error reasons are:
 >
 > In a future release, a bad type for argument `Dir` will probably generate an
 > exception.
+
+`Dir` can also be a directory that was opened with the modes `raw`, `read` and
+`directory`, or a root from `open_root/1`. The working directory is then that
+directory, and its path is not resolved again. Windows returns
+`{error, enotsup}`.
 """.
 -spec set_cwd(Dir) -> ok | {error, Reason} when
-      Dir :: name() | EncodedBinary,
+      Dir :: name() | EncodedBinary | fd(),
       EncodedBinary :: binary(),
       Reason :: posix() | badarg | no_translation.
 
-set_cwd(Dirname) -> 
+set_cwd(#file_descriptor{module = Module} = Handle) ->
+    Module:set_cwd(Handle);
+
+set_cwd(Dirname) ->
     check_and_call(set_cwd, [file_name(Dirname)]).
 
 -doc(#{equiv => delete(Filename, [])}).

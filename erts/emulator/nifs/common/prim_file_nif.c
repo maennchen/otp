@@ -181,6 +181,7 @@ WRAP_FILE_HANDLE_EXPORT(get_handle_nif)
 WRAP_FILE_HANDLE_EXPORT(ipread_s32bu_p32bu_nif)
 WRAP_FILE_HANDLE_EXPORT(read_handle_info_nif)
 WRAP_FILE_HANDLE_EXPORT(list_handle_dir_nif)
+WRAP_FILE_HANDLE_EXPORT(set_handle_cwd_nif)
 WRAP_FILE_HANDLE_EXPORT(set_handle_permissions_nif)
 WRAP_FILE_HANDLE_EXPORT(set_handle_owner_nif)
 WRAP_FILE_HANDLE_EXPORT(set_handle_time_nif)
@@ -201,6 +202,7 @@ static ErlNifFunc nif_funcs[] = {
     {"advise_nif", 4, advise_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"read_handle_info_nif", 1, read_handle_info_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"list_handle_dir_nif", 1, list_handle_dir_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"set_handle_cwd_nif", 1, set_handle_cwd_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"set_handle_permissions_nif", 2, set_handle_permissions_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"set_handle_owner_nif", 3, set_handle_owner_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"set_handle_time_nif", 4, set_handle_time_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
@@ -1429,6 +1431,23 @@ static ERL_NIF_TERM list_handle_dir_nif_impl(efile_data_t *d, ErlNifEnv *env, in
     }
 
     return enif_make_tuple2(env, am_ok, result);
+}
+
+static ERL_NIF_TERM set_handle_cwd_nif_impl(efile_data_t *d, ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    posix_errno_t posix_errno;
+
+    ASSERT(argc == 0);
+    (void)argv;
+
+    if(!(d->modes & EFILE_MODE_DIRECTORY)) {
+        return posix_error_to_tuple(env, ENOTDIR);
+    }
+
+    if((posix_errno = efile_set_handle_cwd(d))) {
+        return posix_error_to_tuple(env, posix_errno);
+    }
+
+    return am_ok;
 }
 
 static ERL_NIF_TERM rename_nif(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
